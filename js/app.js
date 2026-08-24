@@ -219,6 +219,14 @@ function renderTask() {
 
   let body = topbar(lesson.title, backHashForLesson()) + `<main>`;
   body += progressBar();
+
+  if (state.taskIdx === 0 && lesson.intro) {
+    body += `<div class="intro-block"><span class="tag">SCENARIO</span>${lesson.intro}</div>`;
+  }
+  if (task.narration) {
+    body += `<div class="narration">${task.narration}</div>`;
+  }
+
   body += `<div class="task-kind">${KIND_LABEL[task.type] || task.type}</div>`;
 
   if (task.type === 'mcq') body += renderMCQ(task);
@@ -227,6 +235,11 @@ function renderTask() {
   else if (task.type === 'order') body += renderOrder(task);
   else if (task.type === 'scenario') body += renderScenario(task);
   else body += `<p>未対応のタスク形式です: ${task.type}</p>`;
+
+  if (task.hint) {
+    body += `<button class="hint-toggle" onclick="toggleHint()">💡 ヒントを見る</button>
+      <div class="hint-text" id="hintText">${task.hint}</div>`;
+  }
 
   body += `<div class="feedback" id="feedback"></div>`;
   body += `<button class="next-btn" id="nextBtn" disabled onclick="nextTask()">次へ</button>`;
@@ -427,6 +440,10 @@ function answerScenario(idx) {
     }).join('');
   }
   showFeedback(!!choice.correct, choice.resultText);
+}
+
+function toggleHint() {
+  document.getElementById('hintText').classList.toggle('show');
 }
 
 // ---------- utils ----------
