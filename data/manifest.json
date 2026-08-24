@@ -1,0 +1,47 @@
+{
+  "phases": [
+    {
+      "id": 1,
+      "title": "Phase 1: 全体像の把握と土台固め",
+      "description": "システムの地図を手に入れ、OS・ネットワーク・セキュリティの基礎を固める",
+      "modules": [
+        {
+          "id": "system-design-primer",
+          "title": "System Design Primer",
+          "description": "大規模システムの設計パターンを一望する",
+          "lessons": [
+            "data/phase1/system-design-primer/01-caching.json",
+            "data/phase1/system-design-primer/02-scaling.json"
+          ]
+        },
+        {
+          "id": "tryhackme-basics",
+          "title": "TryHackMe 基礎",
+          "description": "OS・ネットワーク・セキュリティの土台",
+          "lessons": [
+            "data/phase1/tryhackme-basics/01-linux-terminal.json",
+            "data/phase1/tryhackme-basics/02-networking.json"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Phase 2: モダンインフラ・クラウドの体感",
+      "description": "Linux・Docker・k8s・クラウドを実機感覚で操作する",
+      "modules": []
+    },
+    {
+      "id": 3,
+      "title": "Phase 3: フルスタック統合プロジェクト",
+      "description": "フロント〜インフラ・CI/CDを一気通貫で自作する",
+      "modules": []
+    },
+    {
+      "id": 4,
+      "title": "Phase 4: 専門性の拡張・深掘り",
+      "description": "興味に応じてアルゴリズム・低レイヤ・データ分析へ",
+      "modules": []
+    }
+  ]
+}
