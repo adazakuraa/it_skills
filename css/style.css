@@ -201,6 +201,57 @@ main {
 .task-progress .seg.done { background: var(--accent); }
 .task-progress .seg.current { background: var(--amber); }
 
+.intro-block {
+  margin: 20px 0 8px;
+  padding: 16px;
+  background: var(--surface);
+  border-left: 3px solid var(--amber);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text);
+}
+.intro-block .tag {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 10.5px;
+  color: var(--amber);
+  letter-spacing: 0.08em;
+  margin-bottom: 6px;
+}
+.narration {
+  margin: 16px 0 10px;
+  padding-left: 14px;
+  border-left: 2px solid var(--line-strong);
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+
+.hint-toggle {
+  background: none;
+  border: 1px dashed var(--line-strong);
+  color: var(--text-faint);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-family: var(--font-display);
+  font-size: 11.5px;
+  margin: 4px 0 16px;
+}
+.hint-toggle:hover { color: var(--text-dim); border-color: var(--text-dim); }
+.hint-text {
+  display: none;
+  font-size: 13px;
+  color: var(--accent);
+  background: rgba(79, 209, 197, 0.08);
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: -6px 0 16px;
+  line-height: 1.6;
+}
+.hint-text.show { display: block; }
+
 .task-kind {
   font-family: var(--font-display);
   font-size: 11px;
