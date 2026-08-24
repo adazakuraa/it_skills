@@ -1,16 +1,29 @@
 {
   "id": "thm-02-networking",
   "title": "ネットワークの基礎",
+  "intro": "`check.sh` がCPUを使い切っていた原因を調べると、外部APIへの接続がタイムアウトを繰り返し、リトライを大量に発生させていたことが分かった。先輩と一緒に、ネットワークの基本から原因を追ってみよう。",
   "tasks": [
     {
+      "type": "terminal",
+      "narration": "まずは、接続先のドメイン `api.example.com` が正しいIPアドレスを指しているか確認するところから。",
+      "prompt": "example.com のIPアドレスを調べたい。使うコマンドは？",
+      "commandOptions": ["nslookup api.example.com", "ping -t api.example.com", "ssh api.example.com", "curl -X DELETE api.example.com"],
+      "answer": "nslookup api.example.com",
+      "output": "Server:  8.8.8.8\nAddress: 8.8.8.8#53\n\nNon-authoritative answer:\nName: api.example.com\nAddress: 93.184.216.34",
+      "wrongOutput": "求めている名前解決の結果は得られません。",
+      "explain": "`nslookup`（や `dig`）はDNSサーバーに問い合わせてドメイン名からIPアドレスを引く（名前解決する）コマンドです。IPアドレス自体は正しく引けている——では接続そのものに問題があるのか？"
+    },
+    {
       "type": "order",
+      "narration": "IPアドレスは正しく引けた。次はそもそも接続（TCPコネクション）が確立できているのかを疑う。TCP通信が始まる際の最初のやりとりを思い出してみよう。",
       "prompt": "TCPの3ウェイハンドシェイクの正しい順序に並べよ",
       "items": ["クライアントが SYN を送信", "サーバーが SYN-ACK を返信", "クライアントが ACK を送信して接続確立"],
       "answer": ["クライアントが SYN を送信", "サーバーが SYN-ACK を返信", "クライアントが ACK を送信して接続確立"],
-      "explain": "SYN → SYN-ACK → ACK の3ステップで、コネクション型プロトコルであるTCPは通信を開始する前にお互いの準備ができているかを確認します。"
+      "explain": "SYN → SYN-ACK → ACK の3ステップで接続を確立します。今回のログを見ると、SYNを送った後 SYN-ACK が返ってこず止まっていた。つまり相手先のポートが閉じているか、途中でブロックされている可能性が高い。"
     },
     {
       "type": "mcq",
+      "narration": "先輩が「そのAPI、HTTPSの443番ポートで待ち受けてるはずだよ」と教えてくれた。ふと、そもそもなぜHTTPではなくHTTPSを使うのか気になった。",
       "question": "HTTPSがHTTPと比べて安全な理由は？",
       "choices": [
         "通信速度が速いから",
@@ -22,25 +35,13 @@
       "explain": "HTTPSはHTTP通信をTLS（旧SSL）で暗号化したもの。第三者による盗聴・改ざんを防ぎます。ポートは443番を使うのが一般的です。"
     },
     {
-      "type": "terminal",
-      "prompt": "example.com のIPアドレスを調べたい。使うコマンドは？",
-      "commandOptions": ["nslookup example.com", "ping -t example.com", "ssh example.com", "curl -X DELETE example.com"],
-      "answer": "nslookup example.com",
-      "output": "Server:  8.8.8.8\nAddress: 8.8.8.8#53\n\nNon-authoritative answer:\nName: example.com\nAddress: 93.184.216.34",
-      "wrongOutput": "command not found or unrelated output",
-      "explain": "`nslookup`（や `dig`）はDNSサーバーに問い合わせてドメイン名からIPアドレスを引く（名前解決する）コマンドです。"
-    },
-    {
-      "type": "mcq",
-      "question": "ポート番号の役割として正しいものは？",
-      "choices": [
-        "1台のマシン内で、どのアプリケーション（サービス）宛の通信かを識別する",
-        "パケットの暗号化方式を決める",
-        "IPアドレスの代わりに使われるもの",
-        "通信速度の上限を決める"
-      ],
-      "answer": 0,
-      "explain": "IPアドレスが「どのマシンか」を特定するのに対し、ポート番号は「そのマシン上のどのアプリ・サービス宛か」を特定します（例: HTTP=80, HTTPS=443, SSH=22）。"
+      "type": "fill",
+      "narration": "同じIPアドレスのサーバーでも、Webサーバー・SSH・DBなど複数のサービスが同時に動いている。API宛の通信がどのサービスに届くべきかを区別しているのが、さっき出てきた「443番」のような番号だ。",
+      "prompt": "1台のマシン内で、どのアプリケーション（サービス）宛の通信かを識別する番号を ___ と呼ぶ。",
+      "template": "IPアドレス + ___ = マシン内のどのサービス宛かが決まる",
+      "options": ["ポート番号", "MACアドレス", "サブネットマスク", "TTL"],
+      "answer": "ポート番号",
+      "explain": "IPアドレスが「どのマシンか」を特定するのに対し、ポート番号は「そのマシン上のどのサービス宛か」を特定します（例: HTTP=80, HTTPS=443, SSH=22）。もし443番ポートがファイアウォールで塞がれていたら、SYNへの応答が返ってこないのも説明がつく——これが今回の原因だった。"
     }
   ]
 }
