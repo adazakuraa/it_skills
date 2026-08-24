@@ -29,15 +29,22 @@ System Design Primer / TryHackMe / Killercoda / AWS Cloud Quest / Cloud Resume C
 ### 運用パターンB: Claudeとのチャットでレッスン生成
 このチャットで「〇〇についてのレッスンJSONを作って」と頼めば、スキーマに沿ったJSONをそのまま出力できます。それをコピーしてGitHub上に新規ファイルとして貼り付け、manifest.jsonに1行パスを追記するだけで反映されます。
 
-### レッスンJSONのスキーマ
+### レッスンJSONのスキーマ（ストーリー形式）
+
+クイズを羅列するのではなく、**1つの状況を最初から最後まで解説しながら進める**構成にしています。
 
 ```json
 {
   "id": "一意なID（英数字とハイフン）",
   "title": "レッスンのタイトル",
-  "tasks": [ /* 下記のいずれかの形式のタスクを好きな数だけ並べる */ ]
+  "intro": "レッスン冒頭に一度だけ表示される状況設定（地の文）。例：あなたはECサイトの運用担当。ある日…",
+  "tasks": [ /* 下記のいずれかの形式のタスクを、ストーリーの展開順に並べる */ ]
 }
 ```
+
+各タスクには共通で以下を追加できます（両方とも任意）：
+- `narration`: そのタスクの直前に表示される、地の文・つなぎの解説。「なぜ今これを考える必要があるのか」をここで説明してから問題に入る
+- `hint`: 詰まったときだけ見る、答えを教えない程度のヒント（トグルボタンで表示）
 
 **タスク形式は5種類:**
 
@@ -48,6 +55,12 @@ System Design Primer / TryHackMe / Killercoda / AWS Cloud Quest / Cloud Resume C
 | `terminal` | 疑似ターミナル操作 | `prompt`, `commandOptions[]`, `answer`, `output`, `explain`（`wrongOutput`は任意） |
 | `order` | 手順の並べ替え | `prompt`, `items[]`, `answer[]`(正しい順序), `explain` |
 | `scenario` | 状況判断＋構成図の変化 | `prompt`, `diagram.nodes[]`, `choices[]`（各choiceに `label`, `correct`, `resultText`, 任意で `diagramAfter[]`） |
+
+**ストーリー形式で書くときのコツ**（`data/phase1/system-design-primer/01-caching.json` が実例）:
+1. `intro` で「誰が・何に困っているか」を具体的に一文で設定する
+2. 最初のタスクの `narration` で、その困りごとに関連する概念をまず言葉で説明する
+3. タスクを重ねるごとに、前のタスクの `explain` が次の `narration` の前提になるようにつなげる（例：「キャッシュを入れた→でも古いデータが残る問題が出た→それを解決するには…」）
+4. 最後のタスクの `explain` で軽く次のレッスンへの橋渡しをすると、レッスンをまたいだ連続性が出る
 
 新しいタスク形式が欲しくなったら、Claudeに「新しいタスクタイプ `xxx` を追加して」と頼めば `js/app.js` に描画ロジックを追加できます。
 
