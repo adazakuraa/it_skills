@@ -11,7 +11,19 @@
           "description": "大規模システムの設計パターンを一望する",
           "lessons": [
             "data/phase1/system-design-primer/01-caching.json",
-            "data/phase1/system-design-primer/02-scaling.json"
+            "data/phase1/system-design-primer/02-scaling.json",
+            "data/phase1/system-design-primer/03-replication-cap.json",
+            "data/phase1/system-design-primer/04-message-queue.json",
+            "data/phase1/system-design-primer/05-latency-throughput.json",
+            "data/phase1/system-design-primer/06-consistency-failover.json",
+            "data/phase1/system-design-primer/07-dns-cdn.json",
+            "data/phase1/system-design-primer/08-lb-reverse-proxy.json",
+            "data/phase1/system-design-primer/09-microservices.json",
+            "data/phase1/system-design-primer/10-db-scaling.json",
+            "data/phase1/system-design-primer/11-nosql.json",
+            "data/phase1/system-design-primer/12-cache-write-strategies.json",
+            "data/phase1/system-design-primer/13-task-queue-backpressure.json",
+            "data/phase1/system-design-primer/14-protocols.json"
           ]
         },
         {
@@ -20,7 +32,17 @@
           "description": "OS・ネットワーク・セキュリティの土台",
           "lessons": [
             "data/phase1/tryhackme-basics/01-linux-terminal.json",
-            "data/phase1/tryhackme-basics/02-networking.json"
+            "data/phase1/tryhackme-basics/02-networking.json",
+            "data/phase1/tryhackme-basics/03-web-security.json",
+            "data/phase1/tryhackme-basics/04-password-hashing.json",
+            "data/phase1/tryhackme-basics/05-cybersecurity-overview.json",
+            "data/phase1/tryhackme-basics/06-how-web-works.json",
+            "data/phase1/tryhackme-basics/07-windows-fundamentals.json",
+            "data/phase1/tryhackme-basics/08-nmap-scanning.json",
+            "data/phase1/tryhackme-basics/09-privilege-escalation.json",
+            "data/phase1/tryhackme-basics/10-basic-cryptography.json",
+            "data/phase1/tryhackme-basics/11-web-authentication.json",
+            "data/phase1/tryhackme-basics/12-owasp-csrf-ssrf.json"
           ]
         }
       ]
@@ -29,7 +51,32 @@
       "id": 2,
       "title": "Phase 2: モダンインフラ・クラウドの体感",
       "description": "Linux・Docker・k8s・クラウドを実機感覚で操作する",
-      "modules": []
+      "modules": [
+        {
+          "id": "containers-k8s",
+          "title": "Docker & Kubernetes",
+          "description": "Killercoda相当：コンテナとオーケストレーションの基礎",
+          "lessons": [
+            "data/phase2/containers-k8s/01-docker.json",
+            "data/phase2/containers-k8s/02-kubernetes.json"
+          ]
+        },
+        {
+          "id": "security-operations",
+          "title": "セキュリティオペレーション",
+          "description": "TryHackMe Jr Pentester / SOC Level1 / Cloud Security 相当",
+          "lessons": [
+            "data/phase2/security-operations/01-pentest-fundamentals.json",
+            "data/phase2/security-operations/02-recon-burpsuite.json",
+            "data/phase2/security-operations/03-vuln-research-metasploit.json",
+            "data/phase2/security-operations/04-attack-frameworks.json",
+            "data/phase2/security-operations/05-soc-siem.json",
+            "data/phase2/security-operations/06-incident-response.json",
+            "data/phase2/security-operations/07-cloud-security.json",
+            "data/phase2/security-operations/08-specialist-tracks-overview.json"
+          ]
+        }
+      ]
     },
     {
       "id": 3,
