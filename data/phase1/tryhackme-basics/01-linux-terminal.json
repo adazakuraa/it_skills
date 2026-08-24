@@ -1,0 +1,52 @@
+{
+  "id": "thm-01-linux",
+  "title": "Linuxターミナルの基礎",
+  "tasks": [
+    {
+      "type": "terminal",
+      "prompt": "現在のディレクトリ内のファイル一覧を、隠しファイルも含めて詳細表示したい。",
+      "commandOptions": ["ls -la", "cd ..", "pwd", "cat file.txt"],
+      "answer": "ls -la",
+      "output": "drwxr-xr-x  5 taro taro 4096 Aug 24 09:00 .\ndrwxr-xr-x 18 taro taro 4096 Aug 20 10:12 ..\n-rw-r--r--  1 taro taro  220 Aug 24 09:00 .bashrc\n-rw-r--r--  1 taro taro   34 Aug 24 09:00 notes.txt",
+      "wrongOutput": "そのコマンドではファイル一覧は表示されません。",
+      "explain": "`ls` は一覧表示、`-l` は詳細（パーミッション・所有者・サイズなど）、`-a` は `.` で始まる隠しファイルも表示するオプションです。"
+    },
+    {
+      "type": "mcq",
+      "question": "ファイルのパーミッション表示 `-rwxr-xr--` の意味として正しいものは？",
+      "choices": [
+        "所有者は読み書き実行可、グループは読み実行可、その他は読みのみ可",
+        "全員が読み書き実行すべて可能",
+        "所有者のみアクセス可能で他は一切不可",
+        "このファイルはディレクトリである"
+      ],
+      "answer": 0,
+      "explain": "先頭の1文字はファイル種別（-はファイル、dはディレクトリ）。残り9文字は3文字ずつ「所有者/グループ/その他」の rwx（読み/書き/実行）権限を表します。"
+    },
+    {
+      "type": "fill",
+      "prompt": "プロセス一覧をリアルタイムで監視するコマンドは ___ 。",
+      "template": "$ ___",
+      "options": ["top", "grep", "chmod", "kill"],
+      "answer": "top",
+      "explain": "`top`はCPU・メモリ使用率を含むプロセス一覧をリアルタイム表示します。よりモダンな `htop` もよく使われます。"
+    },
+    {
+      "type": "order",
+      "prompt": "「テキストファイルを作成し、内容を確認し、権限を実行可能に変更する」流れを正しい順序に並べよ",
+      "items": [
+        "touch script.sh でファイルを作成する",
+        "cat script.sh で中身を確認する",
+        "chmod +x script.sh で実行権限を付与する",
+        "./script.sh で実行する"
+      ],
+      "answer": [
+        "touch script.sh でファイルを作成する",
+        "cat script.sh で中身を確認する",
+        "chmod +x script.sh で実行権限を付与する",
+        "./script.sh で実行する"
+      ],
+      "explain": "Linuxではファイルに実行権限（xビット）がないと直接実行できません。作成 → 確認 → 権限付与 → 実行、が基本の流れです。"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "thm-02-networking",
+  "title": "ネットワークの基礎",
+  "tasks": [
+    {
+      "type": "order",
+      "prompt": "TCPの3ウェイハンドシェイクの正しい順序に並べよ",
+      "items": ["クライアントが SYN を送信", "サーバーが SYN-ACK を返信", "クライアントが ACK を送信して接続確立"],
+      "answer": ["クライアントが SYN を送信", "サーバーが SYN-ACK を返信", "クライアントが ACK を送信して接続確立"],
+      "explain": "SYN → SYN-ACK → ACK の3ステップで、コネクション型プロトコルであるTCPは通信を開始する前にお互いの準備ができているかを確認します。"
+    },
+    {
+      "type": "mcq",
+      "question": "HTTPSがHTTPと比べて安全な理由は？",
+      "choices": [
+        "通信速度が速いから",
+        "TLS/SSLにより通信内容が暗号化されるから",
+        "ポート番号が大きいから",
+        "サーバーの台数が多いから"
+      ],
+      "answer": 1,
+      "explain": "HTTPSはHTTP通信をTLS（旧SSL）で暗号化したもの。第三者による盗聴・改ざんを防ぎます。ポートは443番を使うのが一般的です。"
+    },
+    {
+      "type": "terminal",
+      "prompt": "example.com のIPアドレスを調べたい。使うコマンドは？",
+      "commandOptions": ["nslookup example.com", "ping -t example.com", "ssh example.com", "curl -X DELETE example.com"],
+      "answer": "nslookup example.com",
+      "output": "Server:  8.8.8.8\nAddress: 8.8.8.8#53\n\nNon-authoritative answer:\nName: example.com\nAddress: 93.184.216.34",
+      "wrongOutput": "command not found or unrelated output",
+      "explain": "`nslookup`（や `dig`）はDNSサーバーに問い合わせてドメイン名からIPアドレスを引く（名前解決する）コマンドです。"
+    },
+    {
+      "type": "mcq",
+      "question": "ポート番号の役割として正しいものは？",
+      "choices": [
+        "1台のマシン内で、どのアプリケーション（サービス）宛の通信かを識別する",
+        "パケットの暗号化方式を決める",
+        "IPアドレスの代わりに使われるもの",
+        "通信速度の上限を決める"
+      ],
+      "answer": 0,
+      "explain": "IPアドレスが「どのマシンか」を特定するのに対し、ポート番号は「そのマシン上のどのアプリ・サービス宛か」を特定します（例: HTTP=80, HTTPS=443, SSH=22）。"
+    }
+  ]
+}
