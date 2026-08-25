@@ -1,0 +1,70 @@
+{
+  "id": "k8s-01-docker",
+  "title": "Dockerの基礎",
+  "intro": "新しいプロジェクトにアサインされた。先輩のPCでは動くのに、自分のPCで同じコードを動かすとライブラリのバージョン違いでエラーになる。「私の環境では動きます」問題に、初日から直面してしまった。",
+  "tasks": [
+    {
+      "type": "mcq",
+      "narration": "先輩が「うちはDockerでコンテナ化してるから、その問題そもそも起きないはずなんだけどな」と言いながら、Docker Desktopをインストールするよう勧めてくれた。",
+      "question": "コンテナ技術（Docker）が「私の環境では動きます」問題を解決できる理由は？",
+      "choices": [
+        "OSやライブラリのバージョンも含めた実行環境ごとパッケージ化し、どのマシンでも同じ環境を再現できるから",
+        "コードの実行速度が常に速くなるから",
+        "インターネット接続が不要になるから",
+        "プログラミング言語の文法が統一されるから"
+      ],
+      "answer": 0,
+      "explain": "コンテナは「アプリ本体＋必要なライブラリ・設定」を1つの箱に詰めて配布します。ホストのOSカーネルは共有しつつ、アプリから見える環境は常に同じになるため、環境差異が起きにくくなります。"
+    },
+    {
+      "type": "mcq",
+      "narration": "「コンテナって仮想マシン（VM）と何が違うんですか？」と聞いてみた。",
+      "question": "コンテナと仮想マシン(VM)の主な違いは？",
+      "choices": [
+        "コンテナはホストOSのカーネルを共有するため起動が速く軽量。VMはOSごと丸ごと仮想化するため重い",
+        "コンテナの方が常にセキュリティが高い",
+        "VMはネットワークに接続できない",
+        "違いはほぼない"
+      ],
+      "answer": 0,
+      "explain": "VMはハードウェアレベルから仮想化し、ゲストOSを丸ごと動かすため起動に数十秒〜分かかることも。コンテナはホストのカーネルを共有し、プロセスレベルで隔離するため、起動が秒単位で済みます。"
+    },
+    {
+      "type": "fill",
+      "narration": "Dockerを使う上で最初に理解すべき2つの言葉がある。",
+      "prompt": "アプリの実行環境の「設計図」を ___ 、それを実際に起動して動いている実体を container と呼ぶ。",
+      "template": "___（設計図） を元に container（実体） が起動する",
+      "options": ["image", "volume", "network", "registry"],
+      "answer": "image",
+      "explain": "image は「このアプリを動かすには何が必要か」を記述したテンプレート。そこから実際にプロセスとして起動されたものが container です。同じimageから何個でもcontainerを起動できます。"
+    },
+    {
+      "type": "terminal",
+      "narration": "早速、公式のnginx（Webサーバー）のimageを使ってコンテナを起動してみる。",
+      "prompt": "nginxのコンテナをバックグラウンドで起動し、ホストの8080番ポートをコンテナの80番ポートに繋げたい。",
+      "commandOptions": ["docker run -d -p 8080:80 nginx", "docker build -t nginx .", "docker ps -a", "docker rm nginx"],
+      "answer": "docker run -d -p 8080:80 nginx",
+      "output": "Unable to find image 'nginx:latest' locally\nlatest: Pulling from library/nginx\nStatus: Downloaded newer image\nContainer started: 7f3a9c2e1b44",
+      "wrongOutput": "コンテナは起動しません。",
+      "explain": "`-d` はバックグラウンド実行、`-p ホスト:コンテナ` はポートを繋ぐ指定です。これでブラウザから `localhost:8080` にアクセスすると、コンテナ内のnginxが応答します。"
+    },
+    {
+      "type": "order",
+      "narration": "次は自分のアプリをコンテナ化する番。`Dockerfile`という「imageの作り方を書いたレシピ」を作成する必要がある。",
+      "prompt": "簡単なDockerfileの一般的な構成要素を、書かれる順序として正しく並べよ",
+      "items": [
+        "FROM: ベースとなるimageを指定する（例: node:20）",
+        "COPY: 自分のアプリのコードをimageの中にコピーする",
+        "RUN: 依存ライブラリのインストールなど、ビルド時に実行するコマンドを書く",
+        "CMD: コンテナ起動時に実行するコマンドを指定する"
+      ],
+      "answer": [
+        "FROM: ベースとなるimageを指定する（例: node:20）",
+        "COPY: 自分のアプリのコードをimageの中にコピーする",
+        "RUN: 依存ライブラリのインストールなど、ビルド時に実行するコマンドを書く",
+        "CMD: コンテナ起動時に実行するコマンドを指定する"
+      ],
+      "explain": "土台（FROM）を決め、コードを入れ（COPY）、必要なセットアップを行い（RUN）、最後に起動コマンド（CMD）を指定する、という順序が基本形です。これで `docker build` するとimageが出来上がります。"
+    }
+  ]
+}

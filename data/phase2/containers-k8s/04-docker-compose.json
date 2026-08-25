@@ -1,0 +1,52 @@
+{
+  "id": "k8s-04-docker-compose",
+  "title": "マルチコンテナ構成とdocker-compose",
+  "intro": "Marketaアプリのローカル開発環境を整えることになった。App サーバーだけでなく、開発用のDB（PostgreSQL）とRedisも一緒に動かす必要がある。毎回3つのコンテナを別々の `docker run` コマンドで起動するのは、正直つらい。",
+  "tasks": [
+    {
+      "type": "mcq",
+      "narration": "「毎回コマンド打つの、うんざりですよね」と愚痴ったら、先輩に便利なツールを教えてもらった。",
+      "question": "複数のコンテナの構成（image、ポート、環境変数、依存関係など）を1つのファイルにまとめて定義し、一括で起動・停止できるツールを何と呼ぶ？",
+      "choices": [
+        "docker compose（複数コンテナの構成をYAMLファイルで定義し、`docker compose up` 一発でまとめて起動できる）",
+        "kubectl",
+        "docker build",
+        "nginx"
+      ],
+      "answer": 0,
+      "explain": "docker composeは、ローカル開発環境のように「複数のコンテナをセットで動かしたい」場面で重宝します。`docker-compose.yml` に全構成を書いておけば、チームメンバーは1コマンドで同じ環境を再現できます。"
+    },
+    {
+      "type": "fill",
+      "narration": "`docker-compose.yml` の中身を見せてもらった。App・DB・Redisがそれぞれ ___ という単位で定義されていた。",
+      "prompt": "docker-compose.yml では、起動する各コンテナの設定を ___ という単位で記述する。",
+      "template": "services:\n  app: ...\n  db: ...\n  redis: ...  ← それぞれが1つの ___",
+      "options": ["サービス(service)", "ポッド(pod)", "デプロイメント(deployment)", "ノード(node)"],
+      "answer": "サービス(service)",
+      "explain": "docker composeでは `services` の下に、appやdb、redisのようにコンテナごとの設定（使うimage、ポート、環境変数など）を書きます。これらはKubernetesの `Pod` とは別の概念なので、混同しないよう注意が必要です。"
+    },
+    {
+      "type": "terminal",
+      "narration": "設定ファイルができたので、実際に全部まとめて起動してみる。",
+      "prompt": "docker-compose.yml に定義された全サービスを、バックグラウンドでまとめて起動したい。",
+      "commandOptions": ["docker compose up -d", "docker build -t all .", "docker compose down", "docker ps"],
+      "answer": "docker compose up -d",
+      "output": "Creating network marketa_default\nCreating marketa_db_1 ... done\nCreating marketa_redis_1 ... done\nCreating marketa_app_1 ... done",
+      "wrongOutput": "サービスはまとめて起動されません。",
+      "explain": "`up -d` で、定義された全サービスをバックグラウンドで一括起動できます。サービス同士は自動的に同じネットワークに接続され、コンテナ名（`db`, `redis`など）をホスト名としてお互いに通信できるようになります。"
+    },
+    {
+      "type": "mcq",
+      "narration": "動作確認をしていると、App コンテナのコードの中で `db` というホスト名でDBに接続していることに気づいた。IPアドレスを指定していないのに、なぜ繋がるのか気になった。",
+      "question": "docker compose環境で、サービス名（例: `db`）をそのままホスト名として名前解決できるのはなぜか？",
+      "choices": [
+        "docker composeが自動的に専用のネットワークを作成し、その中で各サービス名をDNSのように解決できるようにしているため",
+        "たまたま同じIPアドレスになっているため",
+        "インターネット経由でDNSに問い合わせているため",
+        "設定ファイルにIPアドレスを直接書いているため"
+      ],
+      "answer": 0,
+      "explain": "docker composeは内部的に軽量なサービスディスカバリーの仕組みを持っており、コンテナ起動のたびにIPアドレスが変わっても、サービス名で名前解決できます。以前学んだ「サービスディスカバリー」の考え方が、ローカル開発環境レベルでもすでに使われているわけです。この後、本番相当の環境であるKubernetesでは、これがより本格的な仕組みとして提供されている。"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "id": "k8s-05-deploy-manifests",
+  "title": "Kubernetesへのデプロイ実践",
+  "intro": "docker composeでローカル環境は快適になった。しかしdocker composeはあくまで「1台のマシンの中で複数コンテナを動かす」ためのツール。本番環境は、以前学んだKubernetesクラスタ上で動かす必要がある。レジストリに上げたimageを、いよいよ本番相当の環境にデプロイしてみよう。",
+  "tasks": [
+    {
+      "type": "mcq",
+      "narration": "「Kubernetesって、`kubectl run` みたいなコマンドで直接起動するんですか？」と聞くと、「本番ではもっと宣言的なやり方をするんだよ」と言われた。",
+      "question": "Kubernetesで「こういう状態にしたい」という理想の構成をYAMLファイルに書き、それを適用する運用スタイルを何と呼ぶ？",
+      "choices": [
+        "宣言的な管理（Declarative）：マニフェスト（YAMLファイル）に望ましい状態を書き、`kubectl apply` で反映する。差分は自動で解消される",
+        "命令的な管理のみが正しいやり方",
+        "GUIでしか設定できない",
+        "設定ファイルという概念はKubernetesには存在しない"
+      ],
+      "answer": 0,
+      "explain": "「Podを1つ起動して」ではなく「常に3つのPodがこの状態で動いていてほしい」とYAMLに書き、Kubernetesにその状態を維持させ続けてもらう——これが宣言的管理です。以前学んだDeploymentの自己修復も、この仕組みの上に成り立っています。"
+    },
+    {
+      "type": "fill",
+      "narration": "実際にDeploymentのマニフェストを見せてもらった。imageの指定箇所に、以前レジストリへpushしたイメージ名が書かれていた。",
+      "prompt": "Deploymentのマニフェストの中で、どのコンテナimageを使うかを指定する項目は ___ 。",
+      "template": "containers:\n  - name: app\n    ___: registry.example.com/marketa-app:1.0",
+      "options": ["image", "replicas", "service", "port"],
+      "answer": "image",
+      "explain": "`image` にレジストリ上のimageのパスとタグを指定します。以前学んだ「具体的なバージョンタグを使うべき」という話が、まさにここで活きてきます。`latest` を指定していると、いつ・どのコードのPodが動いているか分からなくなってしまいます。"
+    },
+    {
+      "type": "terminal",
+      "narration": "マニフェストファイル `deployment.yaml` の準備ができたので、クラスタに適用してみる。",
+      "prompt": "deployment.yaml に書かれた内容をクラスタに反映（適用）したい。",
+      "commandOptions": ["kubectl apply -f deployment.yaml", "kubectl delete -f deployment.yaml", "docker build deployment.yaml", "kubectl get pods"],
+      "answer": "kubectl apply -f deployment.yaml",
+      "output": "deployment.apps/marketa-app created\nWaiting for rollout to finish: 0 of 3 updated replicas are available...\ndeployment \"marketa-app\" successfully rolled out",
+      "wrongOutput": "マニフェストは適用されません。",
+      "explain": "`apply` は「このファイルに書かれた状態にして」という宣言です。初回は新規作成、2回目以降は差分だけを反映してくれるため、同じコマンドを継続的に使い続けられます（これが後述のCI/CDとも相性が良い理由です）。"
+    },
+    {
+      "type": "mcq",
+      "narration": "Podが3つ起動したのは確認できたが、「これ、外部からどうやってアクセスするんですか？Podは頻繁に入れ替わるって言ってましたよね」と疑問が湧いた。",
+      "question": "頻繁に入れ替わるPod群に対して、変わらない1つの窓口（アクセス先）を提供するKubernetesのリソースは？",
+      "choices": [
+        "Service：複数のPodをグループ化し、それらに対する固定のアクセス先（内部DNS名や仮想IP）を提供する。以前学んだロードバランサに近い役割を、クラスタ内部で果たす",
+        "ConfigMap",
+        "Namespace",
+        "Node"
+      ],
+      "answer": 0,
+      "explain": "PodはIPアドレスが動的に変わりますが、Serviceは固定のアクセス先を提供し、その裏にいる（ラベルで紐付けられた）Pod群に自動的に振り分けてくれます。以前Marketaのシステム設計で学んだ「ロードバランサ」や「サービスディスカバリー」の考え方が、Kubernetesの中では Service という具体的な形で実装されているわけです。外部からクラスタの外に公開する場合は、この上にさらに Ingress（外部公開用の入り口）を組み合わせることが一般的です。"
+    }
+  ]
+}

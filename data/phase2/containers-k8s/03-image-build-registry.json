@@ -1,0 +1,61 @@
+{
+  "id": "k8s-03-image-build-registry",
+  "title": "イメージのビルドとレジストリへの登録",
+  "intro": "Dockerfileは書けるようになった。次は「自分のPCで作ったimageを、どうやって他のサーバーやチームメンバーと共有するか」という壁にぶつかった。`docker run` はローカルにあるimageしか使えない。",
+  "tasks": [
+    {
+      "type": "terminal",
+      "narration": "まず、書いたDockerfileから実際にimageを作る作業から。",
+      "prompt": "カレントディレクトリのDockerfileを使って、`marketa-app:1.0` という名前でimageをビルドしたい。",
+      "commandOptions": ["docker build -t marketa-app:1.0 .", "docker run marketa-app:1.0", "docker pull marketa-app:1.0", "docker ps -a"],
+      "answer": "docker build -t marketa-app:1.0 .",
+      "output": "Step 1/4 : FROM node:20\nStep 2/4 : COPY . /app\nStep 3/4 : RUN npm install\nStep 4/4 : CMD [\"node\", \"server.js\"]\nSuccessfully built 9f3e1a2b4c5d\nSuccessfully tagged marketa-app:1.0",
+      "wrongOutput": "imageはビルドされません。",
+      "explain": "`-t` でimageに名前とタグ（バージョン）を付けます。最後の `.` は「Dockerfileがあるディレクトリ（ビルドコンテキスト）」を指しています。これで手元にimageができました。"
+    },
+    {
+      "type": "mcq",
+      "narration": "できたimageを別のサーバーに持っていきたい。先輩に相談すると「imageを置いておく専用の場所があるよ」と教わった。",
+      "question": "Dockerイメージを保管し、必要な時にどこからでも取得（pull）できるようにする保管場所を何と呼ぶ？",
+      "choices": [
+        "レジストリ（Registry）：Docker HubやAmazon ECR、GitHub Container Registryなど、imageを保存・配布する場所",
+        "リポジトリ（Gitのソースコード管理のことのみを指す）",
+        "キャッシュサーバー",
+        "ロードバランサ"
+      ],
+      "answer": 0,
+      "explain": "レジストリはimage版の「GitHub」のようなものと考えると分かりやすいです。ビルドしたimageをレジストリにpushしておけば、本番サーバーやCI/CDパイプラインがそこからpullして使えるようになります。"
+    },
+    {
+      "type": "order",
+      "narration": "実際にレジストリへ登録するまでの一連の流れを整理してみよう。",
+      "prompt": "ローカルで作ったimageを、レジストリ経由で本番サーバーで動かすまでの流れを正しい順序に並べよ",
+      "items": [
+        "docker build でローカルにimageを作成する",
+        "docker tag でレジストリの場所を含む名前を付け直す（例: registry.example.com/marketa-app:1.0）",
+        "docker push でレジストリにimageをアップロードする",
+        "本番サーバーで docker pull してimageを取得し、docker run で起動する"
+      ],
+      "answer": [
+        "docker build でローカルにimageを作成する",
+        "docker tag でレジストリの場所を含む名前を付け直す（例: registry.example.com/marketa-app:1.0）",
+        "docker push でレジストリにimageをアップロードする",
+        "本番サーバーで docker pull してimageを取得し、docker run で起動する"
+      ],
+      "explain": "`tag` でレジストリのアドレスを含む名前に付け替えるのがポイント。これによって `docker push` がどこ宛にアップロードすればよいか分かるようになります。この一連の流れが、後のCI/CDパイプラインの土台になります。"
+    },
+    {
+      "type": "mcq",
+      "narration": "タグの付け方について、もう一つ大事な習慣を教わった。「`1.0` みたいな具体的なバージョンをちゃんと付けてね。`latest` ばかり使わないように」。",
+      "question": "本番運用で `latest` タグばかりに頼らず、具体的なバージョン番号でタグ付けすべき理由は？",
+      "choices": [
+        "「latest」は常に最新のビルドを指すため、いつ・どのコードでビルドされたimageが動いているかが分かりにくくなり、障害時の切り戻し（ロールバック）や原因特定が難しくなる",
+        "「latest」タグは技術的に使用できないため",
+        "バージョン番号を付けるとimageの容量が減るため",
+        "特に理由はなく、慣習の問題ではない"
+      ],
+      "answer": 0,
+      "explain": "具体的なバージョンタグ（`1.0`, `2024-08-25-abc123` など）を使うことで、「今動いているのはどのコードのimageか」が明確になり、問題が起きた時に「1つ前のバージョンに戻す」といった対応が確実に行えます。これは後で学ぶCI/CDの信頼性にも直結します。"
+    }
+  ]
+}

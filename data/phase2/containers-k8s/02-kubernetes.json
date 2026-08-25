@@ -1,0 +1,71 @@
+{
+  "id": "k8s-02-kubernetes",
+  "title": "Kubernetesの基礎",
+  "intro": "Docker化は順調に進み、サービスは今やコンテナが20個以上動く規模になった。どのサーバーにどのコンテナを置くか、落ちたら誰が気づいて再起動するか——手作業での管理が限界に近づいている。",
+  "tasks": [
+    {
+      "type": "mcq",
+      "narration": "先輩から「そろそろKubernetes(k8s)入れる頃合いかもね」と言われた。",
+      "question": "Kubernetesが解決してくれる問題として最も適切なのは？",
+      "choices": [
+        "多数のコンテナを、どのサーバーに配置するか・障害時にどう自動復旧するか・負荷に応じてどう増減するかを自動で管理してくれる（コンテナオーケストレーション）",
+        "コードのバグを自動で修正してくれる",
+        "コンテナを使わずに済むようにしてくれる",
+        "インターネット回線を高速化する"
+      ],
+      "answer": 0,
+      "explain": "Kubernetesは「コンテナオーケストレーションツール」と呼ばれます。大量のコンテナの配置・スケーリング・自己修復・ネットワーキングなどを、宣言的な設定に基づいて自動化してくれます。"
+    },
+    {
+      "type": "fill",
+      "narration": "Kubernetesを理解する第一歩は、その最小単位を知ること。",
+      "prompt": "Kubernetesがコンテナを管理する際の最小のデプロイ単位を ___ と呼ぶ（1つ以上のコンテナをまとめたもの）。",
+      "template": "Kubernetesが管理する最小単位 = ___",
+      "options": ["Pod", "Node", "Cluster", "Volume"],
+      "answer": "Pod",
+      "explain": "Pod は1つ以上のコンテナをまとめた最小単位です。多くの場合は1 Pod = 1コンテナですが、密接に連携する複数コンテナを1つのPodにまとめることもあります。"
+    },
+    {
+      "type": "terminal",
+      "narration": "実際にクラスタ上で動いているPodを確認するコマンドを試してみよう。",
+      "prompt": "現在稼働中のPod一覧を確認したい。",
+      "commandOptions": ["kubectl get pods", "kubectl delete cluster", "docker ps", "kubectl build pods"],
+      "answer": "kubectl get pods",
+      "output": "NAME                    READY   STATUS    RESTARTS   AGE\napp-7f9c8d-x2z9p        1/1     Running   0          2d\napp-7f9c8d-k8m1q        1/1     Running   0          2d\napp-7f9c8d-p3n7r        1/1     Running   1          2d",
+      "wrongOutput": "Pod一覧は表示されません。",
+      "explain": "`kubectl` はKubernetesクラスタを操作するコマンドラインツール。`get pods` で稼働中のPod一覧と、再起動回数（RESTARTS）などの状態が確認できます。"
+    },
+    {
+      "type": "mcq",
+      "narration": "「Podを直接3個作ればいいんじゃないですか？」と聞いたら、「それだと1個落ちたときに誰も気づいて再作成してくれないよ」と言われた。",
+      "question": "「指定した数のPodが常に稼働し続けるよう、落ちたら自動で新しいPodを作り直す」役割を持つKubernetesのリソースは？",
+      "choices": [
+        "Deployment（内部でReplicaSetを使い、Podの数と状態を維持する）",
+        "Dockerfile",
+        "VPC",
+        "SSHキー"
+      ],
+      "answer": 0,
+      "explain": "Deploymentに「Podを3つ維持してね」と宣言しておくと、Kubernetesはその状態を維持し続けようとします。Podが1つ落ちても自動的に新しいPodを作って数を戻してくれます（自己修復）。"
+    },
+    {
+      "type": "scenario",
+      "narration": "実際にPodが1つ、ノード障害で突然消えるという状況をテスト環境で再現してみた。",
+      "prompt": "Deploymentで「3つのPodを維持する」と設定していた場合、Podが1つ消えるとKubernetesはどう反応する？",
+      "diagram": { "nodes": ["Deployment(3 Pods指定)", "Pod-A", "Pod-B", "Pod-C"] },
+      "choices": [
+        {
+          "label": "Pod-Cが消えたことを検知し、自動的に新しいPodを1つ作成して3つの状態に戻す",
+          "correct": true,
+          "resultText": "正解。これがKubernetesの「自己修復（self-healing）」と呼ばれる特徴。人が気づいて手動で再起動する必要がなくなる。",
+          "diagramAfter": ["Deployment(3 Pods指定)", "Pod-A", "Pod-B", "Pod-C(新規作成)"]
+        },
+        {
+          "label": "何もせず、2つのPodのまま運用され続ける",
+          "correct": false,
+          "resultText": "それではDeploymentで「3つ」と宣言した意味がありません。Kubernetesは常に「宣言された状態」と「実際の状態」を比較し、差分があれば自動的に修正しにいきます。"
+        }
+      ]
+    }
+  ]
+}
