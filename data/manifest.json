@@ -23,7 +23,10 @@
             "data/phase1/system-design-primer/11-nosql.json",
             "data/phase1/system-design-primer/12-cache-write-strategies.json",
             "data/phase1/system-design-primer/13-task-queue-backpressure.json",
-            "data/phase1/system-design-primer/14-protocols.json"
+            "data/phase1/system-design-primer/14-protocols.json",
+            "data/phase1/system-design-primer/15-cap-and-cache-layers.json",
+            "data/phase1/system-design-primer/16-cache-layers.json",
+            "data/phase1/system-design-primer/17-security-and-real-world.json"
           ]
         },
         {
@@ -58,7 +61,12 @@
           "description": "Killercoda相当：コンテナとオーケストレーションの基礎",
           "lessons": [
             "data/phase2/containers-k8s/01-docker.json",
-            "data/phase2/containers-k8s/02-kubernetes.json"
+            "data/phase2/containers-k8s/02-kubernetes.json",
+            "data/phase2/containers-k8s/03-image-build-registry.json",
+            "data/phase2/containers-k8s/04-docker-compose.json",
+            "data/phase2/containers-k8s/05-deploy-manifests.json",
+            "data/phase2/containers-k8s/06-config-secret-storage.json",
+            "data/phase2/containers-k8s/07-cicd-pipeline.json"
           ]
         },
         {
@@ -73,7 +81,11 @@
             "data/phase2/security-operations/05-soc-siem.json",
             "data/phase2/security-operations/06-incident-response.json",
             "data/phase2/security-operations/07-cloud-security.json",
-            "data/phase2/security-operations/08-specialist-tracks-overview.json"
+            "data/phase2/security-operations/08-specialist-tracks-overview.json",
+            "data/phase2/security-operations/09-firewall-ids-ips.json",
+            "data/phase2/security-operations/10-cti-phishing.json",
+            "data/phase2/security-operations/11-devsecops.json",
+            "data/phase2/security-operations/12-reporting.json"
           ]
         }
       ]
@@ -82,7 +94,23 @@
       "id": 3,
       "title": "Phase 3: フルスタック統合プロジェクト",
       "description": "フロント〜インフラ・CI/CDを一気通貫で自作する",
-      "modules": []
+      "modules": [
+        {
+          "id": "cloud-resume-challenge",
+          "title": "Cloud Resume Challenge",
+          "description": "S3静的サイト〜サーバーレスAPI〜IaC〜CI/CD〜運用まで一気通貫",
+          "lessons": [
+            "data/phase3/cloud-resume-challenge/01-static-site-s3.json",
+            "data/phase3/cloud-resume-challenge/02-https-cdn-dns.json",
+            "data/phase3/cloud-resume-challenge/03-serverless-api.json",
+            "data/phase3/cloud-resume-challenge/04-dynamodb.json",
+            "data/phase3/cloud-resume-challenge/05-frontend-backend-cors.json",
+            "data/phase3/cloud-resume-challenge/06-infrastructure-as-code.json",
+            "data/phase3/cloud-resume-challenge/07-testing-cicd.json",
+            "data/phase3/cloud-resume-challenge/08-operate-and-share.json"
+          ]
+        }
+      ]
     },
     {
       "id": 4,
