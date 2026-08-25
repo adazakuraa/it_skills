@@ -116,7 +116,27 @@
       "id": 4,
       "title": "Phase 4: 専門性の拡張・深掘り",
       "description": "興味に応じてアルゴリズム・低レイヤ・データ分析へ",
-      "modules": []
+      "modules": [
+        {
+          "id": "kaggle-competitive-ml",
+          "title": "Kaggle競技機械学習",
+          "description": "モデル選定・特徴量エンジニアリング・チューニング・アンサンブルまで、銀メダルを狙えるレベルで",
+          "lessons": [
+            "data/phase4/kaggle-competitive-ml/01-model-selection-tabular.json",
+            "data/phase4/kaggle-competitive-ml/02-gbdt-libraries.json",
+            "data/phase4/kaggle-competitive-ml/03-feature-engineering.json",
+            "data/phase4/kaggle-competitive-ml/04-cross-validation.json",
+            "data/phase4/kaggle-competitive-ml/05-hyperparameter-tuning.json",
+            "data/phase4/kaggle-competitive-ml/06-evaluation-metrics.json",
+            "data/phase4/kaggle-competitive-ml/07-imbalanced-data.json",
+            "data/phase4/kaggle-competitive-ml/08-ensemble.json",
+            "data/phase4/kaggle-competitive-ml/09-overfitting.json",
+            "data/phase4/kaggle-competitive-ml/10-image-text-competitions.json",
+            "data/phase4/kaggle-competitive-ml/11-experiment-management-shakeup.json",
+            "data/phase4/kaggle-competitive-ml/12-silver-medal-strategy.json"
+          ]
+        }
+      ]
     }
   ]
 }
