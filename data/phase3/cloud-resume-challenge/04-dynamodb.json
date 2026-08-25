@@ -1,0 +1,67 @@
+{
+  "id": "crc-04-dynamodb",
+  "title": "DynamoDBでのデータ永続化",
+  "intro": "API Gateway と Lambda まではできたが、肝心の「カウント数」をどこにも保存していないことに気づいた。Lambdaは呼ばれるたびに実行環境がリセットされることがあるため、変数に持たせておくだけでは値が消えてしまう。",
+  "tasks": [
+    {
+      "type": "mcq",
+      "narration": "「RDBMSを1台立てるのは、この程度のデータには大げさすぎる気がする」と感じた。",
+      "question": "「訪問者数」のような、キーと値のシンプルな組み合わせのデータを、サーバーレスで低コストに保存するのに向いたAWSサービスは？",
+      "choices": [
+        "DynamoDB：AWSのマネージドNoSQL（キー/バリュー・ドキュメント指向）データベース。サーバー管理不要で、アクセス量に応じて自動的にスケールする",
+        "S3（オブジェクトストレージなのでカウンターの保存には不向き）",
+        "CloudFront",
+        "Route53"
+      ],
+      "answer": 0,
+      "explain": "以前SDPのNoSQLレッスンで学んだ「キー/バリューストア」の考え方が、ここで実際のサービスと結びつきます。DynamoDBはLambdaとの相性がよく、サーバーレス構成の定番の組み合わせです。"
+    },
+    {
+      "type": "terminal",
+      "narration": "実際にDynamoDBのテーブルから、現在のカウント値を取得する操作を試してみる。",
+      "prompt": "`visitor-count` テーブルから、`id` が `main` の項目を取得したい。",
+      "commandOptions": [
+        "aws dynamodb get-item --table-name visitor-count --key '{\"id\":{\"S\":\"main\"}}'",
+        "aws s3 cp visitor-count",
+        "aws dynamodb delete-table --table-name visitor-count",
+        "aws ec2 describe-instances"
+      ],
+      "answer": "aws dynamodb get-item --table-name visitor-count --key '{\"id\":{\"S\":\"main\"}}'",
+      "output": "{\n  \"Item\": {\n    \"id\": {\"S\": \"main\"},\n    \"count\": {\"N\": \"1233\"}\n  }\n}",
+      "wrongOutput": "カウント値は取得されません。",
+      "explain": "DynamoDBはテーブル内の項目を「キー」で直接取得します。RDBのようにSQL文を書く必要はなく、シンプルなAPI呼び出しでデータの取得・更新ができます。"
+    },
+    {
+      "type": "mcq",
+      "narration": "Lambda関数の中で「取得した値に1を足して、また保存する」処理を実装しようとして、あることが気になった。",
+      "question": "「同時に2人のユーザーがアクセスして、ほぼ同時にカウントを更新する」場合に問題になりうることは？",
+      "choices": [
+        "両方とも「現在の値は1233」と読み込んでから+1して書き込むと、本来1235になるべきところが1234のまま（片方の更新が失われる）可能性がある",
+        "特に問題は起きない",
+        "DynamoDBが自動的にエラーで処理を止めてくれる",
+        "カウンターの値が0にリセットされる"
+      ],
+      "answer": 0,
+      "explain": "これは「Read-Modify-Write」と呼ばれる典型的な競合状態（Race Condition）です。同時アクセスが多いカウンターでは、この問題への対処が必要になります。"
+    },
+    {
+      "type": "scenario",
+      "narration": "この問題への対処法を調べると、DynamoDBには専用の機能が用意されていた。",
+      "prompt": "「読み込んでから+1して書き込む」のではなく、この競合を避ける適切な実装は？",
+      "diagram": { "nodes": ["Lambda", "DynamoDB(count: 1233)"] },
+      "choices": [
+        {
+          "label": "DynamoDBの「アトミックカウンター」機能（UpdateItemのADD操作）を使い、「現在値を読んでから計算する」のではなく「+1して、という命令をDB側にそのまま実行させる」",
+          "correct": true,
+          "resultText": "正解。「読んでから足す」のではなく「足すこと自体をDB側に依頼する」ことで、複数の同時リクエストが来ても、DynamoDB側が内部的に順序を保証してくれ、値が失われません。これでカウンター機能の裏側が完成した。",
+          "diagramAfter": ["Lambda(ADD +1を依頼)", "DynamoDB(内部で安全に+1)"]
+        },
+        {
+          "label": "同時アクセスは滅多に起きないので、気にせずそのまま実装する",
+          "correct": false,
+          "resultText": "個人サイトなら発生頻度は低いかもしれませんが、せっかくの学習プロジェクトなので、正しい実装パターンを知っておく価値があります。実務でのアクセスカウンターやいいね数の実装でも同じ問題が起こり得ます。"
+        }
+      ]
+    }
+  ]
+}

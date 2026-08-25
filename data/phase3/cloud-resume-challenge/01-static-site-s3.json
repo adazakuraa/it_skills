@@ -1,0 +1,62 @@
+{
+  "id": "crc-01-static-site-s3",
+  "title": "静的サイトの構築とS3ホスティング",
+  "intro": "Marketaでの実務にも慣れてきたある日、有名な学習プロジェクト「The Cloud Resume Challenge」の存在を知った。自分の経歴書（レジュメ）サイトを、フロントエンドからインフラ・CI/CDまで全部自分の手で作り上げるチャレンジ。これまで学んだ知識を、実際に手を動かして繋げてみる絶好の機会だ。",
+  "tasks": [
+    {
+      "type": "mcq",
+      "narration": "まずは土台となる、経歴書のHTML/CSSファイルを用意した。これをインターネット上に公開する方法を考える。",
+      "question": "画像やCSS・JSを含む「静的な」Webサイト（サーバー側でのプログラム処理が不要なサイト）を公開する場所として、コストや手軽さの面で適しているのは？",
+      "choices": [
+        "Amazon S3の静的Webサイトホスティング機能：オブジェクトストレージにHTML/CSS/JSファイルを置くだけで、Webサーバーを自分で構築・管理せずに公開できる",
+        "自分でLinuxサーバーを1台契約し、Webサーバーソフトをゼロから構築する",
+        "静的サイトなのでどこにも公開できない",
+        "データベースサーバーに直接アップロードする"
+      ],
+      "answer": 0,
+      "explain": "以前学んだ「S3はオブジェクトストレージ」という知識がここで活きます。静的ファイルを置くだけで公開できるため、サーバーのOSアップデートやミドルウェアの管理が一切不要になり、非常に低コストかつシンプルに運用できます。"
+    },
+    {
+      "type": "terminal",
+      "narration": "AWS CLI（コマンドラインツール）を使って、実際にファイルをS3にアップロードしてみる。",
+      "prompt": "ローカルの `index.html` を、`my-resume-bucket` というS3バケットにアップロードしたい。",
+      "commandOptions": ["aws s3 cp index.html s3://my-resume-bucket/", "aws s3 rm index.html", "aws ec2 run-instances", "aws s3 ls"],
+      "answer": "aws s3 cp index.html s3://my-resume-bucket/",
+      "output": "upload: ./index.html to s3://my-resume-bucket/index.html",
+      "wrongOutput": "ファイルはアップロードされません。",
+      "explain": "`aws s3 cp` はローカルとS3の間でファイルをコピーするコマンドです。バケット（S3上の保存場所）に対して、まるでファイルシステムのようにファイルを配置していきます。"
+    },
+    {
+      "type": "mcq",
+      "narration": "アップロードしただけでは、ブラウザからアクセスしても403エラー（アクセス拒否）になってしまった。",
+      "question": "S3にアップロードしたファイルを、誰でも閲覧できる公開Webサイトとして機能させるために必要な追加設定は？",
+      "choices": [
+        "バケットの静的Webサイトホスティング機能を有効化し、該当ファイルへの読み取りアクセスを許可するバケットポリシーを設定する",
+        "特に追加設定は不要で、アップロードすれば自動的に世界に公開される",
+        "S3の代わりにDynamoDBを使う",
+        "ファイルの拡張子を変更する"
+      ],
+      "answer": 0,
+      "explain": "S3のデフォルトは非公開です。「誰でも読み取れる」ようにするには、明示的に静的Webサイトホスティングを有効化し、パブリック読み取りを許可するポリシーを設定する必要があります。これは以前学んだ「S3バケットの公開設定ミスによる情報漏洩事故」の裏返しでもあり、必要な範囲だけを意図的に公開する感覚を養えます。"
+    },
+    {
+      "type": "scenario",
+      "narration": "サイトが表示できるようになった。しかし、まだURLが `http://my-resume-bucket.s3-website-ap-northeast-1.amazonaws.com` という長いAWS標準のものだった。",
+      "prompt": "このままでは自分の名前を覚えてもらいにくい。次に何をすべきか？",
+      "diagram": { "nodes": ["S3(静的サイト)", "AWS標準の長いURL"] },
+      "choices": [
+        {
+          "label": "独自ドメインとHTTPS化のために、CDN（CloudFront）とDNS（Route53）、SSL証明書（ACM）を組み合わせる準備を進める",
+          "correct": true,
+          "resultText": "正解。以前SDPで学んだCDN・DNSの知識がここで実践に活きる。次のレッスンで、実際にこれらを組み合わせて `https://your-name.com` のような形にしていこう。",
+          "diagramAfter": ["S3(静的サイト)", "CloudFront(準備中)", "独自ドメイン(準備中)"]
+        },
+        {
+          "label": "URLはそのままにして諦める",
+          "correct": false,
+          "resultText": "The Cloud Resume Challengeの醍醐味の1つが、まさにこの独自ドメイン・HTTPS化のプロセスです。ここを飛ばしてしまうと、クラウドの重要な要素（CDN、DNS、証明書）に触れる機会を逃してしまいます。"
+        }
+      ]
+    }
+  ]
+}

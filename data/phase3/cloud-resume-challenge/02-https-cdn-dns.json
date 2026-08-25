@@ -1,0 +1,60 @@
+{
+  "id": "crc-02-https-cdn-dns",
+  "title": "HTTPS化とカスタムドメイン",
+  "intro": "S3だけでは「HTTPS」も「独自ドメイン」も直接は扱えないと分かった。以前SDPで学んだCDNとDNSの知識を、実際にAWSのサービス名と結びつけながら組み立てていく。",
+  "tasks": [
+    {
+      "type": "fill",
+      "narration": "まずは以前学んだCDNの役割をおさらいしつつ、AWSでの具体的なサービス名を確認する。",
+      "prompt": "AWSでCDNの役割を果たすサービスは ___ で、S3の手前に配置してエッジ配信・HTTPS終端を行う。",
+      "template": "Client → ___ (CDN/HTTPS終端) → S3(オリジン)",
+      "options": ["CloudFront", "Route53", "IAM", "DynamoDB"],
+      "answer": "CloudFront",
+      "explain": "CloudFrontは、以前学んだ「CDN」のAWSにおける実装です。世界中のエッジロケーションにS3の内容をキャッシュして配信を高速化するだけでなく、HTTPS通信を終端する役割も担います。"
+    },
+    {
+      "type": "mcq",
+      "narration": "HTTPS化には証明書が必要だと以前学んだ。AWSでは、これを無料で発行・自動更新してくれるサービスがある。",
+      "question": "CloudFrontで使うSSL/TLS証明書を発行・管理するAWSのサービスは？",
+      "choices": [
+        "ACM（AWS Certificate Manager）：ドメインの所有権を確認した上で証明書を無料発行し、有効期限が近づくと自動更新もしてくれる",
+        "IAM",
+        "S3",
+        "DynamoDB"
+      ],
+      "answer": 0,
+      "explain": "以前THMで学んだ「HTTPSは証明書によって成り立っている」という知識が、ここで実際のサービスと結びつきます。ACMのおかげで、証明書の購入や手動更新の手間なく、無料でHTTPS化できます。"
+    },
+    {
+      "type": "mcq",
+      "narration": "最後に、自分の名前のドメイン（例: `your-name.com`）を取得し、CloudFrontに向ける作業が残っている。",
+      "question": "取得したドメイン名を、実際のCloudFrontのアドレスに結びつける（以前学んだDNSの設定を行う）AWSのサービスは？",
+      "choices": [
+        "Route53：ドメインの登録や、DNSレコード（ドメイン名とCloudFrontのアドレスを紐付けるレコードなど）の管理を行う",
+        "Lambda",
+        "API Gateway",
+        "CloudWatch"
+      ],
+      "answer": 0,
+      "explain": "Route53で「your-name.com は、このCloudFrontのアドレスを指す」というDNSレコードを設定します。以前SDPで学んだ「DNSはドメイン名をIPアドレス（や別のアドレス）に変換する仕組み」という知識が、ここでAWSの具体的な設定作業として実践できます。"
+    },
+    {
+      "type": "order",
+      "narration": "ここまでの要素を、実際に設定する順序として整理してみよう。",
+      "prompt": "独自ドメインでのHTTPS公開までの設定手順を正しい順序に並べよ",
+      "items": [
+        "Route53でドメインを取得（または既存ドメインを登録）する",
+        "ACMでそのドメイン名の証明書をリクエストし、所有権を確認して発行を受ける",
+        "CloudFrontのディストリビューションを作成し、オリジンをS3に、証明書をACMで発行したものに設定する",
+        "Route53のDNSレコードで、ドメイン名をCloudFrontのアドレスに向ける"
+      ],
+      "answer": [
+        "Route53でドメインを取得（または既存ドメインを登録）する",
+        "ACMでそのドメイン名の証明書をリクエストし、所有権を確認して発行を受ける",
+        "CloudFrontのディストリビューションを作成し、オリジンをS3に、証明書をACMで発行したものに設定する",
+        "Route53のDNSレコードで、ドメイン名をCloudFrontのアドレスに向ける"
+      ],
+      "explain": "証明書（ACM）は先にドメインの所有権確認を済ませてから、CloudFrontに設定する必要があります。この順序を意識しておくと、実際に作業する時に迷いません。これで `https://your-name.com` で経歴書サイトが表示できるようになった。次はいよいよ、静的なだけではない「動く」要素を追加していく。"
+    }
+  ]
+}
