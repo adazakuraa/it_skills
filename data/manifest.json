@@ -135,6 +135,218 @@
             "data/phase4/kaggle-competitive-ml/11-experiment-management-shakeup.json",
             "data/phase4/kaggle-competitive-ml/12-silver-medal-strategy.json"
           ]
+        },
+        {
+          "id": "atcoder-algorithms",
+          "title": "AtCoder競技プログラミング",
+          "description": "茶色から黄色レベルへ：全探索・DP・グラフ・データ構造・数論・実装力",
+          "lessons": [
+            "data/phase4/atcoder-algorithms/01-brute-force-complexity.json",
+            "data/phase4/atcoder-algorithms/02-greedy.json",
+            "data/phase4/atcoder-algorithms/03-binary-search.json",
+            "data/phase4/atcoder-algorithms/04-prefix-sum-imos.json",
+            "data/phase4/atcoder-algorithms/05-two-pointers.json",
+            "data/phase4/atcoder-algorithms/06-dp-basics.json",
+            "data/phase4/atcoder-algorithms/07-dp-advanced.json",
+            "data/phase4/atcoder-algorithms/08-graph-bfs-dfs.json",
+            "data/phase4/atcoder-algorithms/09-shortest-path.json",
+            "data/phase4/atcoder-algorithms/10-union-find-mst.json",
+            "data/phase4/atcoder-algorithms/11-topsort-scc.json",
+            "data/phase4/atcoder-algorithms/12-segment-tree-bit.json",
+            "data/phase4/atcoder-algorithms/13-number-theory.json",
+            "data/phase4/atcoder-algorithms/14-combinatorics-mod.json",
+            "data/phase4/atcoder-algorithms/15-implementation-and-debugging.json",
+            "data/phase4/atcoder-algorithms/16-yellow-strategy.json"
+          ]
+        },
+        {
+          "id": "nand2tetris",
+          "title": "Nand2Tetris",
+          "description": "NANDゲート1つから、論理回路→CPU→アセンブラ→VM→コンパイラ→OSまでを一気通貫で",
+          "lessons": [
+            "data/phase4/nand2tetris/01-boolean-logic.json",
+            "data/phase4/nand2tetris/02-boolean-arithmetic.json",
+            "data/phase4/nand2tetris/03-sequential-logic.json",
+            "data/phase4/nand2tetris/04-machine-language.json",
+            "data/phase4/nand2tetris/05-computer-architecture.json",
+            "data/phase4/nand2tetris/06-assembler.json",
+            "data/phase4/nand2tetris/07-vm-stack.json",
+            "data/phase4/nand2tetris/08-vm-program-control.json",
+            "data/phase4/nand2tetris/09-high-level-language.json",
+            "data/phase4/nand2tetris/10-compiler-syntax-analysis.json",
+            "data/phase4/nand2tetris/11-compiler-code-generation.json",
+            "data/phase4/nand2tetris/12-operating-system.json"
+          ]
+        },
+        {
+          "id": "byox-git",
+          "title": "Build Your Own Git",
+          "description": "Gitのオブジェクトモデル・ブランチ/マージ・リベースの内部動作",
+          "lessons": [
+            "data/phase4/byox-git/01-object-model.json",
+            "data/phase4/byox-git/02-branch-merge.json",
+            "data/phase4/byox-git/03-rebase-practice.json"
+          ]
+        },
+        {
+          "id": "byox-shell",
+          "title": "Build Your Own Shell",
+          "description": "REPL・fork/exec・パイプ/リダイレクト・ジョブコントロールの内部動作",
+          "lessons": [
+            "data/phase4/byox-shell/01-repl-basics.json",
+            "data/phase4/byox-shell/02-pipes-redirect.json",
+            "data/phase4/byox-shell/03-job-control-env.json"
+          ]
+        },
+        {
+          "id": "byox-webserver",
+          "title": "Build Your Own Web Server",
+          "description": "ソケット/HTTPパース・ルーティング・並行処理モデルの内部動作",
+          "lessons": [
+            "data/phase4/byox-webserver/01-socket-http-parse.json",
+            "data/phase4/byox-webserver/02-routing-static-files.json",
+            "data/phase4/byox-webserver/03-concurrency-models.json"
+          ]
+        },
+        {
+          "id": "byox-database",
+          "title": "Build Your Own Database",
+          "description": "B-Tree・トランザクション/WAL・インデックスとクエリ実行の内部動作",
+          "lessons": [
+            "data/phase4/byox-database/01-storage-engine-btree.json",
+            "data/phase4/byox-database/02-transactions-acid-wal.json",
+            "data/phase4/byox-database/03-indexes-query-execution.json"
+          ]
+        },
+        {
+          "id": "byox-docker",
+          "title": "Build Your Own Docker",
+          "description": "namespace・cgroups・OverlayFSで理解するコンテナの内部実装",
+          "lessons": [
+            "data/phase4/byox-docker/01-namespaces.json",
+            "data/phase4/byox-docker/02-cgroups.json",
+            "data/phase4/byox-docker/03-overlayfs-layers.json"
+          ]
+        },
+        {
+          "id": "byox-tls",
+          "title": "Build Your Own TLS",
+          "description": "ハンドシェイク・証明書チェーン・実務でのTLS運用",
+          "lessons": [
+            "data/phase4/byox-tls/01-handshake.json",
+            "data/phase4/byox-tls/02-cert-chain-ca.json",
+            "data/phase4/byox-tls/03-practical-operations.json"
+          ]
+        },
+        {
+          "id": "byox-os",
+          "title": "Build Your Own OS",
+          "description": "プロセス/コンテキストスイッチ・仮想メモリ・システムコールの内部動作",
+          "lessons": [
+            "data/phase4/byox-os/01-process-context-switch.json",
+            "data/phase4/byox-os/02-virtual-memory-paging.json",
+            "data/phase4/byox-os/03-syscalls-kernel-mode.json"
+          ]
+        },
+        {
+          "id": "byox-distributed-systems",
+          "title": "Build Your Own Distributed System",
+          "description": "合意問題(Raft)・論理時計・実務パターン(リーダー選出/べき等性)",
+          "lessons": [
+            "data/phase4/byox-distributed-systems/01-consensus-raft.json",
+            "data/phase4/byox-distributed-systems/02-time-ordering.json",
+            "data/phase4/byox-distributed-systems/03-practical-patterns.json"
+          ]
+        },
+        {
+          "id": "byox-language",
+          "title": "Build Your Own Programming Language",
+          "description": "Tree-walkingインタプリタ・クロージャ・型システムの設計",
+          "lessons": [
+            "data/phase4/byox-language/01-interpreter-basics.json",
+            "data/phase4/byox-language/02-scope-closures.json",
+            "data/phase4/byox-language/03-type-systems.json"
+          ]
+        },
+        {
+          "id": "byox-vm",
+          "title": "Build Your Own VM",
+          "description": "バイトコード設計・ガベージコレクション・JITコンパイルの基礎",
+          "lessons": [
+            "data/phase4/byox-vm/01-bytecode-design.json",
+            "data/phase4/byox-vm/02-garbage-collection.json",
+            "data/phase4/byox-vm/03-jit-compilation.json"
+          ]
+        },
+        {
+          "id": "byox-react",
+          "title": "Build Your Own React",
+          "description": "Virtual DOM/diffing・reconciliation・Hooksの内部実装",
+          "lessons": [
+            "data/phase4/byox-react/01-virtual-dom-diffing.json",
+            "data/phase4/byox-react/02-reconciliation.json",
+            "data/phase4/byox-react/03-hooks-internals.json"
+          ]
+        },
+        {
+          "id": "byox-search-engine",
+          "title": "Build Your Own Search Engine",
+          "description": "転置インデックス・TF-IDF/BM25・クローリングとアーキテクチャ",
+          "lessons": [
+            "data/phase4/byox-search-engine/01-inverted-index.json",
+            "data/phase4/byox-search-engine/02-ranking-tfidf-bm25.json",
+            "data/phase4/byox-search-engine/03-crawling-architecture.json"
+          ]
+        },
+        {
+          "id": "byox-ai",
+          "title": "Build Your Own AI (LLM/NN)",
+          "description": "ニューラルネット基礎・誤差逆伝播法・Transformer/Attention",
+          "lessons": [
+            "data/phase4/byox-ai/01-neural-network-basics.json",
+            "data/phase4/byox-ai/02-backpropagation.json",
+            "data/phase4/byox-ai/03-transformers-llm.json"
+          ]
+        },
+        {
+          "id": "byox-bot",
+          "title": "Build Your Own Bot",
+          "description": "イベント駆動アーキテクチャ・状態管理・Webhook連携",
+          "lessons": [
+            "data/phase4/byox-bot/01-event-driven-basics.json",
+            "data/phase4/byox-bot/02-state-management.json",
+            "data/phase4/byox-bot/03-webhooks-integration.json"
+          ]
+        },
+        {
+          "id": "byox-blockchain",
+          "title": "Build Your Own Blockchain",
+          "description": "ハッシュチェーン・プルーフオブワーク・分散合意",
+          "lessons": [
+            "data/phase4/byox-blockchain/01-hash-chain.json",
+            "data/phase4/byox-blockchain/02-proof-of-work.json",
+            "data/phase4/byox-blockchain/03-network-consensus.json"
+          ]
+        },
+        {
+          "id": "byox-3d-renderer",
+          "title": "Build Your Own 3D Renderer",
+          "description": "座標変換/透視投影・ラスタライゼーション/z-buffer・シェーディング",
+          "lessons": [
+            "data/phase4/byox-3d-renderer/01-coordinate-projection.json",
+            "data/phase4/byox-3d-renderer/02-rasterization-zbuffer.json",
+            "data/phase4/byox-3d-renderer/03-shading-lighting.json"
+          ]
+        },
+        {
+          "id": "byox-ar",
+          "title": "Build Your Own AR",
+          "description": "ポーズ推定/マーカー検出・座標マッピング・SLAM基礎",
+          "lessons": [
+            "data/phase4/byox-ar/01-pose-estimation-markers.json",
+            "data/phase4/byox-ar/02-coordinate-overlay.json",
+            "data/phase4/byox-ar/03-slam-basics.json"
+          ]
         }
       ]
     }
