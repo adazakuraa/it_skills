@@ -1,1 +1,44 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>EasyBand</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>EasyBand</h1>
+  <button id="audioBtn">🔊 音を有効化</button>
+</header>
 
+<main>
+  <section class="toolbar">
+    <label>楽器
+      <select id="instrument">
+        <option value="piano">ピアノ</option>
+        <option value="acoustic">アコースティックギター</option>
+        <option value="electric">エレキギター</option>
+        <option value="bass">ベース</option>
+        <option value="violin">ヴァイオリン</option>
+        <option value="cello">チェロ</option>
+        <option value="clarinet">クラリネット</option>
+        <option value="sax">サックス</option>
+        <option value="oboe">オーボエ</option>
+        <option value="bassoon">ファゴット</option>
+        <option value="trumpet">トランペット</option>
+        <option value="horn">ホルン</option>
+        <option value="cajon">カホン</option>
+      </select>
+    </label>
+    <label>音量 <input id="master" type="range" min="0" max="1" step=".01" value=".8"></label>
+  </section>
+
+  <section id="instrumentInfo" class="info"></section>
+  <section id="stage" class="stage"></section>
+  <p class="hint">スマホでは同時タッチ対応。タップの強さは対応端末では圧力として音量に反映されます。未対応端末ではタップ位置・速度から自然に補間します。</p>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
