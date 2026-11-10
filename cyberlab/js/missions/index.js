@@ -14,6 +14,8 @@ import { stageForensics } from './stage-forensics.js';
 import { stageLinux2 } from './stage-linux2.js';
 import { stageWebAdv } from './stage-webadv.js';
 import { stageDefense } from './stage-defense.js';
+import { stageNetAdv } from './stage-netadv.js';
+import { stageCTF } from './stage-ctf.js';
 
 export const STAGES = [
   stage0,          // 入門: ターミナル基礎
@@ -24,6 +26,7 @@ export const STAGES = [
   stageShell,      // 環境変数・スクリプト・cron
   stageNetBasics,  // ネットワーク理論
   stage4,          // ネットワーク調査(実技)
+  stageNetAdv,     // ネットワーク調査 II(深掘り)
   stageSecBasics,  // セキュリティ基礎理論
   stageCrypto,     // 暗号・ハッシュ(実技)
   stage3,          // ログ解析・インシデント
@@ -31,6 +34,7 @@ export const STAGES = [
   stageDefense,    // 防御・監視(ブルーチーム)
   stage5,          // Web脆弱性 I
   stageWebAdv,     // Web脆弱性 II
+  stageCTF,        // 総合演習(CTF)
 ];
 
 // 今後のステージはここに追加する:
