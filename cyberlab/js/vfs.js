@@ -250,7 +250,7 @@ export class VFS {
     return node;
   }
 
-  addFile(path, content, { mode = 0o644, owner = 'root', group, mtime } = {}) {
+  addFile(path, content, { mode = 0o644, owner = 'root', group, mtime, caps } = {}) {
     const parts = this.split(path);
     const name = parts.pop();
     let node = this.root;
@@ -263,6 +263,7 @@ export class VFS {
     const m = typeof mode === 'string' ? parseInt(mode, 8) : mode;
     const f = mkfileNode(content, m, u ? u.uid : 0, g ? g.gid : 0, mtime || BASE_TIME);
     node.children[name] = f;
+    if (caps) f.caps = caps;
     return f;
   }
 

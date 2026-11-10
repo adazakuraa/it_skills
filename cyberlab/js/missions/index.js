@@ -19,6 +19,11 @@ import { stageCTF } from './stage-ctf.js';
 import { stageSysadmin } from './stage-sysadmin.js';
 import { stageRecon } from './stage-recon.js';
 import { stageAdvanced } from './stage-advanced.js';
+import { stagePowerTools } from './stage-powertools.js';
+import { stageApiSec } from './stage-apisec.js';
+import { stageCloud } from './stage-cloud.js';
+import { stageDetect } from './stage-detect.js';
+import { stageAISec } from './stage-aisec.js';
 
 export const STAGES = [
   stage0,          // 入門: ターミナル基礎
@@ -28,6 +33,7 @@ export const STAGES = [
   stage2,          // 権限・プロセス
   stageShell,      // 環境変数・スクリプト・cron
   stageSysadmin,   // システム運用(ディスク/ログ/サービス/パッケージ)
+  stagePowerTools, // 実務の道具(jq/capabilities/systemd timer/SSH鍵)
   stageRecon,      // 情報収集・OSINT
   stageNetBasics,  // ネットワーク理論
   stage4,          // ネットワーク調査(実技)
@@ -39,7 +45,11 @@ export const STAGES = [
   stageDefense,    // 防御・監視(ブルーチーム)
   stage5,          // Web脆弱性 I
   stageWebAdv,     // Web脆弱性 II
+  stageApiSec,     // API & 認証(JWT/SSRF)
+  stageCloud,      // クラウド & コンテナ(IAM/S3/Docker/脱出)
   stageAdvanced,   // 発展分野(AD/クラウド/コンテナ/IR 等)
+  stageDetect,     // 脅威分析と検知(ATT&CK/検知/IoC)
+  stageAISec,      // AI/LLMセキュリティ
   stageCTF,        // 総合演習(CTF)
 ];
 

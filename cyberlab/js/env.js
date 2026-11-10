@@ -82,7 +82,7 @@ export function buildEnvironment(mission) {
     else vfs.addDir(d.path, { mode: d.mode, owner: d.owner || userName, group: d.group });
   }
   for (const f of (e.files || [])) {
-    const node = vfs.addFile(f.path, dedent(f.content || ''), { mode: f.mode, owner: f.owner || userName, group: f.group, mtime: f.mtime });
+    const node = vfs.addFile(f.path, dedent(f.content || ''), { mode: f.mode, owner: f.owner || userName, group: f.group, mtime: f.mtime, caps: f.caps });
     if (f.special) node.special = f.special;
   }
   rebuildPasswd(vfs, e.shadow);

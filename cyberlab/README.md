@@ -51,7 +51,9 @@ cd cyberlab && python3 -m http.server 8000
 
 ## 学習の流れ
 
-ステージは一本道で、前のミッションをクリアすると次が解放されます。**全20ステージ・100ミッション**。
+ステージは一本道で、前のミッションをクリアすると次が解放されます。**全25ステージ・117ミッション**。
+基礎（Linux/ネットワーク/セキュリティ）から、**クラウド・コンテナ・API・検知・AIセキュリティ**まで、
+実務的・近代的な応用トピックまでをカバーしています。
 
 | ステージ | 内容 |
 |---|---|
@@ -62,6 +64,7 @@ cd cyberlab && python3 -m http.server 8000
 | 2. 権限とプロセス | chmod / SUID / ps / kill / systemctl で堅牢化 |
 | Shell. 自動化 | 環境変数/PATH・スクリプト読解・cron・リダイレクト |
 | Linux III | ディスク(df/du)・ログローテーション・サービス/パッケージ監査 |
+| Power Tools | jqでJSONログ分析・capabilities権限昇格・systemd timer永続化・SSH鍵バックドア |
 | Recon. 情報収集 | 秘密情報の横断検索・メタデータ漏洩・ユーザー列挙・OSINT/OPSEC |
 | Net.基礎 | OSI/TCP-IP・サブネット・ARP・DNS・DHCP・ポート・ルーティング・HTTP/TLS・FW/VPN |
 | 4. ネットワーク調査 | ip/nmap/ss/dig/curl・ポートスキャン・Web偵察・経路解析・地図化 |
@@ -73,7 +76,11 @@ cd cyberlab && python3 -m http.server 8000
 | Defense. 防御 | C2検知(ss)・bash_history解析・堅牢化・バックアップ復旧・総当たり検知 |
 | 5. Web脆弱性 I | SQLインジェクション・ディレクトリトラバーサル |
 | Web II | コマンドインジェクション・XSS・IDOR・情報漏洩・アップロード |
+| API & 認証 | JWT復号・JWT改ざん(alg:none)・SSRF→クラウドメタデータ窃取 |
+| Cloud & Container | IAM/S3ポリシー監査(jq)・Dockerfileレビュー・コンテナ脱出の兆候 |
 | Advanced. 発展 | AD/Kerberos・Windows・クラウド・コンテナ・PKI・マルウェア・IR・ゼロトラスト |
+| Detect. 検知 | MITRE ATT&CKマッピング・検知ルール作成・IoC抽出/脅威インテル |
+| AI/LLM | プロンプトインジェクション・機密漏洩(RAG)・安全でない出力処理 |
 | CTF. 総合演習 | 偵察→足がかり・権限昇格・Web→RCE・多重復号・総合フォレンジック |
 
 各ミッションは「状況説明 → 事前解説（なぜ/何を解決/仕組み/例/関係）→ 演習 → 段階的ヒント → クリア後の振り返り」で構成し、
