@@ -5,8 +5,19 @@ import { stage2 } from './stage2-permissions.js';
 import { stage3 } from './stage3-incident.js';
 import { stage4 } from './stage4-network.js';
 import { stage5 } from './stage5-webvuln.js';
+import { stageNetBasics } from './stage-netbasics.js';
+import { stageSecBasics } from './stage-secbasics.js';
 
-export const STAGES = [stage0, stage1, stage2, stage3, stage4, stage5];
+export const STAGES = [
+  stage0,
+  stage1,
+  stageNetBasics,
+  stage2,
+  stageSecBasics,
+  stage3,
+  stage4,
+  stage5,
+];
 
 // 今後のステージはここに追加する:
 //   フォレンジック / 暗号 / Active Directory / クラウド・コンテナ など
