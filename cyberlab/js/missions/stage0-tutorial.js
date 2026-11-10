@@ -1,0 +1,142 @@
+// Stage 0: チュートリアル — ターミナルと調査の基本
+export const stage0 = {
+  id: 'stage0',
+  title: 'Stage 0 — 訓練環境へようこそ',
+  subtitle: 'ターミナルの使い方と「調べる」という姿勢を身につける',
+  intro: 'あなたは研究機関のセキュリティ部門に配属された見習いエンジニア。まずは訓練用のLinux端末に慣れることから始める。',
+  missions: [
+    {
+      id: 'tut-01-pwd-ls',
+      title: '自分の居場所を知る',
+      minutes: 5,
+      objectives: ['ターミナルでコマンドを実行する', 'pwd と ls で現在地とファイルを確認する'],
+      prereq: [],
+      briefing: '端末にログインした。まずは「自分が今どこにいて、周りに何があるか」を確認するのが調査の第一歩だ。GUIと違い、ターミナルでは見えているものがすべてではない。自分で問い合わせて初めて情報が得られる。',
+      concepts: [
+        {
+          title: 'シェルとカレントディレクトリ',
+          why: 'ターミナルはシェルというプログラムに文字でコマンドを渡し、結果を文字で受け取る仕組み。GUIのアイコン操作より速く、正確で、記録に残る。',
+          problem: 'ファイルを操作するにも、まず「いま自分がどのフォルダにいるのか」が分からなければ始まらない。',
+          how: 'シェルは常に「カレントディレクトリ（作業中の現在地）」を持つ。pwd (print working directory) でその絶対パスを表示できる。ls (list) でそのディレクトリの中身を一覧できる。',
+          example: '$ pwd\n/home/analyst\n$ ls\nnotes.txt  welcome.txt',
+          relation: 'このミッションでは pwd と ls を実際に打って、自分のホームディレクトリの中身を確認する。',
+        },
+      ],
+      env: {
+        hostname: 'training', user: 'analyst', sudo: false,
+        files: [
+          { path: '/home/analyst/welcome.txt', owner: 'analyst', content: 'CyberLab 訓練環境へようこそ。\nこのファイルは cat welcome.txt で読めます。\n' },
+          { path: '/home/analyst/notes.txt', owner: 'analyst', content: '調査メモ:\n- まず pwd で現在地\n- 次に ls -a で隠しファイルも確認\n' },
+        ],
+      },
+      quick: ['pwd', 'ls', 'ls -a', 'ls -la'],
+      tasks: [
+        {
+          q: '現在の作業ディレクトリ（絶対パス）を表示してください。',
+          narration: 'どんな調査も「現在地の確認」から。まずは pwd を実行しよう。',
+          check: { type: 'answer', any: ['/home/analyst'] },
+          answerHint: 'pwd の出力をそのまま入力',
+          hints: ['いま自分がいる場所を表示するコマンドがある', 'print working directory の略', 'pwd と入力して実行し、表示されたパスを答える'],
+          explain: 'pwd はカレントディレクトリの絶対パスを表示する。ホームディレクトリは慣例的に /home/ユーザー名 に置かれる。',
+        },
+        {
+          q: 'このディレクトリには隠しファイルを含めていくつのエントリ（. と .. を除く通常/隠しファイル）がありますか。ls -a で確認して数を答えてください。',
+          narration: 'ls だけでは「.」で始まる隠しファイルは見えない。セキュリティ調査では隠しファイルにこそ重要な情報があることが多い。-a オプションを付けると隠しファイルも表示される。',
+          check: { type: 'answer', any: ['4', '４'] },
+          answerHint: '半角数字で',
+          hints: ['ls に隠しファイルを表示するオプションを付ける', 'ls -a を使う。. と .. は自分自身と親なので数に含めない', 'welcome.txt, notes.txt と、隠しファイル .bashrc, .profile の4つ'],
+          explain: 'ls -a は「.」で始まる隠しファイルも表示する。ホームには通常 .bashrc や .profile といった設定ファイルが隠しファイルとして存在する。調査では ls -la（詳細＋隠し）を習慣にすると良い。',
+        },
+        {
+          q: 'welcome.txt の中身を表示してください（表示できたら done と入力）。',
+          narration: 'ファイルの中身を読むには cat を使う。cat welcome.txt のように、コマンドの後ろに対象（引数）を渡す。',
+          check: { type: 'answer', any: ['done', 'ok'], ci: true },
+          answerHint: '読めたら done',
+          hints: ['ファイルを表示するコマンドは cat', 'cat の後ろにファイル名を書く', 'cat welcome.txt を実行し、読めたら done と入力'],
+          explain: 'cat はファイルの内容を標準出力に表示する。コマンドの後ろに渡す文字列を「引数」と呼び、ここではファイル名が引数になる。',
+        },
+      ],
+      quickAfter: true,
+      review: {
+        steps: ['pwd で現在地を確認', 'ls -a で隠しファイルを含め一覧', 'cat でファイルを読む'],
+        commands: [
+          { cmd: 'pwd', meaning: '現在の作業ディレクトリの絶対パスを表示' },
+          { cmd: 'ls -a', meaning: '隠しファイルも含めて一覧表示' },
+          { cmd: 'cat welcome.txt', meaning: 'ファイルの内容を表示' },
+        ],
+        why: '調査の基本は「現在地の把握 → 周囲の列挙 → 中身の確認」。この3ステップはあらゆるLinux作業の土台になる。',
+        practice: '侵害されたサーバーを調べるとき、まず cwd と ls -la で不審なファイルがないかを見るのが定石。',
+        related: ['相対パスと絶対パス', 'cd によるディレクトリ移動'],
+      },
+      learned: ['terminal-basics', 'pwd', 'ls', 'cat', 'hidden-files'],
+      solution: ['pwd', 'ls -a', 'cat welcome.txt'],
+    },
+
+    {
+      id: 'tut-02-navigate',
+      title: 'ディレクトリを渡り歩く',
+      minutes: 7,
+      objectives: ['cd で絶対パス・相対パスを移動する', 'ファイルの中身を探して情報を得る'],
+      prereq: ['tut-01-pwd-ls'],
+      briefing: 'ファイルシステムは木構造になっている。目的のファイルにたどり着くには、枝をたどるように cd でディレクトリを移動する。訓練用の資料が /opt/training の下に置かれている。読みに行こう。',
+      concepts: [
+        {
+          title: 'ディレクトリツリーと相対/絶対パス',
+          why: 'Linuxのファイルは一本の木（/ がルート）にぶら下がる。場所を正確に指すために「パス」を使う。',
+          problem: '「あのファイル」と言っても機械には伝わらない。どこにあるかを一意に示す必要がある。',
+          how: '/ から始まるのが絶対パス（例 /opt/training/readme.txt）。現在地からの相対パスは . が現在地、.. が親。cd で移動し、cd .. で一つ上に戻る。',
+          example: '$ cd /opt/training\n$ cd ..\n$ pwd\n/opt',
+          relation: 'このミッションでは絶対パスと相対パスの両方で移動してファイルを探す。',
+        },
+      ],
+      env: {
+        hostname: 'training', user: 'analyst',
+        dirs: ['/opt/training', '/opt/training/day1', '/opt/training/day2'],
+        files: [
+          { path: '/opt/training/readme.txt', content: '訓練初日の資料は day1/ に、2日目は day2/ にあります。\n' },
+          { path: '/opt/training/day1/lesson.txt', content: 'Day1: パスの考え方。合言葉は path-master。\n' },
+          { path: '/opt/training/day2/lesson.txt', content: 'Day2: 権限の考え方。\n' },
+        ],
+      },
+      quick: ['cd /opt/training', 'ls', 'cd ..', 'cat readme.txt', 'cd day1', 'pwd'],
+      tasks: [
+        {
+          q: '/opt/training に移動し、その場所の絶対パスを答えてください。',
+          narration: '絶対パスを使えば、今どこにいても一発で目的地へ飛べる。cd /opt/training を実行しよう。',
+          check: { type: 'answer', any: ['/opt/training'] },
+          hints: ['cd に絶対パスを渡す', 'cd /opt/training', '移動後に pwd で確認してその値を答える'],
+          explain: 'cd に / で始まる絶対パスを渡すと、現在地に関係なくそこへ移動できる。',
+        },
+        {
+          q: 'day1 ディレクトリの中の lesson.txt に書かれている「合言葉」を答えてください。',
+          narration: '相対パスでの移動も試そう。今 /opt/training にいるなら、cd day1 で一つ下の day1 に入れる（先頭に / を付けないのがポイント）。',
+          check: { type: 'answer', any: ['path-master'] },
+          answerHint: 'lesson.txt 内の合言葉',
+          hints: ['cd day1 で下に降り、cat でファイルを読む', 'cat day1/lesson.txt でも直接読める', 'ファイル内の「合言葉は ___」の部分を答える'],
+          explain: '相対パス day1 は「現在地の下の day1」を指す。cat day1/lesson.txt のようにパスを引数にすれば、移動せずに読むこともできる。どちらも覚えておくと速い。',
+        },
+        {
+          q: '一つ上のディレクトリ（/opt）へ戻ってから、現在地の絶対パスを答えてください。',
+          narration: '.. は「親ディレクトリ」を意味する特別な名前。cd .. で木を一段のぼれる。',
+          check: { type: 'answer', any: ['/opt'] },
+          hints: ['親に戻る相対パスは ..', 'cd .. を実行', 'pwd で確認'],
+          explain: '.. は親ディレクトリ、. は現在地を指す。これらを組み合わせると ../../etc のように相対的に離れた場所も指せる。',
+        },
+      ],
+      review: {
+        steps: ['cd 絶対パス で一気に移動', 'cd 相対名 で下へ', 'cd .. で上へ', 'cat パス で移動せず中身確認'],
+        commands: [
+          { cmd: 'cd /opt/training', meaning: '絶対パスで移動' },
+          { cmd: 'cd day1', meaning: '相対パスで一段下へ' },
+          { cmd: 'cd ..', meaning: '親ディレクトリへ' },
+          { cmd: 'cat day1/lesson.txt', meaning: 'パス指定で直接読む' },
+        ],
+        why: '侵害調査やログ調査では深いディレクトリを行き来する。パスを自在に扱えることが効率を大きく左右する。',
+        practice: 'Webサーバーの設定を見るときは /etc/nginx や /var/www/html へ cd して調べる。',
+        related: ['find によるファイル検索', 'ワイルドカード'],
+      },
+      learned: ['cd', 'absolute-path', 'relative-path', 'directory-tree'],
+      solution: ['cd /opt/training', 'cat day1/lesson.txt', 'cd ..', 'pwd'],
+    },
+  ],
+};

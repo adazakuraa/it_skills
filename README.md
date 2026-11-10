@@ -3,6 +3,8 @@
 System Design Primer / TryHackMe / Killercoda / AWS Cloud Quest / Cloud Resume Challenge などから得られる知識を、
 スマホで完結する疑似コーディング形式のクイズ/シナリオとして学べる、GitHub Pages用の静的Webアプリです。
 
+> **🖥️ 新規: CyberLab（Linux × サイバーセキュリティ 実践演習）** — 仮想ターミナルを操作して調査・防御の課題を自力で解く、TryHackMe型の実践シミュレーターを `cyberlab/` に追加しました。公開URLは `.../cyberlab/`。詳細は [`cyberlab/README.md`](cyberlab/README.md) を参照してください。
+
 - ビルド不要（Vanilla HTML/CSS/JS）
 - コンテンツはすべて `data/` 以下のJSONファイル
 - 進捗は端末のブラウザ内（localStorage）に保存。エクスポート/インポートで機種変更にも対応
