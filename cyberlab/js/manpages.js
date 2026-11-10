@@ -24,4 +24,11 @@ export const MANPAGES = {
   tail: `TAIL(1)\n\nNAME\n    tail - ファイルの末尾を表示する\n\nDESCRIPTION\n    -n N   末尾 N 行   -f  追記を監視（本シミュレーターでは静的）\n\n例: tail -n 20 /var/log/auth.log`,
   head: `HEAD(1)\n\nNAME\n    head - ファイルの先頭を表示する\n\nDESCRIPTION\n    -n N   先頭 N 行`,
   man: `MAN(1)\n\nNAME\n    man - マニュアルを表示する\n\nDESCRIPTION\n    man COMMAND で各コマンドの要約を表示します（シミュレーター版）。`,
+  ip: `IP(8)\n\nNAME\n    ip - ネットワーク設定を表示・操作する\n\nDESCRIPTION\n    ip a (ip addr)   インターフェースとIPアドレスを表示\n    ip r (ip route)  ルーティング表（default がゲートウェイ）\n    ip link          リンク層(MAC)情報`,
+  nmap: `NMAP(1)\n\nNAME\n    nmap - ネットワーク探索・ポートスキャン\n\nSYNOPSIS\n    nmap [options] target\n\nDESCRIPTION\n    nmap HOST        開いているTCPポートとサービスを列挙\n    -sV              サービス/バージョンを推定\n    -p 22,80         ポートを指定\n\n注: 本シミュレーターはゲーム内の仮想ホストのみを対象にします。`,
+  curl: `CURL(1)\n\nNAME\n    curl - URLにデータを送受信する\n\nSYNOPSIS\n    curl [options] URL\n\nDESCRIPTION\n    curl URL             GETでレスポンスを取得\n    -I                   ヘッダのみ取得\n    -X POST              メソッド指定\n    -d "k=v&k2=v2"       POSTデータ送信\n    -o FILE              レスポンスをファイルに保存\n\n& や ? を含むURLはクォートで囲むこと。`,
+  curlnote: '',
+  ss: `SS(8)\n\nNAME\n    ss - ソケットの統計を表示\n\nDESCRIPTION\n    -t TCP  -u UDP  -l LISTEN  -n 数値表示  -p プロセス\n\n例: ss -tlnp  (待ち受けTCPポートとプロセス)`,
+  dig: `DIG(1)\n\nNAME\n    dig - DNSを問い合わせる\n\nDESCRIPTION\n    dig NAME          Aレコードを問い合わせ\n    dig +short NAME   IPアドレスだけ表示`,
+  ping: `PING(8)\n\nNAME\n    ping - ICMPでホストの到達性を確認\n\nDESCRIPTION\n    ping HOST     応答を確認\n    -c N          N回で終了`,
 };

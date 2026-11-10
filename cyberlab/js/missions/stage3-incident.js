@@ -149,5 +149,97 @@ Oct 14 09:30:00 intra-07 sshd[3001]: Accepted publickey for analyst from 198.51.
       learned: ['cron', 'persistence-removal', 'c2-beacon', 'ioc', 'incident-containment'],
       solution: ['cat /var/spool/cron/crontabs/backup', 'cat /tmp/.x/beacon.sh', 'rm /tmp/.x/beacon.sh'],
     },
+
+    {
+      id: 'i-03-syslog',
+      title: 'syslogから障害と攻撃を切り分ける',
+      minutes: 11,
+      objectives: ['syslogを解析する', 'ノイズの中から重要イベントを抽出する'],
+      prereq: ['i-01-authlog'],
+      briefing: 'システム全体のログ /var/log/syslog には、正常動作から障害、攻撃の兆候まで玉石混交で記録される。grep で重要なレベルのイベントだけを拾い、状況を評価する。',
+      concepts: [{
+        title: 'syslogの構造と重要度',
+        why: 'syslogはOS・サービスの出来事を集約する。膨大なノイズの中から、重要なイベントを素早く抽出する力が要る。',
+        problem: '大量のINFOログに紛れた ERROR/CRITICAL や、攻撃の兆候を見つけたい。',
+        how: 'syslogの各行は「時刻 ホスト名 プロセス[PID]: メッセージ」。grep で重大度(error/warn/fail)やキーワード(denied, segfault, oom)を抽出。grep -i で表記揺れ吸収、grep -c で件数。時刻で相関させて状況を再構成する。',
+        example: '$ grep -iE "error|fail|denied" /var/log/syslog',
+        relation: 'syslogから重大イベントを抽出し、障害か攻撃かを切り分ける。',
+      }],
+      env: {
+        hostname: 'intra-07', user: 'analyst',
+        files: [{ path: '/var/log/syslog', owner: 'analyst', content:
+`Oct 14 05:00:01 intra-07 systemd[1]: Started Daily apt upgrade.
+Oct 14 05:01:10 intra-07 kernel: [12345] usb 1-1: new device
+Oct 14 05:02:33 intra-07 sshd[2211]: error: maximum authentication attempts exceeded for root from 203.0.113.9
+Oct 14 05:02:40 intra-07 kernel: Out of memory: Killed process 3300 (java)
+Oct 14 05:03:00 intra-07 sudo[2250]: pam_unix(sudo:auth): authentication failure; user=webops
+Oct 14 05:03:15 intra-07 cron[900]: (root) CMD (/usr/local/bin/backup.sh)
+Oct 14 05:04:00 intra-07 sshd[2260]: error: maximum authentication attempts exceeded for admin from 203.0.113.9
+` }],
+      },
+      quick: ['cd /var/log', 'grep -i error syslog', 'grep -iE "error|fail|denied" syslog', 'grep -c "authentication attempts exceeded" syslog', 'grep -i "out of memory" syslog'],
+      tasks: [
+        {
+          q: 'syslogには、リソース枯渇による障害(プロセスが強制終了された)イベントが1件あります。カーネルがメモリ不足で強制終了させたプロセス名を答えてください。',
+          narration: 'grep -i "out of memory" で、メモリ枯渇(OOM)による強制終了を探す。これは攻撃でなく障害の可能性。',
+          check: { type: 'answer', any: ['java'], ci: true },
+          answerHint: 'プロセス名',
+          hints: ['grep -i "out of memory" syslog', 'Killed process ... (___)', 'java が OOM Killer に終了された'],
+          explain: 'kernel: Out of memory: Killed process (java) はメモリ枯渇でカーネルがjavaを強制終了したもの＝性能/障害イベント(攻撃とは限らない)。syslogには攻撃だけでなく障害も記録される。両者を切り分けるのが運用・調査の目。OOMはメモリリークや負荷増が原因。',
+        },
+        {
+          q: 'syslog には SSH認証の試行超過エラーが複数あり、同一IPからの攻撃の兆候です。その攻撃元IPを答えてください。',
+          narration: 'grep -iE で error/fail を抽出し、SSH関連の攻撃兆候(maximum authentication attempts exceeded)の発信元を見る。',
+          check: { type: 'answer', any: ['203.0.113.9'], normalizeIp: true },
+          answerHint: 'IPアドレス',
+          hints: ['grep "authentication attempts exceeded" syslog', 'from ___ の部分', '203.0.113.9 が root と admin に試行'],
+          explain: '203.0.113.9 が root/admin へ認証試行を超過＝総当たりの兆候(auth.logと同じIP)。syslogから「障害(OOM)」と「攻撃(SSH試行超過・sudo失敗)」を切り分けられた。重大イベントをgrepで拾い、時刻とIPで相関させるのがログ解析の実務。syslogとauth.logの突き合わせで確度が上がる。',
+        },
+      ],
+      review: { steps: ['grep -iEで重大イベントを抽出', 'OOM等の障害と攻撃を切り分け', '攻撃兆候の発信元を特定', '他ログと相関'], commands: [{ cmd: 'grep -iE "error|fail|denied" syslog', meaning: '重大イベント抽出' }, { cmd: 'grep "authentication attempts exceeded" syslog', meaning: 'SSH攻撃兆候の抽出' }], why: 'syslogは情報の洪水。重要イベントを素早く拾い、障害と攻撃を切り分ける力が運用と調査を支える。', practice: 'syslog/journalの監視、OOM・segfault等の障害検知、攻撃兆候のアラート、SIEMでの相関。', related: ['ログ解析', 'auth.log', 'SIEM'] },
+      learned: ['syslog', 'oom-killer', 'event-triage', 'log-correlation'], solution: ['cd /var/log', 'grep -i "out of memory" syslog', 'grep "authentication attempts exceeded" syslog'],
+    },
+
+    {
+      id: 'i-04-report',
+      title: 'インシデントを報告書にまとめる',
+      minutes: 12,
+      objectives: ['調査結果を構造化して記録する', 'IoCとタイムラインを整理する'],
+      prereq: ['i-02-persistence'],
+      briefing: '調査の締めくくりは報告。発見した事実(侵入元・経路・設置物・対応)を、ファイルに構造化して記録する。報告できて初めて対応は完了する。',
+      concepts: [{
+        title: 'インシデント報告の作成',
+        why: '調査は「記録・共有」されて初めて価値になる。再発防止・法的対応・引き継ぎのため、事実を構造化して残す。',
+        problem: '散らばった調査結果(IoC・タイムライン・対応)を、後から誰でも追える形でまとめたい。',
+        how: '報告書に必須の要素: 概要、タイムライン(時刻順の出来事)、IoC(攻撃元IP・ハッシュ・ファイル名)、影響範囲、対応内容、再発防止策。echo や リダイレクト(>, >>)でファイルに書き出し、cat で確認する。事実と推測を区別して書く。',
+        example: '$ echo "攻撃元IP: 203.0.113.9" >> /home/analyst/report/incident.md',
+        relation: 'リダイレクトで調査結果を報告書ファイルに記録する。',
+      }],
+      env: {
+        hostname: 'intra-07', user: 'analyst', dirs: ['/home/analyst/report'],
+        files: [{ path: '/home/analyst/report/template.md', owner: 'analyst', content: '# インシデント報告書\n## 概要\n## タイムライン\n## IoC(侵害指標)\n## 対応\n## 再発防止\n' }],
+      },
+      quick: ['cd /home/analyst/report', 'cat template.md', 'echo "攻撃元IP: 203.0.113.9" > incident.md', 'echo "設置物: /tmp/.x/beacon.sh (C2: evil.example)" >> incident.md', 'cat incident.md'],
+      tasks: [
+        {
+          q: 'report/incident.md という報告書ファイルを作り、1行目に攻撃元IPを記録します。"攻撃元IP: 203.0.113.9" という内容で incident.md を作成してください（リダイレクト >）。できたら done。',
+          narration: 'echo の出力を > で新規ファイルに書き出す。報告書の最初の事実を記録する。',
+          check: { type: 'all', of: [{ type: 'state', path: '/home/analyst/report/incident.md', exists: true }, { type: 'state', path: '/home/analyst/report/incident.md', contains: '203.0.113.9' }] },
+          answerHint: '作成したら done',
+          hints: ['cd ~/report', 'echo "攻撃元IP: 203.0.113.9" > incident.md', 'cat incident.md で確認し done'],
+          explain: 'echo ... > incident.md で報告書を作成し、攻撃元IPを記録した。> は新規作成/上書き。インシデント対応では、確定した事実(IoC)を漏れなく記録することが、再発防止と引き継ぎの要になる。',
+        },
+        {
+          q: '続けて、設置されたバックドアの情報を追記します。"設置物: /tmp/.x/beacon.sh (C2: evil.example)" を incident.md に追記してください（追記は >>）。追記できたら done。',
+          narration: '既存ファイルに追加するのは >> (上書きの > と区別)。IoCを積み上げていく。',
+          check: { type: 'all', of: [{ type: 'state', path: '/home/analyst/report/incident.md', contains: '203.0.113.9' }, { type: 'state', path: '/home/analyst/report/incident.md', contains: 'beacon.sh' }] },
+          answerHint: '追記したら done',
+          hints: ['echo "設置物: /tmp/.x/beacon.sh (C2: evil.example)" >> incident.md', '>> は追記(> だと上書きで前の行が消える)', 'cat incident.md で2行あることを確認し done'],
+          explain: '>> で追記し、攻撃元IPと設置物(beacon.sh, C2:evil.example)の両方が報告書に揃った。> と >> の使い分けが重要(> だと前の行が消える)。報告書には概要・タイムライン・IoC・対応・再発防止を構造化して記す。調査は記録・共有されて初めて組織の資産になる。',
+        },
+      ],
+      review: { steps: ['報告書の構成を決める', '> で新規作成', '>> で事実を追記', 'IoC・タイムライン・対応を構造化'], commands: [{ cmd: 'echo "攻撃元IP: 203.0.113.9" > incident.md', meaning: '報告書を新規作成' }, { cmd: 'echo "..." >> incident.md', meaning: '事実を追記' }], why: '報告は対応の最終段階。記録されない調査は価値を失う。再発防止・引き継ぎ・法的対応の基礎。', practice: 'インシデント報告書の作成、IoCの共有(MISP等)、ポストモーテム、教訓の文書化。', related: ['リダイレクト', 'IoC', 'インシデント対応プロセス'] },
+      learned: ['incident-report', 'ioc-documentation', 'redirect', 'reporting'], solution: ['cd /home/analyst/report', 'echo "攻撃元IP: 203.0.113.9" > incident.md', 'echo "設置物: /tmp/.x/beacon.sh (C2: evil.example)" >> incident.md'],
+    },
   ],
 };

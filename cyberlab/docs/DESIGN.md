@@ -100,9 +100,22 @@ node = { type: 'd'|'f'|'l', mode: 0o755, uid, gid, mtime, content?: string, chil
 |---|---|---|
 | 1 | スマホUI・ステージ/ミッション管理・ターミナル・仮想FS・基本コマンド・保存 | 実装済み |
 | 2 | Linux基礎カリキュラム（ファイル・検索・テキスト処理・パイプ・権限・プロセス・cron・ログ） | 実装済み |
-| 3 | 仮想ネットワーク・ネットワークコマンド | 設計済み（未実装） |
-| 4 | 仮想Webサーバー・脆弱性演習・防御/フォレンジック | 設計済み（未実装） |
-| 5 | 完成度向上 | 継続 |
+| 3 | 仮想ネットワーク・ネットワークコマンド（ip/nmap/ss/dig/curl 等） | 実装済み（Stage 4） |
+| 4 | 仮想Webサーバー・脆弱性演習（SQLi/トラバーサル） | 実装済み（Stage 5） |
+| 5 | フォレンジック・暗号・AD・クラウド/コンテナ 等の発展 | 継続 |
+
+### 仮想ネットワーク (netcommands.js)
+`mission.env.network` から `shell.net` を構築する。実在ホストへは一切通信せず、以下のデータだけを参照する。
+```js
+network = {
+  interfaces, routes, dns,            // ip a / ip r / dig・nslookup
+  listening: [{proto,addr,port,process,pid}],  // ss / netstat（自ホストの待ち受け）
+  hosts: { 'ip': { names, ports:[{port,service,banner, http}] } }, // nmap / nc / curl
+}
+```
+HTTPは宣言的ルーティング `http.routes[{ path, method?, when?, body, default? }]` で応答を出し分ける。
+`when:{param,equals|contains|regex}` によって、SQLi（`' OR '1'='1`）やパストラバーサル（`../`）の
+成功条件を**関数を使わずデータだけで**表現し、安全に攻撃演習を再現する。
 
 ## 7. ミッション追加手順
 1. `js/missions/` にステージファイルを追加（または既存ファイルに追記）。

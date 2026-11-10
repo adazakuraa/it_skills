@@ -708,6 +708,24 @@ export function makeCommands(getCmds) {
     return 0;
   };
 
+  C.jq = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { r: 'bool', c: 'bool', e: 'bool' });
+    const filter = operands[0];
+    if (filter == null) { ctx.err('jq: フィルタがありません (例: jq \'.key\')\n'); return 2; }
+    const srcs = operands.slice(1);
+    let text = srcs.length ? safeRead(ctx, srcs[0], 'jq') : ctx.stdin;
+    if (text == null) return 1;
+    let data;
+    try { data = JSON.parse(text); } catch (e) { ctx.err(`jq: error: JSONの解析に失敗しました\n`); return 2; }
+    let results;
+    try { results = applyJq(filter, data); } catch (e) { ctx.err(`jq: error: ${e.message}\n`); return 3; }
+    for (const r of results) {
+      if (opts.r && typeof r === 'string') ctx.out(r + '\n');
+      else ctx.out(JSON.stringify(r, null, opts.c ? undefined : 2) + '\n');
+    }
+    return 0;
+  };
+
   C.cut = (args, ctx) => {
     const { opts, operands } = parseOpts(args, { d: 'val', f: 'val', c: 'val', s: 'bool' });
     let data = operands.length ? safeRead(ctx, operands[0], 'cut') : ctx.stdin;
@@ -817,6 +835,8 @@ export function makeCommands(getCmds) {
         const parts = arg.split(',').map(tok => {
           tok = tok.trim();
           if (tok === '$0') return line;
+          if (tok === '$NF') return fields[NF - 1] ?? '';
+          if (tok === '$(NF-1)') return fields[NF - 2] ?? '';
           const fm = tok.match(/^\$(\d+)$/);
           if (fm) return fields[parseInt(fm[1], 10) - 1] ?? '';
           if (tok === 'NR') return String(NR);
@@ -968,7 +988,8 @@ export function makeCommands(getCmds) {
     const data = srcs.length ? safeRead(ctx, srcs[0], 'base64') : ctx.stdin;
     if (data == null) return 1;
     try {
-      if (decode) ctx.out(b64decode(data.trim()));
+      // base64url (JWT等) も許容: - _ を + / に変換
+      if (decode) ctx.out(b64decode(data.trim().replace(/-/g, '+').replace(/_/g, '/')));
       else { const enc = b64encode(data); ctx.out(enc.replace(/(.{76})/g, '$1\n').replace(/\n$/, '') + '\n'); }
     } catch (e) { ctx.err('base64: invalid input\n'); return 1; }
     return 0;
@@ -991,6 +1012,71 @@ export function makeCommands(getCmds) {
   C.exit = (args, ctx) => { ctx.sh.exitRequested = true; return parseInt(args[0] || '0', 10) || 0; };
   C.logout = C.exit;
 
+  C.du = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { s: 'bool', h: 'bool', a: 'bool' });
+    const paths = operands.length ? operands : ['.'];
+    const vfs = ctx.sh.vfs;
+    let code = 0;
+    const sizeOf = (node) => {
+      if (node.type !== 'd') return nodeSize(node);
+      let total = 4096;
+      for (const c of Object.values(node.children)) total += sizeOf(c);
+      return total;
+    };
+    const fmt = (bytes) => opts.h ? humanSize(bytes) : String(Math.ceil(bytes / 1024));
+    for (const p of paths) {
+      let node;
+      try { node = lookup(ctx, p); } catch (e) { ctx.err(`du: cannot access '${p}': ${fsMsg(e)}\n`); code = 1; continue; }
+      if (node.type === 'd' && !opts.s) {
+        for (const name of Object.keys(node.children).sort()) {
+          const child = node.children[name];
+          if (child.type === 'd' || opts.a) {
+            const cp = p === '.' ? './' + name : (p.endsWith('/') ? p + name : p + '/' + name);
+            ctx.out(`${fmt(sizeOf(child))}\t${cp}\n`);
+          }
+        }
+      }
+      ctx.out(`${fmt(sizeOf(node))}\t${p}\n`);
+    }
+    return code;
+  };
+
+  C.df = (args, ctx) => {
+    const h = args.some(a => a.includes('h'));
+    if (h) {
+      ctx.out('Filesystem      Size  Used Avail Use% Mounted on\n');
+      ctx.out('/dev/vda1        20G   14G  5.2G  73% /\n');
+      ctx.out('tmpfs           2.0G     0  2.0G   0% /dev/shm\n');
+    } else {
+      ctx.out('Filesystem     1K-blocks     Used Available Use% Mounted on\n');
+      ctx.out('/dev/vda1       20511356 14680064   5452096  73% /\n');
+      ctx.out('tmpfs            2048000        0   2048000   0% /dev/shm\n');
+    }
+    return 0;
+  };
+
+  C.getcap = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { r: 'bool', R: 'bool' });
+    const recursive = opts.r || opts.R;
+    const vfs = ctx.sh.vfs;
+    let code = 0;
+    const show = (path, node) => { if (node.caps) ctx.out(`${path} ${node.caps}\n`); };
+    for (const p of (operands.length ? operands : ['.'])) {
+      let node;
+      try { node = lookup(ctx, p); } catch (e) { ctx.err(`getcap: ${p}: ${fsMsg(e)}\n`); code = 1; continue; }
+      if (node.type === 'd' && recursive) vfs.walk(resolve(ctx, p), node, ctx.sh.user, (pp, nd) => { if (nd.type === 'f') show(pp, nd); }, () => {});
+      else show(resolve(ctx, p), node);
+    }
+    return code;
+  };
+  C.setcap = (args, ctx) => {
+    if (ctx.sh.user.uid !== 0) { ctx.err('setcap: Operation not permitted (root権限が必要)\n'); return 1; }
+    const operands = args.filter(a => !a.startsWith('-'));
+    const caps = operands[0]; const p = operands[1];
+    try { const node = lookup(ctx, p); if (caps === '-r' || !caps) delete node.caps; else node.caps = caps; } catch (e) { ctx.err(`setcap: ${fsMsg(e)}\n`); return 1; }
+    return 0;
+  };
+
   C.crontab = (args, ctx) => {
     if (args.includes('-l')) {
       try { ctx.out(ctx.sh.vfs.readFile(`/var/spool/cron/crontabs/${ctx.sh.user.name}`, '/', ctx.sh.user)); return 0; }
@@ -1001,6 +1087,56 @@ export function makeCommands(getCmds) {
   };
 
   return C;
+}
+
+// ---------- jq (簡易版) ----------
+// 対応: . / .key / .a.b / .[] / .key[] / .key[0] / .["k"] / | / keys / length
+function applyJq(filter, data) {
+  let values = [data];
+  for (const rawSeg of filter.split('|')) {
+    const seg = rawSeg.trim();
+    const next = [];
+    for (const v of values) {
+      if (seg === '.' || seg === '') { next.push(v); continue; }
+      if (seg === 'keys') { next.push(Object.keys(v == null ? {} : v).sort()); continue; }
+      if (seg === 'length') { next.push(v == null ? 0 : (Array.isArray(v) || typeof v === 'string' ? v.length : Object.keys(v).length)); continue; }
+      // パス式を評価
+      for (const r of evalJqPath(seg, v)) next.push(r);
+    }
+    values = next;
+  }
+  return values;
+}
+function evalJqPath(seg, value) {
+  if (seg[0] !== '.') throw new Error(`未対応のフィルタ: ${seg}`);
+  let cur = [value];
+  let i = 1; // skip leading '.'
+  // 先頭が '.' だけの後にキーが続く / いきなり [] の両方を許容
+  while (i < seg.length) {
+    const c = seg[i];
+    if (c === '.') { i++; continue; }
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i; while (j < seg.length && /[A-Za-z0-9_]/.test(seg[j])) j++;
+      const key = seg.slice(i, j); i = j;
+      cur = cur.map(x => (x == null ? null : x[key]));
+    } else if (c === '[') {
+      const end = seg.indexOf(']', i);
+      if (end < 0) throw new Error('壊れた添字');
+      const inner = seg.slice(i + 1, end).trim(); i = end + 1;
+      if (inner === '') {
+        const out = [];
+        for (const x of cur) { if (Array.isArray(x)) out.push(...x); else if (x && typeof x === 'object') out.push(...Object.values(x)); }
+        cur = out;
+      } else if (/^-?\d+$/.test(inner)) {
+        const idx = parseInt(inner, 10);
+        cur = cur.map(x => Array.isArray(x) ? x[idx < 0 ? x.length + idx : idx] : undefined);
+      } else {
+        const key = inner.replace(/^["']|["']$/g, '');
+        cur = cur.map(x => (x == null ? null : x[key]));
+      }
+    } else throw new Error(`未対応のフィルタ: ${seg}`);
+  }
+  return cur;
 }
 
 // ---------- helpers ----------
