@@ -993,6 +993,49 @@ export function makeCommands(getCmds) {
   C.exit = (args, ctx) => { ctx.sh.exitRequested = true; return parseInt(args[0] || '0', 10) || 0; };
   C.logout = C.exit;
 
+  C.du = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { s: 'bool', h: 'bool', a: 'bool' });
+    const paths = operands.length ? operands : ['.'];
+    const vfs = ctx.sh.vfs;
+    let code = 0;
+    const sizeOf = (node) => {
+      if (node.type !== 'd') return nodeSize(node);
+      let total = 4096;
+      for (const c of Object.values(node.children)) total += sizeOf(c);
+      return total;
+    };
+    const fmt = (bytes) => opts.h ? humanSize(bytes) : String(Math.ceil(bytes / 1024));
+    for (const p of paths) {
+      let node;
+      try { node = lookup(ctx, p); } catch (e) { ctx.err(`du: cannot access '${p}': ${fsMsg(e)}\n`); code = 1; continue; }
+      if (node.type === 'd' && !opts.s) {
+        for (const name of Object.keys(node.children).sort()) {
+          const child = node.children[name];
+          if (child.type === 'd' || opts.a) {
+            const cp = p === '.' ? './' + name : (p.endsWith('/') ? p + name : p + '/' + name);
+            ctx.out(`${fmt(sizeOf(child))}\t${cp}\n`);
+          }
+        }
+      }
+      ctx.out(`${fmt(sizeOf(node))}\t${p}\n`);
+    }
+    return code;
+  };
+
+  C.df = (args, ctx) => {
+    const h = args.some(a => a.includes('h'));
+    if (h) {
+      ctx.out('Filesystem      Size  Used Avail Use% Mounted on\n');
+      ctx.out('/dev/vda1        20G   14G  5.2G  73% /\n');
+      ctx.out('tmpfs           2.0G     0  2.0G   0% /dev/shm\n');
+    } else {
+      ctx.out('Filesystem     1K-blocks     Used Available Use% Mounted on\n');
+      ctx.out('/dev/vda1       20511356 14680064   5452096  73% /\n');
+      ctx.out('tmpfs            2048000        0   2048000   0% /dev/shm\n');
+    }
+    return 0;
+  };
+
   C.crontab = (args, ctx) => {
     if (args.includes('-l')) {
       try { ctx.out(ctx.sh.vfs.readFile(`/var/spool/cron/crontabs/${ctx.sh.user.name}`, '/', ctx.sh.user)); return 0; }

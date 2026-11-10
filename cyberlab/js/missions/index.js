@@ -16,6 +16,9 @@ import { stageWebAdv } from './stage-webadv.js';
 import { stageDefense } from './stage-defense.js';
 import { stageNetAdv } from './stage-netadv.js';
 import { stageCTF } from './stage-ctf.js';
+import { stageSysadmin } from './stage-sysadmin.js';
+import { stageRecon } from './stage-recon.js';
+import { stageAdvanced } from './stage-advanced.js';
 
 export const STAGES = [
   stage0,          // 入門: ターミナル基礎
@@ -24,6 +27,8 @@ export const STAGES = [
   stageLinux2,     // Linux応用(作成/検索/ユーザー/所有権)
   stage2,          // 権限・プロセス
   stageShell,      // 環境変数・スクリプト・cron
+  stageSysadmin,   // システム運用(ディスク/ログ/サービス/パッケージ)
+  stageRecon,      // 情報収集・OSINT
   stageNetBasics,  // ネットワーク理論
   stage4,          // ネットワーク調査(実技)
   stageNetAdv,     // ネットワーク調査 II(深掘り)
@@ -34,6 +39,7 @@ export const STAGES = [
   stageDefense,    // 防御・監視(ブルーチーム)
   stage5,          // Web脆弱性 I
   stageWebAdv,     // Web脆弱性 II
+  stageAdvanced,   // 発展分野(AD/クラウド/コンテナ/IR 等)
   stageCTF,        // 総合演習(CTF)
 ];
 
