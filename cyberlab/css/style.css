@@ -40,7 +40,9 @@ body {
 }
 #app { max-width: 720px; margin: 0 auto; }
 main { padding: 0 var(--gutter) calc(40px + env(safe-area-inset-bottom)); min-height: 100vh; }
-.boot { padding-top: 60px; color: var(--dim); text-align: center; }
+.boot { padding-top: 60px; color: var(--dim); text-align: center; font-family: var(--mono); }
+.boot-dots::after { content: ''; animation: boot-dots 1.2s steps(4, end) infinite; }
+@keyframes boot-dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } 100% { content: ''; } }
 button { font-family: inherit; font-size: inherit; cursor: pointer; border: none; background: none; color: inherit; }
 code, pre { font-family: var(--mono); }
 h1, h2, h3 { line-height: 1.3; }
