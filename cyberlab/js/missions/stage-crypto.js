@@ -127,6 +127,84 @@ export const stageCrypto = {
       review: { steps: ['ls -l で shadow の厳格な権限を確認', 'sudo で中身を閲覧', '$N$ でハッシュ方式を読み分け', 'ソルトの役割を理解'], commands: [{ cmd: 'ls -l /etc/shadow', meaning: '権限(640 root)を確認' }, { cmd: 'sudo cat /etc/shadow', meaning: 'ハッシュ方式を確認' }], why: '認証情報の保護設計(ハッシュ・ソルト・権限分離)はあらゆるシステムの土台。弱い方式の検出は監査の実務。', practice: 'パスワードポリシー策定、弱いハッシュ方式の棚卸し、漏洩DBのリスク評価、など。', related: ['ハッシュ', 'レインボーテーブル', '最小権限'] },
       learned: ['etc-shadow', 'password-hashing', 'salt', 'hash-algorithms'], solution: ['ls -l /etc/shadow', 'sudo cat /etc/shadow'],
     },
+
+    {
+      id: 'c-04-rot',
+      title: '古典暗号とrot13',
+      minutes: 9,
+      objectives: ['換字式暗号の仕組みを理解する', 'tr でrot13を復号する'],
+      prereq: ['c-01-base64'],
+      briefing: 'CTFやマルウェアで時々見かける rot13。文字を13個ずらすだけの古典暗号で、tr で簡単に復号できる。暗号の「鍵と変換」の最も素朴な形だ。',
+      concepts: [{
+        title: '換字式暗号(rot13/シーザー暗号)',
+        why: '最も単純な暗号で、換字(文字の置き換え)という暗号の基本操作を理解できる。難読化によく使われる。',
+        problem: 'アルファベットを一定数ずらしただけの文字列を元に戻したい。',
+        how: 'シーザー暗号は各文字を一定数ずらす。rot13 は13ずらす方式で、2回かけると元に戻る(対称)。tr \'A-Za-z\' \'N-ZA-Mn-za-m\' で復号できる。鍵空間が狭く容易に解けるため、暗号としては弱く「難読化」の域を出ない。',
+        example: "$ echo 'Uryyb' | tr 'A-Za-z' 'N-ZA-Mn-za-m'\nHello",
+        relation: 'tr で rot13 を復号し、換字暗号の弱さを体感する。',
+      }],
+      env: {
+        user: 'analyst', dirs: ['/home/analyst/ctf'],
+        files: [{ path: '/home/analyst/ctf/note.rot13', owner: 'analyst', content: 'SYNT{ebg13_vf_abg_pelcgb_8h2x}\n' }],
+      },
+      quick: ['cd /home/analyst/ctf', 'cat note.rot13', "cat note.rot13 | tr 'A-Za-z' 'N-ZA-Mn-za-m'"],
+      tasks: [
+        {
+          q: 'ctf/note.rot13 は rot13 で変換されています。tr で復号し、現れるフラグ FLAG{...} の中身を答えてください。',
+          narration: "tr 'A-Za-z' 'N-ZA-Mn-za-m' で各文字を13ずらし戻す。SYNT が FLAG に戻るはず。",
+          check: { type: 'answer', any: ['rot13_is_not_crypto_8u2k'], stripFlag: true, ci: true },
+          answerHint: 'FLAG{ } の中身',
+          hints: ["cat note.rot13 | tr 'A-Za-z' 'N-ZA-Mn-za-m'", 'SYNT{...} が FLAG{...} に戻る', 'FLAG{rot13_is_not_crypto_8u2k}'],
+          explain: "tr の文字範囲マッピングで rot13 を復号。SYNT→FLAG と戻った。rot13 は鍵が固定で誰でも戻せる＝暗号ではなく難読化。マルウェアが検知回避に使うこともあるが、解読は一瞬。base64 同様「可逆で鍵なし=秘匿性なし」の典型例。",
+        },
+      ],
+      review: { steps: ["tr 'A-Za-z' 'N-ZA-Mn-za-m' で13ずらす", 'SYNT→FLAGを確認', '換字暗号の弱さを理解'], commands: [{ cmd: "cat note.rot13 | tr 'A-Za-z' 'N-ZA-Mn-za-m'", meaning: 'rot13を復号' }], why: '古典暗号は現代では使えないが、換字という基本操作と「鍵が弱い暗号の危うさ」を学べる。', practice: 'CTFの古典暗号問、マルウェアの簡易難読化の解除。', related: ['base64', 'エンコード', '暗号の強度'] },
+      learned: ['rot13', 'caesar-cipher', 'substitution', 'tr-mapping'], solution: ['cd /home/analyst/ctf', "cat note.rot13 | tr 'A-Za-z' 'N-ZA-Mn-za-m'"],
+    },
+
+    {
+      id: 'c-05-strings-hunt',
+      title: 'バイナリから文字列を拾う',
+      minutes: 9,
+      objectives: ['ファイル種別を見分ける', 'grep で可読文字列から秘密を探す'],
+      prereq: ['c-01-base64'],
+      briefing: '一見読めないデータファイルにも、設定文字列やURL、埋め込まれた秘密が紛れていることがある。file で種別を確かめ、可読部分を拾い出す。',
+      concepts: [{
+        title: 'ファイル種別と埋め込み文字列',
+        why: 'マルウェアや設定の入ったファイルには、C2 URL・パスワード・フラグなどの可読文字列が埋め込まれていることが多い。',
+        problem: 'テキストかデータか分からないファイルから、意味のある文字列だけ拾いたい。',
+        how: 'file で種別を判定(ASCII text / data / ELF等)。可読文字列は grep で特定パターン(http/flag/key)を拾う。実機では strings コマンドで印字可能文字の連続を抽出する。',
+        example: '$ file blob.dat\n$ grep -aoE "https?://[^ ]+" blob.dat',
+        relation: 'file で種別を見て、grep で埋め込まれたURLやフラグを探す。',
+      }],
+      env: {
+        user: 'analyst', dirs: ['/home/analyst/sample'],
+        files: [
+          { path: '/home/analyst/sample/dropper.dat', owner: 'analyst', content: '\u0001\u0002binary\u0000garbage\u0003 config: c2=http://evil.example/gate flag=FLAG{strings_in_binary_3a9f} \u0000\u0004more\u0005' },
+          { path: '/home/analyst/sample/readme.txt', owner: 'analyst', content: 'ただのテキストです。\n' },
+        ],
+      },
+      quick: ['cd /home/analyst/sample', 'file dropper.dat', 'file readme.txt', 'grep -ao "FLAG{[^}]*}" dropper.dat', 'grep -aoE "http://[^ ]+" dropper.dat'],
+      tasks: [
+        {
+          q: 'file コマンドで dropper.dat の種別を調べます。テキスト(ASCII text)ですか、それともバイナリ等のデータ(data)ですか。text か data で答えてください。',
+          narration: 'file はファイルの中身から種別を推定する。制御文字を含むと data と判定される。',
+          check: { type: 'answer', any: ['data'], ci: true },
+          hints: ['file dropper.dat を実行', '制御文字を含むと "data" と判定', 'dropper.dat は data'],
+          explain: 'file は拡張子でなく中身で種別を判定する。dropper.dat は制御文字を含むため data。拡張子を偽装したマルウェア(.jpg に見せかけた実行ファイル等)を file で見破れる。種別確認は解析の第一歩。',
+        },
+        {
+          q: 'バイナリ風の dropper.dat に埋め込まれたフラグ FLAG{...} を grep で拾い出し、中身を答えてください。',
+          narration: 'grep -a はバイナリも対象に検索する。grep -ao "FLAG{[^}]*}" で埋め込まれたフラグだけを抜ける。',
+          check: { type: 'answer', any: ['strings_in_binary_3a9f'], stripFlag: true, ci: true },
+          answerHint: 'FLAG{ } の中身',
+          hints: ['grep -ao "FLAG{[^}]*}" dropper.dat', '-a はバイナリも検索、-o は一致部分のみ', 'FLAG{strings_in_binary_3a9f}'],
+          explain: 'grep -a(バイナリも検索)と -o(一致部分のみ)で、データに埋もれたフラグとC2 URL(http://evil.example/gate)を抽出できた。マルウェア解析では、実行せずとも埋め込み文字列からC2・パスワード・機能の手がかりが得られる(静的解析)。実機の strings コマンドも同じ目的で使う。',
+        },
+      ],
+      review: { steps: ['file で種別判定', 'grep -a でバイナリも検索', 'grep -o で一致部分抽出', 'URL/フラグ/秘密を拾う'], commands: [{ cmd: 'file dropper.dat', meaning: 'ファイル種別の判定' }, { cmd: 'grep -ao "FLAG{[^}]*}" dropper.dat', meaning: '埋め込み文字列の抽出' }], why: '埋め込み文字列の抽出はマルウェア静的解析の基本。実行せず安全に手がかりを得られる。', practice: 'strings/grep -a でのマルウェア解析、拡張子偽装の検出、設定の抽出。', related: ['file', 'grep', 'マルウェア解析'] },
+      learned: ['file-type', 'strings', 'grep-binary', 'static-analysis'], solution: ['cd /home/analyst/sample', 'file dropper.dat', 'grep -ao "FLAG{[^}]*}" dropper.dat'],
+    },
   ],
 };
 

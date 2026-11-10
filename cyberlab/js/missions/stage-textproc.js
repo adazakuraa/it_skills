@@ -179,5 +179,96 @@ export const stageTextproc = {
       review: { steps: ["sed 's/old/new/' で置換", 'sed -i でファイル直接編集', "tr で文字種変換"], commands: [{ cmd: "sed -i 's/debug=true/debug=false/' config.ini", meaning: '設定を直接書き換え' }, { cmd: "tr 'A-Z' 'a-z'", meaning: '大文字を小文字に変換' }], why: 'テキスト整形・設定変更の自動化は運用の基本スキル。手作業を減らしミスを防ぐ。', practice: "設定テンプレートを sed で環境ごとに書き換える、ログを tr で正規化してから集計する、など。", related: ['awk', 'grep', 'シェルスクリプト'] },
       learned: ['sed', 'tr', 'in-place-edit', 'text-transform'], solution: ['cd /home/analyst/work', "sed -i 's/debug=true/debug=false/' config.ini", "cat names.txt | tr 'A-Z' 'a-z'"],
     },
+
+    {
+      id: 't-05-uniq',
+      title: 'uniqで重複を分析する',
+      minutes: 10,
+      objectives: ['sort|uniq -c で頻度集計する', '-d/-u で重複/非重複を抽出する'],
+      prereq: ['t-03-cut-sort'],
+      briefing: 'アクセスログの重複分析は異常検知の基本。uniq を使いこなして「何が何回」「一度きりは何か」を切り分ける。',
+      concepts: [{
+        title: 'uniq による重複分析',
+        why: '重複の数や有無から、通常と異常のパターンが浮かび上がる(大量アクセス、一度きりの不審アクセス)。',
+        problem: '同じ行が何回現れるか、逆に一度しか現れない行はどれかを知りたい。',
+        how: 'uniq は「隣り合う」重複しか見ないので必ず sort で前処理。sort|uniq -c で件数付き、uniq -d で重複した行のみ、uniq -u で一度きりの行のみ。sort -rn を足せば頻度順ランキング。',
+        example: '$ sort ips.txt | uniq -c | sort -rn',
+        relation: 'uniq -c/-d/-u を使い分けて重複を分析する。',
+      }],
+      env: {
+        user: 'analyst', dirs: ['/var/log'],
+        files: [{ path: '/var/log/ips.txt', owner: 'analyst', content: '10.0.0.1\n10.0.0.1\n10.0.0.1\n10.0.0.2\n203.0.113.9\n10.0.0.2\n10.0.0.1\n' }],
+      },
+      quick: ['cd /var/log', 'sort ips.txt | uniq -c', 'sort ips.txt | uniq -c | sort -rn', 'sort ips.txt | uniq -u', 'sort ips.txt | uniq -d'],
+      tasks: [
+        {
+          q: 'ips.txt を sort してから uniq -c で集計します。最も多く出現するIPは何回出ていますか（回数を数字で）。',
+          narration: 'sort で同じ行を隣接させてから uniq -c で数える。sort -rn を足すと多い順。',
+          check: { type: 'answer', any: ['4'] },
+          hints: ['sort ips.txt | uniq -c | sort -rn', '先頭行の件数を見る', '10.0.0.1 が4回で最多'],
+          explain: '10.0.0.1 が4回で最多。uniq -c は必ず sort の後に使う(隣接重複しか数えないため)。頻度集計は大量アクセス元(DoS/総当たり)の検出に直結する。',
+        },
+        {
+          q: '一度しか現れない(uniq -u)IPアドレスを抽出してください。該当するIPを答えてください。',
+          narration: 'uniq -u は「重複しない=一度きり」の行だけを出す。通常と違う単発アクセスの発見に使う。',
+          check: { type: 'answer', any: ['203.0.113.9'], normalizeIp: true },
+          hints: ['sort ips.txt | uniq -u', '一度だけ現れる行', '203.0.113.9 が1回のみ'],
+          explain: '203.0.113.9 が一度きり(uniq -u)。-u は「他と違う単発」を浮かび上がらせる——一度だけ現れた外部IPは偵察やテストアクセスの痕跡かもしれない。-d(重複のみ)と併せ、uniq は「多すぎる/少なすぎる」両方の異常を切り出せる。',
+        },
+      ],
+      review: { steps: ['sort で前処理', 'uniq -c で頻度集計', 'uniq -d/-u で重複/単発を抽出', 'sort -rn でランキング'], commands: [{ cmd: 'sort ips.txt | uniq -c | sort -rn', meaning: '頻度ランキング' }, { cmd: 'sort ips.txt | uniq -u', meaning: '一度きりの行を抽出' }], why: '重複分析は異常検知の核。多すぎる(攻撃)も少なすぎる(偵察)も uniq で切り出せる。', practice: 'アクセス元ランキング、単発不審アクセスの検出、重複データのクレンジング。', related: ['sort', 'パイプ', 'ログ解析'] },
+      learned: ['uniq', 'uniq-c', 'uniq-du', 'frequency-analysis'], solution: ['cd /var/log', 'sort ips.txt | uniq -c | sort -rn', 'sort ips.txt | uniq -u'],
+    },
+
+    {
+      id: 't-06-pipeline',
+      title: '複合パイプラインを組む',
+      minutes: 12,
+      objectives: ['複数ツールを連結して分析する', 'grep/cut/sort/uniq/head を組み合わせる'],
+      prereq: ['t-05-uniq'],
+      briefing: 'これまでの道具を総動員する。生のアクセスログから「404エラーを最も多く出したURLのトップ3」を、1本のパイプラインで導き出す。',
+      concepts: [{
+        title: 'パイプラインの設計',
+        why: '単機能の道具を直列に繋ぐと、専用ツール無しで柔軟な分析ができる。観点を変えるのも部品の差し替えだけ。',
+        problem: '生ログから「特定条件の行を絞り→列を抜き→集計し→上位だけ表示」を一気にやりたい。',
+        how: '思考の順に繋ぐ: grep(絞る)→ cut/awk(列を抜く)→ sort | uniq -c(集計)→ sort -rn(並べる)→ head(上位)。各段で何が流れているかを意識し、段階的に組み立てる。',
+        example: '$ grep " 404 " access.log | awk \'{print $7}\' | sort | uniq -c | sort -rn | head -3',
+        relation: '条件抽出→集計→上位表示を1本のパイプで実現する。',
+      }],
+      env: {
+        user: 'analyst', dirs: ['/var/log/web'],
+        files: [{ path: '/var/log/web/access.log', owner: 'analyst', content: `10.0.0.1 - GET /index 200
+10.0.0.2 - GET /missing 404
+10.0.0.3 - GET /admin 404
+10.0.0.1 - GET /missing 404
+10.0.0.4 - GET /index 200
+10.0.0.2 - GET /missing 404
+10.0.0.5 - GET /admin 404
+10.0.0.6 - GET /old 404
+10.0.0.1 - GET /missing 404
+` }],
+      },
+      quick: ['cd /var/log/web', 'grep " 404 " access.log', "grep ' 404 ' access.log | awk '{print $4}'", "grep ' 404 ' access.log | awk '{print $4}' | sort | uniq -c | sort -rn", "grep ' 404 ' access.log | awk '{print $4}' | sort | uniq -c | sort -rn | head -3"],
+      tasks: [
+        {
+          q: '404エラーの行だけを抽出し、要求されたURL(4列目)を集計します。最も多く404になったURLを答えてください。',
+          narration: 'grep " 404 " で404行を絞り、awk \'{print $4}\' でURL列を抜き、sort|uniq -c|sort -rn で集計。段階的に繋ぐ。',
+          check: { type: 'answer', any: ['/missing'] },
+          answerHint: 'URLパス',
+          hints: ["grep ' 404 ' access.log で404行を絞る", "| awk '{print $4}' | sort | uniq -c | sort -rn でURL集計", '/missing が最多(4回)'],
+          explain: '/missing が404最多。パイプラインを「絞る→抜く→数える→並べる」と段階的に組んだ。存在しないURLへの繰り返しアクセスは、リンク切れか、あるいはディレクトリ探索(攻撃)の兆候。各段を確認しながら伸ばすのが設計のコツ。',
+        },
+        {
+          q: '同じパイプラインの末尾に head -3 を付けて、404が多いURLのトップ3だけを表示します。トップ3に入っていないURLを次から選んでください: /missing, /admin, /old, /index',
+          narration: 'head -N はパイプの最後で「上位N件」に絞る定番。404のトップ3に入らないものを考える。',
+          check: { type: 'answer', any: ['/index'] },
+          answerHint: 'URLパス',
+          hints: ["... | sort -rn | head -3 で上位3件", '404になったのは /missing /admin /old の3つ', '/index は200(成功)なので404ランキングに入らない'],
+          explain: '/index は常に200(成功)なので404ランキングには登場しない。404のトップ3は /missing(4)・/admin(2)・/old(1)。head -N は「上位だけ見る」仕上げの定番。この grep→awk→sort→uniq -c→sort -rn→head の型は、ログ分析で無数に応用できる万能パターン。',
+        },
+      ],
+      review: { steps: ['grep で条件抽出', 'awk/cut で列抽出', 'sort|uniq -c で集計', 'sort -rn|head で上位表示'], commands: [{ cmd: "grep ' 404 ' access.log | awk '{print $4}' | sort | uniq -c | sort -rn | head -3", meaning: '404最多URLトップ3' }], why: 'パイプライン設計はログ解析の総合力。部品の組み合わせで、専用ツール無しに自在な分析ができる。', practice: 'アクセス解析、エラー集計、攻撃パターンの抽出など、現場の分析の大半はこの型。', related: ['grep', 'awk', 'sort/uniq', 'head'] },
+      learned: ['pipeline-design', 'log-analysis', 'top-n', 'composition'], solution: ['cd /var/log/web', "grep ' 404 ' access.log | awk '{print $4}' | sort | uniq -c | sort -rn", "grep ' 404 ' access.log | awk '{print $4}' | sort | uniq -c | sort -rn | head -3"],
+    },
   ],
 };
