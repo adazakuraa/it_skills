@@ -149,7 +149,7 @@ export function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&');
 
 // ---------- シェル本体 ----------
 export class Shell {
-  constructor({ vfs, user, cwd, env = {}, hostname = 'lab', commands, processes = [], services = [], sudo = false }) {
+  constructor({ vfs, user, cwd, env = {}, hostname = 'lab', commands, processes = [], services = [], sudo = false, net = null }) {
     this.vfs = vfs;
     this.user = user;
     this.cwd = cwd;
@@ -158,6 +158,7 @@ export class Shell {
     this.processes = processes;
     this.services = services;
     this.sudoAllowed = sudo;
+    this.net = net;
     this.history = [];
     this.lastCode = 0;
     this.positional = [];

@@ -4,6 +4,7 @@
 import { VFS } from './vfs.js';
 import { Shell } from './shell.js';
 import { makeCommands } from './commands.js';
+import { makeNetCommands } from './netcommands.js';
 
 const DEFAULT_USERS = [
   { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash', gecos: 'root' },
@@ -94,10 +95,13 @@ export function buildEnvironment(mission) {
 
   const commandsRef = {};
   const commands = makeCommands(() => commandsRef);
+  Object.assign(commands, makeNetCommands());
   Object.assign(commandsRef, commands);
 
+  const net = buildNetwork(e.network, hostname);
+
   const shell = new Shell({
-    vfs, user: player, cwd, hostname,
+    vfs, user: player, cwd, hostname, net,
     env: e.env || {},
     commands,
     processes: (e.processes || []).map((p, i) => ({ pid: p.pid ?? (900 + i), user: p.user || 'root', cmd: p.cmd, cpu: p.cpu ?? 0, mem: p.mem ?? 0.1, tty: p.tty || '?', stat: p.stat || 'Ss', time: p.time || '0:00', start: p.start || '09:00', vsz: p.vsz, rss: p.rss })),
@@ -126,6 +130,41 @@ function rebuildPasswd(vfs, shadow) {
     for (const u of [...vfs.users].sort((a, b) => a.uid - b.uid)) sh += `${u.name}:${u.uid === 0 ? '!' : '*'}:19500:0:99999:7:::\n`;
     vfs.addFile('/etc/shadow', sh, { mode: 0o640, owner: 'root', group: 'root' });
   }
+}
+
+// ミッションの network 定義にデフォルトを補完して net オブジェクトを作る
+function buildNetwork(n, hostname) {
+  if (!n) return null;
+  const self = n.self || '10.10.5.20';
+  const gw = n.gateway || '10.10.5.1';
+  const net = {
+    interfaces: n.interfaces || [
+      { name: 'lo', ip: '127.0.0.1', prefix: 8, mac: '00:00:00:00:00:00', state: 'UP' },
+      { name: 'eth0', ip: self, prefix: n.prefix || 24, mac: n.mac || '02:42:0a:0a:05:14', state: 'UP' },
+    ],
+    routes: n.routes || [
+      { dst: 'default', via: gw, dev: 'eth0' },
+      { dst: cidrOf(self, n.prefix || 24), dev: 'eth0', scope: 'link' },
+    ],
+    dns: Object.assign({ [hostname]: self, localhost: '127.0.0.1' }, n.dns || {}),
+    resolver: n.resolver || gw,
+    listening: n.listening || [],
+    hosts: n.hosts || {},
+    arp: n.arp || {},
+  };
+  // hosts に names を補完（DNS逆引き用）
+  for (const [ip, h] of Object.entries(net.hosts)) {
+    if (!h.names) h.names = [];
+    for (const [name, addr] of Object.entries(net.dns)) if (addr === ip && !h.names.includes(name)) h.names.push(name);
+  }
+  return net;
+}
+function cidrOf(ip, prefix) {
+  const parts = ip.split('.').map(Number);
+  const bits = (0xffffffff << (32 - prefix)) >>> 0;
+  const mask = [(bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255];
+  const network = parts.map((p, i) => p & mask[i]);
+  return network.join('.') + '/' + prefix;
 }
 
 // テンプレート文字列の共通インデントを除去（ミッション定義を書きやすくする）

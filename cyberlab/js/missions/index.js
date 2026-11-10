@@ -3,11 +3,13 @@ import { stage0 } from './stage0-tutorial.js';
 import { stage1 } from './stage1-files.js';
 import { stage2 } from './stage2-permissions.js';
 import { stage3 } from './stage3-incident.js';
+import { stage4 } from './stage4-network.js';
+import { stage5 } from './stage5-webvuln.js';
 
-export const STAGES = [stage0, stage1, stage2, stage3];
+export const STAGES = [stage0, stage1, stage2, stage3, stage4, stage5];
 
-// 今後のステージ（Phase 3-4）はここに追加する:
-//   ネットワーク基礎 / Web脆弱性(SQLi,XSS) / フォレンジック / 発展
+// 今後のステージはここに追加する:
+//   フォレンジック / 暗号 / Active Directory / クラウド・コンテナ など
 
 // 索引を構築
 const missionById = {};
