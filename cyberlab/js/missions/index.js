@@ -11,11 +11,14 @@ import { stageTextproc } from './stage-textproc.js';
 import { stageShell } from './stage-shell.js';
 import { stageCrypto } from './stage-crypto.js';
 import { stageForensics } from './stage-forensics.js';
+import { stageLinux2 } from './stage-linux2.js';
+import { stageWebAdv } from './stage-webadv.js';
 
 export const STAGES = [
   stage0,          // 入門: ターミナル基礎
   stage1,          // ファイル調査・検索・集計
   stageTextproc,   // テキスト処理
+  stageLinux2,     // Linux応用(作成/検索/ユーザー/所有権)
   stage2,          // 権限・プロセス
   stageShell,      // 環境変数・スクリプト・cron
   stageNetBasics,  // ネットワーク理論
@@ -24,7 +27,8 @@ export const STAGES = [
   stageCrypto,     // 暗号・ハッシュ(実技)
   stage3,          // ログ解析・インシデント
   stageForensics,  // フォレンジック
-  stage5,          // Web脆弱性
+  stage5,          // Web脆弱性 I
+  stageWebAdv,     // Web脆弱性 II
 ];
 
 // 今後のステージはここに追加する:
