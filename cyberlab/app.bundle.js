@@ -20,6 +20,7 @@ const DEFAULT = {
   flags: [],      // 取得したフラグ文字列
   learned: [],    // 学習済みトピック
   settings: { fontSize: 'm' },
+  storySeen: false, // プロローグ既読
 };
 
 let cache = null;
@@ -54,6 +55,7 @@ function validate(obj) {
   }
   if (Array.isArray(obj.flags)) out.flags = [...new Set(obj.flags.filter(f => typeof f === 'string' && f.length < 200))].slice(0, 500);
   if (Array.isArray(obj.learned)) out.learned = [...new Set(obj.learned.filter(f => typeof f === 'string' && f.length < 200))].slice(0, 500);
+  out.storySeen = obj.storySeen === true;
   if (obj.settings && typeof obj.settings === 'object') {
     if (['s', 'm', 'l'].includes(obj.settings.fontSize)) out.settings.fontSize = obj.settings.fontSize;
   }
@@ -88,6 +90,8 @@ function addLearned(topics) {
   if (changed) save();
 }
 function incHint(id) { missionState(id).usedHints++; save(); }
+function storySeen() { return load().storySeen === true; }
+function markStorySeen() { load().storySeen = true; save(); }
 function getSettings() { return load().settings; }
 function setSetting(k, v) { load().settings[k] = v; save(); }
 
@@ -105,7 +109,7 @@ function importData(file, done) {
 }
 function resetAll() { cache = structuredCloneSafe(DEFAULT); save(); }
 
-Object.assign(exports, { load, save, missionState, markStarted, markTaskDone, markMissionDone, addFlag, addLearned, incHint, getSettings, setSetting, exportData, importData, resetAll });
+Object.assign(exports, { load, save, missionState, markStarted, markTaskDone, markMissionDone, addFlag, addLearned, incHint, storySeen, markStorySeen, getSettings, setSetting, exportData, importData, resetAll });
 
 };
 __mods["js/util.js"] = function (module, exports, __require) {
@@ -8820,6 +8824,182 @@ function nextMissionInStage(stage, isDone) {
 Object.assign(exports, { STAGES, getMission, getStageOf, missionOrder, allMissions, isMissionUnlocked, nextMissionInStage });
 
 };
+__mods["js/story.js"] = function (module, exports, __require) {
+// ============================================================
+// ゲーム全体の軽量ストーリー（組織・人物・事件はすべて架空・教材用）
+// lines: [{ who: 'asagiri'|'hayama'|'narr', text }]
+// ============================================================
+
+const CAST = { asagiri: '主任 朝霧', hayama: '分析官 葉山', narr: null };
+
+const PROLOGUE = {
+  title: 'Prologue — ARGUS Lab 訓練プログラム',
+  lines: [
+    { who: 'narr', text: 'あなたは情報セキュリティ研究機関「ARGUS Lab」の見習いエンジニア。与えられたのは仮想の訓練環境と一台のターミナルだけ。' },
+    { who: 'asagiri', text: '主任の朝霧だ。この教材は、昨年うちが調査を手伝った侵害事案を分解して作ってある。社内では「ケース・ゼロ」と呼んでいる。' },
+    { who: 'asagiri', text: '課題は一つずつは小さい。だが全部終えれば、あの事案で何が起き、どこで防げたのかを自分の言葉で説明できるようになる。' },
+    { who: 'hayama', text: '監視チームの葉山です。ときどき現場の話をしに来ますね。まずは端末に慣れることから。' },
+  ],
+};
+
+// stage.id → { title, intro[], outro[] }
+const CHAPTERS = {
+  stage0: {
+    title: '最初の一歩',
+    intro: [{ who: 'asagiri', text: 'ここでは何も教えてもらえない。自分で問い合わせた分だけ情報が手に入る。今いる場所、周りにあるもの、その中身——まずはこの3つを確かめる癖をつけろ。' }],
+    outro: [{ who: 'asagiri', text: '手は動くようになったな。次は、ケース・ゼロの実物のディスクを触ってもらう。' }],
+  },
+  stage1: {
+    title: '最初の手がかり',
+    intro: [
+      { who: 'hayama', text: '侵害が疑われるWebサーバーのディスクを渡します。ログもファイルも大量です。' },
+      { who: 'asagiri', text: '全部を目で読む必要はない。find で探し、grep で絞り、パイプで集計する。それだけで景色が変わる。' },
+    ],
+    outro: [{ who: 'hayama', text: 'ログイン失敗を繰り返していた 203.0.113.9……この番号、ケース・ゼロの記録にもありました。覚えておいてください。' }],
+  },
+  textproc: {
+    title: '膨大なログ',
+    intro: [{ who: 'asagiri', text: '事案のログは一日で数万行になる。読むんじゃない。切って、並べて、数えるんだ。' }],
+    outro: [{ who: 'asagiri', text: 'テキスト処理の道具が揃ったな。この先ずっとこれを使う。' }],
+  },
+  linux2: {
+    title: '証拠を整える',
+    intro: [{ who: 'asagiri', text: '調査は見つけて終わりじゃない。原本を壊さず複製し、誰のアカウントが何を持つかを把握しておけ。' }],
+    outro: [{ who: 'hayama', text: '証拠フォルダとアカウント一覧、受け取りました。次は実際に侵害されたサーバーの対応をお願いします。' }],
+  },
+  stage2: {
+    title: '設定ミスの代償',
+    intro: [
+      { who: 'hayama', text: 'app-02 で、誰でも読める秘密鍵と、CPUを食い続ける見覚えのないプロセスが見つかりました。' },
+      { who: 'asagiri', text: '今回は調べて終わりじゃない。権限を締めて、不審なプロセスは止める。防御側の仕事だ。' },
+    ],
+    outro: [{ who: 'asagiri', text: '止めたな。だが相手は、止められる前提で何度でも戻る仕掛けを置いていく。それを次で学ぶ。' }],
+  },
+  'shell-auto': {
+    title: '自動化の表と裏',
+    intro: [{ who: 'asagiri', text: '環境変数、スクリプト、cron。運用を楽にする仕組みは、そのまま居座りの手段にもなる。両方の目で見ろ。' }],
+    outro: [{ who: 'asagiri', text: '正規のジョブと不審なジョブを見分けられるようになった。' }],
+  },
+  sysadmin: {
+    title: '止まらないサーバー',
+    intro: [{ who: 'hayama', text: 'srv-20 でディスク逼迫のアラート。それと、深夜に何かが導入された形跡があります。' }],
+    outro: [{ who: 'hayama', text: '深夜に入っていたツール群……攻撃者が持ち込む定番の道具でした。運用ログは正直です。' }],
+  },
+  powertools: {
+    title: '一段上の道具',
+    intro: [{ who: 'asagiri', text: 'ここからは実務でよく使う応用だ。JSON を jq で捌き、SUID 以外の昇格経路や新しい永続化も知っておけ。使う側も狙う側も同じ道具を使う。' }],
+    outro: [{ who: 'asagiri', text: '古典だけ見ていては足をすくわれる。道具の引き出しが増えたな。' }],
+  },
+  recon: {
+    title: '情報を集める',
+    intro: [{ who: 'asagiri', text: '攻防はどちらも情報を制した側が有利だ。設定・メタデータ・アカウント——漏れている手がかりを機械的に拾い集めろ。' }],
+    outro: [{ who: 'hayama', text: '平文の鍵や消し忘れのメモ……現実でも、ここから崩れることが本当に多いんです。' }],
+  },
+  'net-basics': {
+    title: 'ネットワークの原理',
+    intro: [{ who: 'asagiri', text: 'ツールを使う前に原理だ。パケットがなぜ届くのか分かっていれば、未知のトラブルにも自分で対処できる。' }],
+    outro: [{ who: 'asagiri', text: '土台はできた。次は実際にネットワークを調べてもらう。' }],
+  },
+  stage4: {
+    title: '攻撃面を見渡す',
+    intro: [{ who: 'hayama', text: '評価対象の内部ネットワークです。どの機器が、何のサービスを、どのポートで公開しているか——攻撃者より先に把握してください。' }],
+    outro: [{ who: 'asagiri', text: '開いている窓を数えられるようになった。次はその窓の「中身」まで踏み込む。' }],
+  },
+  'net-adv': {
+    title: '深掘り偵察',
+    intro: [{ who: 'asagiri', text: 'ポートが開いている、の先だ。何が、どのバージョンで動くか。そこまで分かって初めて的確な判断ができる。' }],
+    outro: [{ who: 'hayama', text: '古いバージョンのサービスがいくつか……ケース・ゼロも、ここが入口でした。' }],
+  },
+  'sec-basics': {
+    title: '守るための原則',
+    intro: [{ who: 'asagiri', text: '手を動かす前に、何を・なぜ守るのかを固めろ。原則があるから、個々の対策に優先順位がつけられる。' }],
+    outro: [{ who: 'asagiri', text: 'CIA、認証と認可、暗号とハッシュ——判断の軸ができたな。' }],
+  },
+  'crypto-lab': {
+    title: 'エンコードと暗号',
+    intro: [{ who: 'asagiri', text: 'エンコードと暗号は混同されがちだ。手を動かして「可逆か／鍵が要るか」を体で覚えろ。' }],
+    outro: [{ who: 'hayama', text: 'base64 を暗号だと思い込む人、本当に多いんですよ。違いが分かる人は強いです。' }],
+  },
+  stage3: {
+    title: '侵入の痕跡を追う',
+    intro: [
+      { who: 'hayama', text: 'ケース・ゼロの中核です。サーバー intra-07 で不審な外向き通信が見つかりました。' },
+      { who: 'asagiri', text: 'どうやって入られ、どうやって居座っているのか。ログと設定から再構成しろ。' },
+    ],
+    outro: [{ who: 'asagiri', text: '侵入口と居座りの仕掛けが見えたな。次は、痕跡をもっと細かく読み解く。' }],
+  },
+  forensics: {
+    title: '痕跡を読む',
+    intro: [{ who: 'asagiri', text: '攻撃者は隠す。だが完全には消せない。隠しファイル、更新時刻、改ざんされた設定——点の証拠を時系列に並べて線にしろ。' }],
+    outro: [{ who: 'hayama', text: '事案の全体像がだいぶ見えてきました。あとは、同じことを起こさせない側に回る番です。' }],
+  },
+  defense: {
+    title: '守る側へ',
+    intro: [{ who: 'asagiri', text: '再発させないために、検知・封じ込め・堅牢化・復旧を実際にやってもらう。ケース・ゼロで足りなかったのは、まさにこの部分だ。' }],
+    outro: [{ who: 'asagiri', text: '守りの型はひと通り身についた。次は、入口になった弱点そのものを、訓練環境の中で再現して理解する。' }],
+  },
+  stage5: {
+    title: '入口の弱点',
+    intro: [{ who: 'asagiri', text: '対象はすべて訓練用の仮想アプリだ。弱点の仕組みを理解するための再現であり、現実のサイトに試すことは許されない。' }],
+    outro: [{ who: 'hayama', text: '原因はどちらも「入力を信用しすぎた」こと。対策まで言えるようになってくださいね。' }],
+  },
+  'web-adv': {
+    title: '攻撃面の広がり',
+    intro: [{ who: 'asagiri', text: '入力を信用した結果は一つではない。コマンド実行、スクリプト混入、他人のデータの閲覧、不正なファイル設置。共通点を掴め。' }],
+    outro: [{ who: 'asagiri', text: '入口の種類は増えても、守りの原則は変わらない。入力を疑い、権限を絞る。' }],
+  },
+  'api-sec': {
+    title: '現代のアプリは API で動く',
+    intro: [{ who: 'hayama', text: '最近の案件はAPIとトークンが主役です。トークンの中身を読み、検証が甘い実装がどう崩れるかを見てください。' }],
+    outro: [{ who: 'asagiri', text: '「署名を検証しない」「サーバーに任意のURLを取らせる」——どちらもクラウドでは致命傷になる。次はそのクラウドだ。' }],
+  },
+  'cloud-container': {
+    title: 'クラウドとコンテナ',
+    intro: [{ who: 'asagiri', text: '今のインフラは設定ファイルでできている。ポリシーの過剰な権限、公開設定、Dockerfile の不備——設定を読んで穴を見つけろ。' }],
+    outro: [{ who: 'hayama', text: 'クラウドの事故は、侵入よりも「うっかり公開」の方が多いんです。設定を疑う癖を。' }],
+  },
+  advanced: {
+    title: '視野を広げる',
+    intro: [{ who: 'asagiri', text: '現場はLinuxだけでは完結しない。ディレクトリサービス、Windows、証明書、マルウェア、インシデント対応の型。地図を完成させろ。' }],
+    outro: [{ who: 'asagiri', text: '概念の地図はひと通り埋まった。次は、守りを「設計」する側の話だ。' }],
+  },
+  detection: {
+    title: '守りを設計する',
+    intro: [{ who: 'hayama', text: '検知は気合いではなく設計です。攻撃を共通の枠組みで整理して、ログから検知ルールを起こし、得られた指標を共有します。' }],
+    outro: [{ who: 'hayama', text: 'ケース・ゼロで見逃した兆候、今ならルールにできますね。' }],
+  },
+  'ai-sec': {
+    title: '新しい攻撃面',
+    intro: [{ who: 'asagiri', text: '最近は生成AIを組み込んだ製品が増えた。便利さの裏で、新しい種類の弱点が生まれている。仮想のボットで確かめろ。' }],
+    outro: [{ who: 'asagiri', text: '原理はこれまでと同じだ。信頼できない入力を、信頼したまま扱わない。' }],
+  },
+  ctf: {
+    title: '最終試験',
+    intro: [
+      { who: 'asagiri', text: '最終試験だ。ヒントは最小限、手順も自分で組み立てろ。これまで学んだすべてを使っていい。' },
+      { who: 'hayama', text: '最後の課題は、ケース・ゼロの全体像を再構成することです。' },
+    ],
+    outro: [{ who: 'asagiri', text: 'よくやった。' }],
+  },
+};
+
+const EPILOGUE = {
+  title: 'Epilogue — ケース・ゼロ、完',
+  lines: [
+    { who: 'asagiri', text: '侵入口、昇格、居座り、持ち出し。ケース・ゼロの全体を、君は自分の手で再構成した。' },
+    { who: 'hayama', text: '報告書の最後に必ず書くことがあります。「どこで止められたか」。もう答えられますよね。' },
+    { who: 'asagiri', text: '訓練は終わりだ。ここからは、本物の現場で学び続けろ。調べて、確かめて、記録を残す。それが一番の武器だ。' },
+    { who: 'narr', text: 'ARGUS Lab 訓練プログラム、修了。' },
+  ],
+};
+
+// 章の取得（無ければ空）
+function chapterOf(stageId) { return CHAPTERS[stageId] || { title: '', intro: [], outro: [] }; }
+
+
+Object.assign(exports, { CAST, PROLOGUE, CHAPTERS, EPILOGUE, chapterOf });
+
+};
 __mods["js/app.js"] = function (module, exports, __require) {
 // ============================================================
 // CyberLab — アプリ本体（画面遷移・ミッション実行）
@@ -8830,6 +9010,7 @@ const { Terminal } = __require("js/terminal.js");
 const { evaluate, needsAnswer } = __require("js/checker.js");
 const store = __require("js/storage.js");
 const { STAGES, getMission, getStageOf, isMissionUnlocked, allMissions } = __require("js/missions/index.js");
+const { CAST, PROLOGUE, EPILOGUE, chapterOf } = __require("js/story.js");
 
 const app = document.getElementById('app');
 const isDone = id => store.missionState(id).done;
@@ -8846,6 +9027,8 @@ function route() {
   if (parts[0] === 'mission' && parts[1]) return renderMissionDetail(parts[1]);
   if (parts[0] === 'play' && parts[1]) return startPlay(parts[1]);
   if (parts[0] === 'progress') return renderProgress();
+  if (parts[0] === 'story') return renderStory();
+  if (!store.storySeen() && parts.length === 0) return renderStory(true);
   return renderHome();
 }
 window.addEventListener('hashchange', route);
@@ -8862,6 +9045,47 @@ function topbar(title, back) {
 }
 
 function screen(children) { clear(app); const m = el('main', {}, children); app.appendChild(m); window.scrollTo(0, 0); }
+
+// ---------- ストーリー ----------
+function dialogue(lines) {
+  return el('div', { class: 'story-lines' }, (lines || []).map(l => {
+    const who = CAST[l.who];
+    return el('div', { class: 'story-line ' + (who ? 'say ' + l.who : 'narr') }, [
+      who ? el('div', { class: 'story-who', text: who }) : null,
+      el('div', { class: 'story-text', text: l.text }),
+    ]);
+  }));
+}
+
+function renderStory(first) {
+  const done = STAGES.filter(st => st.missions.every(m => isDone(m.id))).length;
+  const chapters = STAGES.map((st, i) => {
+    const ch = chapterOf(st.id);
+    const cleared = st.missions.every(m => isDone(m.id));
+    const open = isMissionUnlocked(st.missions[0].id, isDone);
+    return el('div', { class: 'chapter-row' + (open ? '' : ' locked') }, [
+      el('div', { class: 'chapter-no', text: String(i + 1) }),
+      el('div', { class: 'chapter-body' }, [
+        el('div', { class: 'chapter-title', text: ch.title || st.title }),
+        el('div', { class: 'chapter-sub', text: open ? (cleared ? '読了' : '進行中') : '未解放' }),
+      ]),
+    ]);
+  });
+  const all = done === STAGES.length;
+  screen([
+    topbar('ストーリー', first ? null : '#/'),
+    el('div', { class: 'story-hero' }, [
+      el('div', { class: 'hero-badge', text: 'PROLOGUE' }),
+      el('h2', { class: 'detail-title', text: PROLOGUE.title }),
+    ]),
+    dialogue(PROLOGUE.lines),
+    first ? el('div', { class: 'detail-cta' }, [el('button', { class: 'btn-primary', text: '訓練を始める ▸', onclick: () => { store.markStorySeen(); go('#/'); renderHome(); } })]) : null,
+    first ? null : el('div', { class: 'section-label', text: '章の一覧' }),
+    first ? null : el('div', { class: 'chapter-list' }, chapters),
+    first || !all ? null : el('div', { class: 'section-label', text: 'エピローグ' }),
+    first || !all ? null : dialogue(EPILOGUE.lines),
+  ]);
+}
 
 // ---------- ホーム ----------
 function renderHome() {
@@ -8887,6 +9111,7 @@ function renderHome() {
   const cont = el('div', { class: 'home-actions' }, [
     el('button', { class: 'btn-primary', text: next ? (done ? '続きから学習する ▸' : '訓練を開始する ▸') : '全ミッション踏破済み ✓', onclick: () => next ? go('#/mission/' + next.id) : go('#/progress') }),
     el('button', { class: 'btn-ghost', text: 'ステージ一覧を見る', onclick: () => go('#/stage/' + STAGES[0].id) }),
+    el('button', { class: 'btn-ghost', text: 'ストーリーを読む', onclick: () => go('#/story') }),
   ]);
 
   const map = el('div', { class: 'stage-list' }, STAGES.map(st => stageRow(st)));
@@ -8933,13 +9158,20 @@ function renderStage(stageId) {
       el('div', { class: 'mc-arrow', text: unlocked ? '›' : '' }),
     ]);
   }));
+  const ch = chapterOf(st.id);
+  const idx = STAGES.indexOf(st);
+  const cleared = st.missions.every(m => isDone(m.id));
   screen([
     topbar(st.title, '#/'),
     el('div', { class: 'stage-hero' }, [
       el('div', { class: 'section-label', text: st.title }),
+      ch.title ? el('div', { class: 'chapter-head', text: `第${idx + 1}章 ${ch.title}` }) : null,
+      dialogue(ch.intro),
       el('p', { class: 'stage-intro', text: st.intro }),
     ]),
     list,
+    cleared && ch.outro.length ? el('div', { class: 'section-label', text: 'この章の締め' }) : null,
+    cleared ? dialogue(ch.outro) : null,
   ]);
 }
 
@@ -9183,6 +9415,9 @@ function renderReview(m) {
   const stageId = getStageOf(m.id);
   const st = STAGES.find(s => s.id === stageId);
   const nextInStage = st.missions.find(x => !isDone(x.id));
+  const ch = chapterOf(st.id);
+  const stageCleared = !nextInStage;
+  const gameCleared = stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
   let nextBtn;
   if (nextInStage) nextBtn = el('button', { class: 'btn-primary', text: '次のミッションへ ▸', onclick: () => { play = null; go('#/mission/' + nextInStage.id); } });
   else {
@@ -9205,6 +9440,10 @@ function renderReview(m) {
     rv.why ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: 'なぜこの操作が必要だったか' }), el('div', { class: 'db-text', text: rv.why })]) : null,
     rv.practice ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '実務での使いどころ' }), el('div', { class: 'db-text', text: rv.practice })]) : null,
     rv.related && rv.related.length ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '次につながる知識' }), el('div', { class: 'chips' }, rv.related.map(r => el('span', { class: 'chip', text: r })))]) : null,
+    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `第${STAGES.indexOf(st) + 1}章 クリア` }) : null,
+    stageCleared ? dialogue(ch.outro) : null,
+    gameCleared ? el('div', { class: 'section-label', text: EPILOGUE.title }) : null,
+    gameCleared ? dialogue(EPILOGUE.lines) : null,
     el('div', { class: 'detail-cta' }, [nextBtn]),
   ]);
 }

@@ -9,6 +9,7 @@ const DEFAULT = {
   flags: [],      // 取得したフラグ文字列
   learned: [],    // 学習済みトピック
   settings: { fontSize: 'm' },
+  storySeen: false, // プロローグ既読
 };
 
 let cache = null;
@@ -43,6 +44,7 @@ function validate(obj) {
   }
   if (Array.isArray(obj.flags)) out.flags = [...new Set(obj.flags.filter(f => typeof f === 'string' && f.length < 200))].slice(0, 500);
   if (Array.isArray(obj.learned)) out.learned = [...new Set(obj.learned.filter(f => typeof f === 'string' && f.length < 200))].slice(0, 500);
+  out.storySeen = obj.storySeen === true;
   if (obj.settings && typeof obj.settings === 'object') {
     if (['s', 'm', 'l'].includes(obj.settings.fontSize)) out.settings.fontSize = obj.settings.fontSize;
   }
@@ -77,6 +79,8 @@ export function addLearned(topics) {
   if (changed) save();
 }
 export function incHint(id) { missionState(id).usedHints++; save(); }
+export function storySeen() { return load().storySeen === true; }
+export function markStorySeen() { load().storySeen = true; save(); }
 export function getSettings() { return load().settings; }
 export function setSetting(k, v) { load().settings[k] = v; save(); }
 

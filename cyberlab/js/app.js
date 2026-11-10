@@ -7,6 +7,7 @@ import { Terminal } from './terminal.js';
 import { evaluate, needsAnswer } from './checker.js';
 import * as store from './storage.js';
 import { STAGES, getMission, getStageOf, isMissionUnlocked, allMissions } from './missions/index.js';
+import { CAST, PROLOGUE, EPILOGUE, chapterOf } from './story.js';
 
 const app = document.getElementById('app');
 const isDone = id => store.missionState(id).done;
@@ -23,6 +24,8 @@ function route() {
   if (parts[0] === 'mission' && parts[1]) return renderMissionDetail(parts[1]);
   if (parts[0] === 'play' && parts[1]) return startPlay(parts[1]);
   if (parts[0] === 'progress') return renderProgress();
+  if (parts[0] === 'story') return renderStory();
+  if (!store.storySeen() && parts.length === 0) return renderStory(true);
   return renderHome();
 }
 window.addEventListener('hashchange', route);
@@ -39,6 +42,47 @@ function topbar(title, back) {
 }
 
 function screen(children) { clear(app); const m = el('main', {}, children); app.appendChild(m); window.scrollTo(0, 0); }
+
+// ---------- ストーリー ----------
+function dialogue(lines) {
+  return el('div', { class: 'story-lines' }, (lines || []).map(l => {
+    const who = CAST[l.who];
+    return el('div', { class: 'story-line ' + (who ? 'say ' + l.who : 'narr') }, [
+      who ? el('div', { class: 'story-who', text: who }) : null,
+      el('div', { class: 'story-text', text: l.text }),
+    ]);
+  }));
+}
+
+function renderStory(first) {
+  const done = STAGES.filter(st => st.missions.every(m => isDone(m.id))).length;
+  const chapters = STAGES.map((st, i) => {
+    const ch = chapterOf(st.id);
+    const cleared = st.missions.every(m => isDone(m.id));
+    const open = isMissionUnlocked(st.missions[0].id, isDone);
+    return el('div', { class: 'chapter-row' + (open ? '' : ' locked') }, [
+      el('div', { class: 'chapter-no', text: String(i + 1) }),
+      el('div', { class: 'chapter-body' }, [
+        el('div', { class: 'chapter-title', text: ch.title || st.title }),
+        el('div', { class: 'chapter-sub', text: open ? (cleared ? '読了' : '進行中') : '未解放' }),
+      ]),
+    ]);
+  });
+  const all = done === STAGES.length;
+  screen([
+    topbar('ストーリー', first ? null : '#/'),
+    el('div', { class: 'story-hero' }, [
+      el('div', { class: 'hero-badge', text: 'PROLOGUE' }),
+      el('h2', { class: 'detail-title', text: PROLOGUE.title }),
+    ]),
+    dialogue(PROLOGUE.lines),
+    first ? el('div', { class: 'detail-cta' }, [el('button', { class: 'btn-primary', text: '訓練を始める ▸', onclick: () => { store.markStorySeen(); go('#/'); renderHome(); } })]) : null,
+    first ? null : el('div', { class: 'section-label', text: '章の一覧' }),
+    first ? null : el('div', { class: 'chapter-list' }, chapters),
+    first || !all ? null : el('div', { class: 'section-label', text: 'エピローグ' }),
+    first || !all ? null : dialogue(EPILOGUE.lines),
+  ]);
+}
 
 // ---------- ホーム ----------
 function renderHome() {
@@ -64,6 +108,7 @@ function renderHome() {
   const cont = el('div', { class: 'home-actions' }, [
     el('button', { class: 'btn-primary', text: next ? (done ? '続きから学習する ▸' : '訓練を開始する ▸') : '全ミッション踏破済み ✓', onclick: () => next ? go('#/mission/' + next.id) : go('#/progress') }),
     el('button', { class: 'btn-ghost', text: 'ステージ一覧を見る', onclick: () => go('#/stage/' + STAGES[0].id) }),
+    el('button', { class: 'btn-ghost', text: 'ストーリーを読む', onclick: () => go('#/story') }),
   ]);
 
   const map = el('div', { class: 'stage-list' }, STAGES.map(st => stageRow(st)));
@@ -110,13 +155,20 @@ function renderStage(stageId) {
       el('div', { class: 'mc-arrow', text: unlocked ? '›' : '' }),
     ]);
   }));
+  const ch = chapterOf(st.id);
+  const idx = STAGES.indexOf(st);
+  const cleared = st.missions.every(m => isDone(m.id));
   screen([
     topbar(st.title, '#/'),
     el('div', { class: 'stage-hero' }, [
       el('div', { class: 'section-label', text: st.title }),
+      ch.title ? el('div', { class: 'chapter-head', text: `第${idx + 1}章 ${ch.title}` }) : null,
+      dialogue(ch.intro),
       el('p', { class: 'stage-intro', text: st.intro }),
     ]),
     list,
+    cleared && ch.outro.length ? el('div', { class: 'section-label', text: 'この章の締め' }) : null,
+    cleared ? dialogue(ch.outro) : null,
   ]);
 }
 
@@ -360,6 +412,9 @@ function renderReview(m) {
   const stageId = getStageOf(m.id);
   const st = STAGES.find(s => s.id === stageId);
   const nextInStage = st.missions.find(x => !isDone(x.id));
+  const ch = chapterOf(st.id);
+  const stageCleared = !nextInStage;
+  const gameCleared = stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
   let nextBtn;
   if (nextInStage) nextBtn = el('button', { class: 'btn-primary', text: '次のミッションへ ▸', onclick: () => { play = null; go('#/mission/' + nextInStage.id); } });
   else {
@@ -382,6 +437,10 @@ function renderReview(m) {
     rv.why ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: 'なぜこの操作が必要だったか' }), el('div', { class: 'db-text', text: rv.why })]) : null,
     rv.practice ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '実務での使いどころ' }), el('div', { class: 'db-text', text: rv.practice })]) : null,
     rv.related && rv.related.length ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '次につながる知識' }), el('div', { class: 'chips' }, rv.related.map(r => el('span', { class: 'chip', text: r })))]) : null,
+    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `第${STAGES.indexOf(st) + 1}章 クリア` }) : null,
+    stageCleared ? dialogue(ch.outro) : null,
+    gameCleared ? el('div', { class: 'section-label', text: EPILOGUE.title }) : null,
+    gameCleared ? dialogue(EPILOGUE.lines) : null,
     el('div', { class: 'detail-cta' }, [nextBtn]),
   ]);
 }
