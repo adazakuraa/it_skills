@@ -101,16 +101,19 @@ export function makeNetCommands() {
       return true;
     });
     if (name === 'ss') {
-      ctx.out('Netid State   Local Address:Port    Peer Address:Port   Process\n');
+      ctx.out('Netid State   Local Address:Port      Peer Address:Port     Process\n');
       for (const e of list) {
         const proc = (opts.p && e.process) ? `users:(("${e.process}",pid=${e.pid || 0}))` : '';
-        ctx.out(`${e.proto.padEnd(5)} ${(e.state || 'LISTEN').padEnd(7)} ${(e.addr || '0.0.0.0') + ':' + e.port}`.padEnd(45) + `${proc}\n`);
+        const local = (e.addr || '0.0.0.0') + ':' + e.port;
+        const peer = e.peer || ((e.state && e.state !== 'LISTEN') ? '*:*' : '0.0.0.0:*');
+        ctx.out(`${e.proto.padEnd(5)} ${(e.state || 'LISTEN').padEnd(7)} ${local.padEnd(22)} ${peer.padEnd(21)} ${proc}\n`);
       }
     } else {
-      ctx.out('Proto Recv-Q Send-Q Local Address           State       PID/Program name\n');
+      ctx.out('Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name\n');
       for (const e of list) {
         const proc = (opts.p && e.process) ? `${e.pid || '-'}/${e.process}` : '-';
-        ctx.out(`${e.proto.padEnd(5)} 0      0      ${((e.addr || '0.0.0.0') + ':' + e.port).padEnd(22)} ${(e.state || 'LISTEN').padEnd(11)} ${proc}\n`);
+        const peer = e.peer || ((e.state && e.state !== 'LISTEN') ? '*:*' : '0.0.0.0:*');
+        ctx.out(`${e.proto.padEnd(5)} 0      0      ${((e.addr || '0.0.0.0') + ':' + e.port).padEnd(22)}  ${peer.padEnd(22)} ${(e.state || 'LISTEN').padEnd(11)} ${proc}\n`);
       }
     }
     return 0;

@@ -13,6 +13,7 @@ import { stageCrypto } from './stage-crypto.js';
 import { stageForensics } from './stage-forensics.js';
 import { stageLinux2 } from './stage-linux2.js';
 import { stageWebAdv } from './stage-webadv.js';
+import { stageDefense } from './stage-defense.js';
 
 export const STAGES = [
   stage0,          // 入門: ターミナル基礎
@@ -27,6 +28,7 @@ export const STAGES = [
   stageCrypto,     // 暗号・ハッシュ(実技)
   stage3,          // ログ解析・インシデント
   stageForensics,  // フォレンジック
+  stageDefense,    // 防御・監視(ブルーチーム)
   stage5,          // Web脆弱性 I
   stageWebAdv,     // Web脆弱性 II
 ];

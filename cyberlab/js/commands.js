@@ -817,6 +817,8 @@ export function makeCommands(getCmds) {
         const parts = arg.split(',').map(tok => {
           tok = tok.trim();
           if (tok === '$0') return line;
+          if (tok === '$NF') return fields[NF - 1] ?? '';
+          if (tok === '$(NF-1)') return fields[NF - 2] ?? '';
           const fm = tok.match(/^\$(\d+)$/);
           if (fm) return fields[parseInt(fm[1], 10) - 1] ?? '';
           if (tok === 'NR') return String(NR);
