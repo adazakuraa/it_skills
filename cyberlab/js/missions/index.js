@@ -7,16 +7,24 @@ import { stage4 } from './stage4-network.js';
 import { stage5 } from './stage5-webvuln.js';
 import { stageNetBasics } from './stage-netbasics.js';
 import { stageSecBasics } from './stage-secbasics.js';
+import { stageTextproc } from './stage-textproc.js';
+import { stageShell } from './stage-shell.js';
+import { stageCrypto } from './stage-crypto.js';
+import { stageForensics } from './stage-forensics.js';
 
 export const STAGES = [
-  stage0,
-  stage1,
-  stageNetBasics,
-  stage2,
-  stageSecBasics,
-  stage3,
-  stage4,
-  stage5,
+  stage0,          // 入門: ターミナル基礎
+  stage1,          // ファイル調査・検索・集計
+  stageTextproc,   // テキスト処理
+  stage2,          // 権限・プロセス
+  stageShell,      // 環境変数・スクリプト・cron
+  stageNetBasics,  // ネットワーク理論
+  stage4,          // ネットワーク調査(実技)
+  stageSecBasics,  // セキュリティ基礎理論
+  stageCrypto,     // 暗号・ハッシュ(実技)
+  stage3,          // ログ解析・インシデント
+  stageForensics,  // フォレンジック
+  stage5,          // Web脆弱性
 ];
 
 // 今後のステージはここに追加する:
