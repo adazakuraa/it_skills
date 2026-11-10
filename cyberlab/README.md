@@ -25,13 +25,22 @@ https://<ユーザー名>.github.io/<リポジトリ名>/cyberlab/
 ## 動作確認（開発者向け）
 
 ```bash
-# 自動テスト（コマンド挙動＋全ミッションが模範解で解けるか）
+# js/ を変更したらバンドルを再生成（起動高速化のため index.html は単一バンドルを読む）
+node cyberlab/build.mjs
+
+# 自動テスト（コマンド挙動＋全ミッションが模範解で解けるか＋バンドルが最新か）
 node cyberlab/tests/run.mjs
 
 # ローカルプレビュー
 cd cyberlab && python3 -m http.server 8000
 # → http://localhost:8000/
 ```
+
+> **起動の高速化について**: `js/` 以下は編集しやすいようモジュール分割していますが、本番(`index.html`)は
+> `build.mjs` が生成する単一ファイル `app.bundle.js` を読み込みます。これによりHTTPリクエストが
+> 約40→3に減り、GitHub Pages の gzip 配信と合わせてモバイルでの初回起動が大幅に速くなります
+> （4G相当の計測で約4.5秒→約1.8秒）。`js/` を変更したら `node build.mjs` の再実行を忘れずに
+> （テストが不一致を検出します）。
 
 ## 構成
 

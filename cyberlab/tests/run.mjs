@@ -1,7 +1,11 @@
 // 自動テスト：コマンド挙動＋全ミッションが solution で解けるか
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { buildEnvironment } from '../js/env.js';
 import { evaluate, needsAnswer } from '../js/checker.js';
 import { STAGES, allMissions } from '../js/missions/index.js';
+import { bundle } from '../build.mjs';
 
 let pass = 0, fail = 0;
 const fails = [];
@@ -178,9 +182,19 @@ function structureTests() {
   }
 }
 
+// ---------- バンドルが最新か検証（node build.mjs の実行忘れを検出） ----------
+function bundleTests() {
+  const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const built = bundle(baseDir).code;
+  let onDisk = null;
+  try { onDisk = fs.readFileSync(path.join(baseDir, 'app.bundle.js'), 'utf8'); } catch { /* missing */ }
+  ok(onDisk === built, 'app.bundle.js が最新のソースと一致（不一致なら `node build.mjs` を実行してコミット）');
+}
+
 cmdTests();
 structureTests();
 missionTests();
+bundleTests();
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) { console.log('\nFAILURES:'); for (const f of fails) console.log('  ✗ ' + f); process.exit(1); }
