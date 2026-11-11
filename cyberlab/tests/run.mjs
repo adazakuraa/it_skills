@@ -121,9 +121,9 @@ function cmdTests() {
   s = freshShell(env);
   ok(sh(s, 'cat /data/private 2>/dev/null') === '', 'stderr to /dev/null discards error');
 
-  // command substitution should error gracefully, not eval
+  // コマンド置換は自前パーサーで安全に実行される（eval ではない）
   s = freshShell(env);
-  ok(shErr(s, 'echo $(whoami)').includes('未対応'), 'command substitution rejected (no eval)');
+  ok(sh(s, 'echo $(whoami)') === 'tester\n', 'command substitution runs in the sandboxed shell');
 
   // unknown command
   ok(shErr(s, 'frobnicate').includes('command not found'), 'unknown command');
@@ -239,6 +239,56 @@ function engineTests() {
   ok(run('ls --bogus').includes("Try 'man ls'"), '不明オプションは GNU 形式のエラー');
 }
 
+
+// ---------- シェルスクリプト機能の回帰テスト ----------
+function scriptTests() {
+  const env = { user: 't', files: [
+    { path: '/home/t/a.txt', owner: 't', content: 'one two\nthree\n' },
+    { path: '/home/t/b.log', owner: 't', content: 'x\n' },
+    { path: '/home/t/run.sh', owner: 't', mode: 0o755, content: '#!/bin/bash\nfor f in *.txt; do\n  if [ -s "$f" ]; then\n    echo "found $f"\n  else\n    echo "empty $f"\n  fi\ndone\ncount=0\nwhile [ $count -lt 3 ]; do\n  count=$((count+1))\ndone\necho "count=$count"\nexit 3\n' },
+  ] };
+  const { shell: s } = buildEnvironment({ env });
+  const run = (l) => s.run(l).map(c => (c.fd === 2 ? '[E]' : '') + c.text).join('');
+  run('cd /home/t');
+  const eq = (name, cmd, want) => { const got = run(cmd); ok(got === want, `${name}: ${cmd} → ${JSON.stringify(got)} (期待 ${JSON.stringify(want)})`); };
+  eq('subst', 'echo "user=$(whoami) cwd=$(pwd)"', 'user=t cwd=/home/t\n');
+  eq('backtick', 'echo `hostname`', 'lab-01\n');
+  eq('arith', 'n=5; echo $((n*n+1)) $((1+2*(3+4)))', '26 15\n');
+  eq('arith div0', 'echo $((10/0))', '[E]bash: division by 0\n');
+  eq('assign no split', 'x=$(cat a.txt); echo "$x" | wc -l', '2\n');
+  eq('word split', 'v="a b"; echo $v | wc -w', '2\n');
+  eq('glob in subst', 'ls $(echo *.log)', 'b.log\n');
+  eq('for list', 'for f in a b c; do echo $f; done', 'a\nb\nc\n');
+  eq('for glob', 'for f in *.txt; do wc -l $f; done', '2 a.txt\n');
+  eq('if/else', 'if [ -f a.txt ]; then echo yes; else echo no; fi', 'yes\n');
+  eq('if/elif', 'if [ -d nope ]; then echo d; elif [ -f a.txt ]; then echo f; else echo none; fi', 'f\n');
+  eq('while', 'i=0; while [ $i -lt 3 ]; do echo i=$i; i=$((i+1)); done', 'i=0\ni=1\ni=2\n');
+  eq('break', 'for n in $(seq 1 5); do [ $n -eq 3 ] && break; echo $n; done', '1\n2\n');
+  eq('continue', 'for n in 1 2 3; do [ $n -eq 2 ] && continue; echo $n; done', '1\n3\n');
+  eq('test -a', '[ 5 -gt 3 -a 2 -lt 4 ] && echo both', 'both\n');
+  eq('[[ glob', '[[ abc == a* ]] && echo m', 'm\n');
+  eq('[[ regex', '[[ hello =~ ^h.l+o$ ]] && echo re', 're\n');
+  eq('script run', './run.sh; echo rc=$?', 'found a.txt\ncount=3\nrc=3\n');
+  eq('bash script', 'bash run.sh | tail -1', 'count=3\n');
+  eq('case unsupported', 'case x in x) echo y;; esac', "[E]bash: 'case' はこのシミュレーターでは未対応です\n");
+  ok(run('if true; then echo a').includes("'fi'"), '未完の if は構文エラーを報告');
+  ok(run('while true; do :; done').includes('上限'), '無限ループはステップ上限で止まる');
+}
+
+// ---------- セキュリティ: eval / Function を使っていないことの静的検査 ----------
+function securityStaticTests() {
+  const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap(e => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
+  for (const f of walk(path.join(baseDir, 'js')).filter(x => x.endsWith('.js'))) {
+    const src = fs.readFileSync(f, 'utf8').split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+    const rel = path.relative(baseDir, f);
+    ok(!/(^|[^.\w])eval\s*\(/.test(src), `${rel}: eval() を使っていない`);
+    ok(!/new\s+Function\s*\(/.test(src) && !/(^|[^.\w])Function\s*\(/.test(src), `${rel}: Function() を使っていない`);
+    ok(!/set(Timeout|Interval)\s*\(\s*['"`]/.test(src), `${rel}: 文字列の setTimeout/setInterval を使っていない`);
+    ok(!/\.innerHTML\s*=|insertAdjacentHTML|document\.write/.test(src), `${rel}: innerHTML 等の HTML 文字列挿入を使っていない`);
+  }
+}
+
 // ---------- バンドルが最新か検証（node build.mjs の実行忘れを検出） ----------
 function bundleTests() {
   const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -250,6 +300,8 @@ function bundleTests() {
 
 cmdTests();
 engineTests();
+scriptTests();
+securityStaticTests();
 structureTests();
 missionTests();
 bundleTests();

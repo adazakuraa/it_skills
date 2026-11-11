@@ -467,45 +467,45 @@ class Interp {
   }
   lval(node) {
     if (node.k === 'var') return { get: () => this.vars[node.name], set: (v) => this.setVar(node.name, v) };
-    if (node.k === 'field') { const i = this.eval(node.e); return { get: () => this.getField(i), set: (v) => this.setField(i, v) }; }
-    const key = toStr(this.eval(node.e)); const a = this.arr(node.name);
+    if (node.k === 'field') { const i = this.ev(node.e); return { get: () => this.getField(i), set: (v) => this.setField(i, v) }; }
+    const key = toStr(this.ev(node.e)); const a = this.arr(node.name);
     return { get: () => a.get(key), set: (v) => a.set(key, v) };
   }
-  eval(n) {
+  ev(n) {
     this.tick();
     switch (n.k) {
       case 'num': return n.v;
       case 'str': return n.v;
       case 'regex': return this.regex(n.v).test(this.record) ? 1 : 0;
-      case 'group': return this.eval(n.e);
+      case 'group': return this.ev(n.e);
       case 'var': return this.vars[n.name];
-      case 'field': return this.getField(this.eval(n.e));
-      case 'index': { const a = this.arr(n.name), key = toStr(this.eval(n.e)); if (!a.has(key)) a.set(key, undefined); return a.get(key); }
+      case 'field': return this.getField(this.ev(n.e));
+      case 'index': { const a = this.arr(n.name), key = toStr(this.ev(n.e)); if (!a.has(key)) a.set(key, undefined); return a.get(key); }
       case 'assign': {
         const lv = this.lval(n.l);
         let v;
-        if (n.op === '=') v = this.eval(n.r);
-        else { const x = toNum(lv.get()), y = toNum(this.eval(n.r)); v = n.op === '+=' ? x + y : n.op === '-=' ? x - y : n.op === '*=' ? x * y : n.op === '/=' ? this.div(x, y) : n.op === '%=' ? this.mod(x, y) : x ** y; }
+        if (n.op === '=') v = this.ev(n.r);
+        else { const x = toNum(lv.get()), y = toNum(this.ev(n.r)); v = n.op === '+=' ? x + y : n.op === '-=' ? x - y : n.op === '*=' ? x * y : n.op === '/=' ? this.div(x, y) : n.op === '%=' ? this.mod(x, y) : x ** y; }
         lv.set(v); return v;
       }
-      case 'cond': return toBool(this.eval(n.c)) ? this.eval(n.a) : this.eval(n.b);
-      case 'or': return toBool(this.eval(n.l)) || toBool(this.eval(n.r)) ? 1 : 0;
-      case 'and': return toBool(this.eval(n.l)) && toBool(this.eval(n.r)) ? 1 : 0;
-      case 'not': return toBool(this.eval(n.e)) ? 0 : 1;
-      case 'neg': return -toNum(this.eval(n.e));
-      case 'pos': return toNum(this.eval(n.e));
+      case 'cond': return toBool(this.ev(n.c)) ? this.ev(n.a) : this.ev(n.b);
+      case 'or': return toBool(this.ev(n.l)) || toBool(this.ev(n.r)) ? 1 : 0;
+      case 'and': return toBool(this.ev(n.l)) && toBool(this.ev(n.r)) ? 1 : 0;
+      case 'not': return toBool(this.ev(n.e)) ? 0 : 1;
+      case 'neg': return -toNum(this.ev(n.e));
+      case 'pos': return toNum(this.ev(n.e));
       case 'bin': {
-        const x = toNum(this.eval(n.l)), y = toNum(this.eval(n.r));
+        const x = toNum(this.ev(n.l)), y = toNum(this.ev(n.r));
         switch (n.op) { case '+': return x + y; case '-': return x - y; case '*': return x * y; case '/': return this.div(x, y); case '%': return this.mod(x, y); default: return x ** y; }
       }
-      case 'rel': return this.compare(n.op, this.eval(n.l), this.eval(n.r), this.isStrNode(n.l) || this.isStrNode(n.r)) ? 1 : 0;
+      case 'rel': return this.compare(n.op, this.ev(n.l), this.ev(n.r), this.isStrNode(n.l) || this.isStrNode(n.r)) ? 1 : 0;
       case 'match': {
-        const s = toStr(this.eval(n.l));
-        const re = n.r.k === 'regex' ? this.regex(n.r.v) : this.regex(toStr(this.eval(n.r)));
+        const s = toStr(this.ev(n.l));
+        const re = n.r.k === 'regex' ? this.regex(n.r.v) : this.regex(toStr(this.ev(n.r)));
         return re.test(s) !== n.neg ? 1 : 0;
       }
-      case 'concat': return toStr(this.eval(n.l)) + toStr(this.eval(n.r));
-      case 'in': return this.arr(n.arr).has(toStr(this.eval(n.key))) ? 1 : 0;
+      case 'concat': return toStr(this.ev(n.l)) + toStr(this.ev(n.r));
+      case 'in': return this.arr(n.arr).has(toStr(this.ev(n.key))) ? 1 : 0;
       case 'incdec': {
         const lv = this.lval(n.t); const old = toNum(lv.get()); const nv = n.op === '++' ? old + 1 : old - 1;
         lv.set(nv); return n.pre ? nv : old;
@@ -519,7 +519,7 @@ class Interp {
 
   call(n) {
     const a = n.args;
-    const sarg = (i) => toStr(this.eval(a[i]));
+    const sarg = (i) => toStr(this.ev(a[i]));
     const need = (min, max = min) => { if (a.length < min || a.length > max) throw new AwkError(`${n.name}: 引数の数が不正です`); };
     switch (n.name) {
       case 'length': {
@@ -528,24 +528,24 @@ class Interp {
         return sarg(0).length;
       }
       case 'substr': {
-        need(2, 3); const s = sarg(0); const m = Math.round(toNum(this.eval(a[1])));
-        const len = a.length === 3 ? Math.round(toNum(this.eval(a[2]))) : Infinity;
+        need(2, 3); const s = sarg(0); const m = Math.round(toNum(this.ev(a[1])));
+        const len = a.length === 3 ? Math.round(toNum(this.ev(a[2]))) : Infinity;
         const start = Math.max(1, m); const end = Math.min(s.length + 1, m + len);
         return end <= start ? '' : s.slice(start - 1, end - 1);
       }
       case 'index': need(2); return sarg(0).indexOf(sarg(1)) + 1;
       case 'tolower': need(1); return sarg(0).toLowerCase();
       case 'toupper': need(1); return sarg(0).toUpperCase();
-      case 'sprintf': { if (!a.length) throw new AwkError('sprintf: フォーマットがありません'); return sprintf(sarg(0), a.slice(1).map(x => this.eval(x))); }
-      case 'int': need(1); return Math.trunc(toNum(this.eval(a[0])));
-      case 'sqrt': need(1); return Math.sqrt(toNum(this.eval(a[0])));
-      case 'exp': need(1); return Math.exp(toNum(this.eval(a[0])));
-      case 'log': need(1); return Math.log(toNum(this.eval(a[0])));
-      case 'sin': need(1); return Math.sin(toNum(this.eval(a[0])));
-      case 'cos': need(1); return Math.cos(toNum(this.eval(a[0])));
-      case 'atan2': need(2); return Math.atan2(toNum(this.eval(a[0])), toNum(this.eval(a[1])));
+      case 'sprintf': { if (!a.length) throw new AwkError('sprintf: フォーマットがありません'); return sprintf(sarg(0), a.slice(1).map(x => this.ev(x))); }
+      case 'int': need(1); return Math.trunc(toNum(this.ev(a[0])));
+      case 'sqrt': need(1); return Math.sqrt(toNum(this.ev(a[0])));
+      case 'exp': need(1); return Math.exp(toNum(this.ev(a[0])));
+      case 'log': need(1); return Math.log(toNum(this.ev(a[0])));
+      case 'sin': need(1); return Math.sin(toNum(this.ev(a[0])));
+      case 'cos': need(1); return Math.cos(toNum(this.ev(a[0])));
+      case 'atan2': need(2); return Math.atan2(toNum(this.ev(a[0])), toNum(this.ev(a[1])));
       case 'rand': this.seed = (this.seed * 1103515245 + 12345) & 0x7fffffff; return this.seed / 0x80000000;
-      case 'srand': { const old = this.seed; this.seed = a.length ? Math.trunc(toNum(this.eval(a[0]))) : 0; return old; }
+      case 'srand': { const old = this.seed; this.seed = a.length ? Math.trunc(toNum(this.ev(a[0]))) : 0; return old; }
       case 'split': {
         need(2, 3);
         if (a[1].k !== 'var') throw new AwkError('split の第2引数は配列名です');
@@ -587,22 +587,22 @@ class Interp {
     this.tick();
     switch (st.k) {
       case 'block': for (const s of st.body) this.exec(s); return;
-      case 'expr': this.eval(st.e); return;
+      case 'expr': this.ev(st.e); return;
       case 'print': {
-        const vals = st.args.length ? st.args.map(e => toStr(this.eval(e))) : [this.record];
+        const vals = st.args.length ? st.args.map(e => toStr(this.ev(e))) : [this.record];
         this.emit(vals.join(toStr(this.vars.OFS)) + toStr(this.vars.ORS)); return;
       }
       case 'printf': {
         if (!st.args.length) throw new AwkError('printf: フォーマットがありません');
-        const vals = st.args.map(e => this.eval(e));
+        const vals = st.args.map(e => this.ev(e));
         this.emit(sprintf(toStr(vals[0]), vals.slice(1))); return;
       }
-      case 'if': if (toBool(this.eval(st.c))) this.exec(st.then); else if (st.els) this.exec(st.els); return;
-      case 'while': this.loop(() => toBool(this.eval(st.c)), st.body); return;
-      case 'do': { let first = true; this.loop(() => { if (first) { first = false; return true; } return toBool(this.eval(st.c)); }, st.body); return; }
+      case 'if': if (toBool(this.ev(st.c))) this.exec(st.then); else if (st.els) this.exec(st.els); return;
+      case 'while': this.loop(() => toBool(this.ev(st.c)), st.body); return;
+      case 'do': { let first = true; this.loop(() => { if (first) { first = false; return true; } return toBool(this.ev(st.c)); }, st.body); return; }
       case 'for': {
         if (st.init) this.exec(st.init);
-        this.loop(() => (st.c ? toBool(this.eval(st.c)) : true), st.body, st.inc ? () => this.exec(st.inc) : null); return;
+        this.loop(() => (st.c ? toBool(this.ev(st.c)) : true), st.body, st.inc ? () => this.exec(st.inc) : null); return;
       }
       case 'forin': {
         for (const key of [...this.arr(st.arr).keys()]) {
@@ -611,11 +611,11 @@ class Interp {
         }
         return;
       }
-      case 'delete': if (st.e) this.arr(st.name).delete(toStr(this.eval(st.e))); else this.arr(st.name).clear(); return;
+      case 'delete': if (st.e) this.arr(st.name).delete(toStr(this.ev(st.e))); else this.arr(st.name).clear(); return;
       case 'break': throw new BreakSignal();
       case 'continue': throw new ContinueSignal();
       case 'next': throw new NextSignal();
-      case 'exit': throw new ExitSignal(st.e ? Math.trunc(toNum(this.eval(st.e))) : 0);
+      case 'exit': throw new ExitSignal(st.e ? Math.trunc(toNum(this.ev(st.e))) : 0);
       default: throw new AwkError(`内部エラー: 未知の文 ${st.k}`);
     }
   }
@@ -631,10 +631,10 @@ class Interp {
     for (const it of mains) {
       if (it.pat2) {
         let active = this.range.get(it);
-        if (!active) { if (!toBool(this.eval(it.pat))) continue; active = true; }
-        if (toBool(this.eval(it.pat2))) active = false;
+        if (!active) { if (!toBool(this.ev(it.pat))) continue; active = true; }
+        if (toBool(this.ev(it.pat2))) active = false;
         this.range.set(it, active);
-      } else if (it.pat && !toBool(this.eval(it.pat))) continue;
+      } else if (it.pat && !toBool(this.ev(it.pat))) continue;
       if (it.action) this.exec(it.action); else this.emit(this.record + toStr(this.vars.ORS));
     }
   }

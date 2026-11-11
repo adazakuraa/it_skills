@@ -485,11 +485,31 @@ const { FsError, ERRMSG } = __require("js/vfs.js");
 const MAX_LINE = 4000;
 const MAX_OUTPUT = 200000;
 const MAX_DEPTH = 8;
+const COMPOUND_RE = /(^|[;&|]\s*)(if|for|while|until|case)\s/;
+const MAX_SCRIPT_STEPS = 20000;
 
 class ShellSyntaxError extends Error {}
 
+
+// 対応する ')' の位置を返す（クォート・入れ子・エスケープを考慮）。start は '(' の次の位置。無ければ -1
+function findClosingParen(line, start) {
+  let depth = 1, i = start, inS = false, inD = false;
+  while (i < line.length) {
+    const c = line[i];
+    if (inS) { if (c === "'") inS = false; i++; continue; }
+    if (c === '\\') { i += 2; continue; }
+    if (inD) { if (c === '"') inD = false; i++; continue; }
+    if (c === "'") inS = true;
+    else if (c === '"') inD = true;
+    else if (c === '(') depth++;
+    else if (c === ')') { depth--; if (depth === 0) return i; }
+    i++;
+  }
+  return -1;
+}
+
 // ---------- 字句解析 ----------
-// 単語は segment の配列: {k:'lit', v, q} / {k:'var', name, q} / {k:'tilde'}
+// 単語は segment の配列: {k:'lit', v, q} / {k:'var', name, q} / {k:'cmd', src, q} / {k:'arith', src, q} / {k:'tilde'}
 function tokenize(line) {
   const toks = [];
   let i = 0;
@@ -502,8 +522,20 @@ function tokenize(line) {
     let m;
     if ((m = rest.match(/^\{([A-Za-z_][A-Za-z0-9_]*|[0-9?#@*])\}/))) { push({ k: 'var', name: m[1], q }); i += m[0].length + 1; return; }
     if ((m = rest.match(/^([A-Za-z_][A-Za-z0-9_]*|[0-9?#@*$])/))) { push({ k: 'var', name: m[1], q }); i += m[0].length + 1; return; }
-    if (rest.startsWith('(')) throw new ShellSyntaxError('コマンド置換 $(...) はこのシミュレーターでは未対応です');
+    if (rest.startsWith('(')) {
+      const end = findClosingParen(line, i + 2);
+      if (end < 0) throw new ShellSyntaxError("unexpected EOF while looking for matching `)'");
+      if (line[i + 2] === '(' && line[end - 1] === ')') push({ k: 'arith', src: line.slice(i + 3, end - 1), q });
+      else push({ k: 'cmd', src: line.slice(i + 2, end), q });
+      i = end + 1; return;
+    }
     push({ k: 'lit', v: '$', q }); i++;
+  };
+  const readBacktick = (q) => {
+    const end = line.indexOf('`', i + 1);
+    if (end < 0) throw new ShellSyntaxError("unexpected EOF while looking for matching ``'");
+    push({ k: 'cmd', src: line.slice(i + 1, end).replace(/\\`/g, '`'), q });
+    i = end + 1;
   };
 
   while (i < line.length) {
@@ -531,7 +563,7 @@ function tokenize(line) {
         if (d === '"') { closed = true; i++; break; }
         if (d === '\\' && i + 1 < line.length && '"\\$`'.includes(line[i + 1])) { buf += line[i + 1]; i += 2; continue; }
         if (d === '$') { if (buf) { push({ k: 'lit', v: buf, q: true }); buf = ''; } readVar(true); continue; }
-        if (d === '`') throw new ShellSyntaxError('コマンド置換 `...` はこのシミュレーターでは未対応です');
+        if (d === '`') { if (buf) { push({ k: 'lit', v: buf, q: true }); buf = ''; } readBacktick(true); continue; }
         buf += d; i++;
       }
       if (!closed) throw new ShellSyntaxError('unexpected EOF while looking for matching `"\'');
@@ -539,7 +571,7 @@ function tokenize(line) {
       continue;
     }
     if (c === '$') { readVar(false); continue; }
-    if (c === '`') throw new ShellSyntaxError('コマンド置換 `...` はこのシミュレーターでは未対応です');
+    if (c === '`') { readBacktick(false); continue; }
     // 演算子
     const three = line.slice(i, i + 3);
     const two = line.slice(i, i + 2);
@@ -642,6 +674,9 @@ class Shell {
     this.positional = [];
     this.depth = 0;
     this.cmdLog = []; // 実行したコマンド名の記録（復習画面用）
+    this.subDepth = 0;      // コマンド置換の入れ子の深さ
+    this.loopDepth = 0;     // 実行中のループの深さ（break/continue の検証用）
+    this.pendingErr = [];   // コマンド置換内で出た stderr（親コマンドの出力へ合流）
     this.env = Object.assign({
       HOME: user.home, USER: user.name, LOGNAME: user.name, SHELL: '/bin/bash',
       PATH: '/usr/local/bin:/usr/bin:/bin', PWD: cwd, LANG: 'C.UTF-8', TERM: 'xterm-256color',
@@ -666,26 +701,92 @@ class Shell {
     return this.env[name] ?? '';
   }
 
-  /** 単語を展開して文字列配列にする（グロブ展開を含む） */
-  expandWord(word) {
-    let text = '';
-    let pattern = '';
-    let hasGlob = false;
+  /** 単語を展開して文字列配列にする（変数/コマンド置換/算術 → 単語分割 → グロブ） */
+  expandWord(word, { noSplit = false, noGlob = false } = {}) {
+    const fields = [];
+    let cur = { text: '', pat: '', glob: false, keep: false };
+    const endField = () => { fields.push(cur); cur = { text: '', pat: '', glob: false, keep: false }; };
+    const addQuoted = (v) => { cur.text += v; cur.pat += quoteAll(v); cur.keep = true; };
     for (const s of word) {
-      if (s.k === 'tilde') { text += this.env.HOME || this.user.home; pattern += quoteAll(this.env.HOME || this.user.home); continue; }
-      const v = s.k === 'var' ? this.getVar(s.name) : s.v;
-      text += v;
-      if (s.q || s.k === 'var') pattern += quoteAll(v);
-      else {
-        pattern += v;
-        if (/[*?[]/.test(v)) hasGlob = true;
+      if (s.k === 'tilde') { const h = this.env.HOME || this.user.home; cur.text += h; cur.pat += quoteAll(h); continue; }
+      if (s.k === 'lit') {
+        if (s.q) addQuoted(s.v);
+        else { cur.text += s.v; cur.pat += s.v; if (/[*?[]/.test(s.v)) cur.glob = true; }
+        continue;
       }
+      const v = s.k === 'var' ? this.getVar(s.name) : s.k === 'cmd' ? this.captureRun(s.src) : this.evalArith(s.src);
+      if (s.q || noSplit) { addQuoted(v); continue; }
+      if (v === '') continue;
+      // 未クォートの展開結果は空白で単語分割され、グロブの対象にもなる
+      const toks = v.split(/[ \t\n]+/).filter(Boolean);
+      if (!toks.length) { if (cur.text !== '' || cur.keep) endField(); continue; }
+      if (/^[ \t\n]/.test(v) && (cur.text !== '' || cur.keep)) endField();
+      toks.forEach((t, k) => { if (k > 0) endField(); cur.text += t; cur.pat += t; if (/[*?[]/.test(t)) cur.glob = true; });
+      if (/[ \t\n]$/.test(v)) endField();
     }
-    if (hasGlob) {
-      const matches = this.glob(pattern);
-      if (matches.length) return matches;
+    if (cur.text !== '' || cur.keep) fields.push(cur);
+    const out = [];
+    for (const f of fields) {
+      if (f.glob && !noGlob) { const m = this.glob(f.pat); if (m.length) { out.push(...m); continue; } }
+      out.push(f.text);
     }
-    return [text];
+    return out;
+  }
+
+  /** コマンド置換 $(...) / `...`: 同じ安全なパーサーでサブコマンドを実行し stdout を返す */
+  captureRun(src) {
+    if (this.subDepth >= 4) throw new ShellSyntaxError('コマンド置換の入れ子が深すぎます');
+    this.subDepth++;
+    const saved = this.lastCode;
+    try {
+      const chunks = this.run(src, { record: false });
+      for (const c of chunks) if (c.fd === 2) this.pendingErr.push(c);
+      return chunks.filter(c => c.fd === 1).map(c => c.text).join('').replace(/\n+$/, '');
+    } finally { this.subDepth--; this.lastCode = saved; }
+  }
+
+  /** 算術展開 $((...)): + - * / % ** と括弧・比較。変数は名前でも $名前 でも参照可。eval は使わない */
+  evalArith(src) {
+    const s = src.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*|[0-9?#])\}?/g, (m, n) => this.getVar(n) || '0');
+    let i = 0;
+    const ws = () => { while (s[i] === ' ' || s[i] === '\t') i++; };
+    const fail = (m) => { throw new ShellSyntaxError(m); };
+    const primary = () => {
+      ws();
+      if (s[i] === '(') { i++; const v = cmp(); ws(); if (s[i] !== ')') fail('arithmetic: ) が必要です'); i++; return v; }
+      if (s[i] === '-') { i++; return -primary(); }
+      if (s[i] === '+') { i++; return primary(); }
+      if (s[i] === '!') { i++; return primary() ? 0 : 1; }
+      const m = s.slice(i).match(/^(0[xX][0-9a-fA-F]+|\d+|[A-Za-z_][A-Za-z0-9_]*)/);
+      if (!m) fail(`arithmetic: 構文エラー: '${s.slice(i)}'`);
+      i += m[0].length;
+      if (/^[A-Za-z_]/.test(m[0])) return parseInt(this.getVar(m[0]) || '0', 10) || 0;
+      return Number(m[0]);
+    };
+    const pow = () => { let l = primary(); ws(); if (s.startsWith('**', i)) { i += 2; l = l ** pow(); } return l; };
+    const mul = () => {
+      let l = pow();
+      for (;;) {
+        ws(); const c = s[i];
+        if (c === '*' && s[i + 1] !== '*') { i++; l *= pow(); }
+        else if (c === '/') { i++; const r = pow(); if (r === 0) fail('division by 0'); l = Math.trunc(l / r); }
+        else if (c === '%') { i++; const r = pow(); if (r === 0) fail('division by 0'); l %= r; }
+        else return l;
+      }
+    };
+    const add = () => { let l = mul(); for (;;) { ws(); if (s[i] === '+') { i++; l += mul(); } else if (s[i] === '-') { i++; l -= mul(); } else return l; } };
+    const cmp = () => {
+      let l = add();
+      for (;;) {
+        ws(); const m = s.slice(i).match(/^(<=|>=|==|!=|<|>)/);
+        if (!m) return l;
+        i += m[0].length; const r = add();
+        l = (m[0] === '<=' ? l <= r : m[0] === '>=' ? l >= r : m[0] === '==' ? l === r : m[0] === '!=' ? l !== r : m[0] === '<' ? l < r : l > r) ? 1 : 0;
+      }
+    };
+    const v = cmp(); ws();
+    if (i < s.length) fail(`arithmetic: 構文エラー: '${s.slice(i)}'`);
+    return String(Math.trunc(v));
   }
 
   glob(pattern) {
@@ -719,7 +820,7 @@ class Shell {
   }
 
   /** 1行を実行して出力チャンク [{fd, text}] を返す */
-  run(line, { record = true } = {}) {
+  run(line, { record = true, noRoute = false } = {}) {
     const chunks = [];
     if (line.length > MAX_LINE) {
       chunks.push({ fd: 2, text: 'bash: 入力が長すぎます\n' });
@@ -728,6 +829,12 @@ class Shell {
     if (record && line.trim()) {
       this.history.push(line);
       if (this.history.length > 500) this.history.shift();
+    }
+    // if / for / while / until を含む行は、複合コマンド対応の実行器で処理する
+    if (!noRoute && COMPOUND_RE.test(line)) {
+      const ctx = { sh: this, tty: true, stdin: '', out: (t) => chunks.push({ fd: 1, text: t }), err: (t) => chunks.push({ fd: 2, text: t }) };
+      this.lastCode = this.runScript(line, [], ctx, 'bash', { interactive: true });
+      return chunks;
     }
     let list;
     try {
@@ -740,10 +847,12 @@ class Shell {
       }
       throw e;
     }
+    let loopSig = null;
     for (const item of list) {
       if (item.connector === '&&' && this.lastCode !== 0) continue;
       if (item.connector === '||' && this.lastCode === 0) continue;
-      this.lastCode = this.runPipeline(item.pipeline, chunks);
+      try { this.lastCode = this.runPipeline(item.pipeline, chunks); }
+      catch (e) { if (e instanceof LoopSignal) { loopSig = e; break; } throw e; }
       if (this.exitRequested) break;
     }
     // 出力サイズ上限
@@ -756,6 +865,7 @@ class Shell {
         break;
       }
     }
+    if (loopSig) chunks.loopSignal = loopSig;
     return chunks;
   }
 
@@ -779,11 +889,19 @@ class Shell {
     const ordered = []; // [{fd, text}]
     let argv = [];
     try {
-      for (const w of cmd.words) argv.push(...this.expandWord(w));
+      let assignPhase = true;
+      for (const w of cmd.words) {
+        const first = w[0];
+        const isAssign = assignPhase && first && first.k === 'lit' && !first.q && /^[A-Za-z_][A-Za-z0-9_]*=/.test(first.v);
+        if (!isAssign) assignPhase = false;
+        const inDbl = argv[0] === '[['; // [[ ]] の中は単語分割もグロブもしない
+        argv.push(...this.expandWord(w, { noSplit: isAssign || inDbl, noGlob: inDbl }));
+      }
     } catch (e) {
       errChunks.push({ fd: 2, text: `bash: ${e.message}\n` });
       return { out: '', code: 1 };
     }
+    if (this.pendingErr.length) { errChunks.push(...this.pendingErr); this.pendingErr = []; }
 
     // リダイレクト解決
     let outTarget = null, outAppend = false, errTarget = null, errAppend = false, errToOut = false;
@@ -887,6 +1005,7 @@ class Shell {
       const r = fn(argv.slice(1), ctx);
       return typeof r === 'number' ? r : 0;
     } catch (e) {
+      if (e instanceof LoopSignal) throw e;
       if (e instanceof FsError) { ctx.err(`${name}: ${e.path}: ${ERRMSG[e.code] || e.code}\n`); return 1; }
       if (e && e.name === 'OptError') { ctx.err(`${name}: ${e.message}\nTry 'man ${name}' for more information.\n`); return 2; }
       ctx.err(`${name}: 内部エラー: ${e.message}\n`);
@@ -913,32 +1032,129 @@ class Shell {
     return this.runScript(node.content, args, ctx, path);
   }
 
-  runScript(content, args, ctx, name = 'script') {
+  /**
+   * スクリプト/複合コマンドの実行器。
+   * 対応: if/elif/else/fi, for VAR in WORDS; do ... done, while/until, break/continue,
+   *       exit, 変数代入, $(...) / $((...)), test / [ ] / [[ ]]
+   * 非対応(明示エラー): case, 関数定義, { } グループ, here-doc, read/リダイレクト付きループ
+   */
+  runScript(content, args, ctx, name = 'script', { interactive = false } = {}) {
     if (this.depth >= MAX_DEPTH) { ctx.err(`bash: ${name}: 再帰が深すぎます\n`); return 1; }
-    const savedPos = this.positional;
-    const savedCwd = this.cwd;
-    this.positional = args;
-    this.depth++;
+    const savedPos = this.positional, savedCwd = this.cwd, savedExit = this.exitRequested;
+    this.positional = args; this.depth++; this.exitRequested = false;
     let code = 0;
     try {
-      for (const raw of content.split('\n')) {
-        const line = raw.trim();
-        if (!line || line.startsWith('#')) continue;
-        if (/^(if|then|else|elif|fi|for|while|do|done|case|esac|function)\b/.test(line)) {
-          ctx.err(`${name}: 制御構文 (${line.split(/\s/)[0]}) はこのシミュレーターでは未対応です。行をスキップします\n`);
-          continue;
-        }
-        if (/^exit\b/.test(line)) { code = parseInt(line.split(/\s+/)[1] || '0', 10) || 0; break; }
-        const chunks = this.run(line, { record: false });
-        for (const c of chunks) (c.fd === 2 ? ctx.err : ctx.out)(c.text);
+      const stmts = splitScript(content);
+      code = this.execStmts(stmts, 0, stmts.length, ctx, name, { steps: 0, loops: 0 });
+    } catch (e) {
+      if (e instanceof ScriptError || e instanceof ShellSyntaxError) { ctx.err(`${name}: ${e.message}\n`); code = 2; }
+      else if (e instanceof LoopSignal) { ctx.err(`${name}: ${e.kind}: ループの外では使えません\n`); code = 1; }
+      else throw e;
+    } finally {
+      this.positional = savedPos; this.depth--; this.exitRequested = savedExit;
+      if (!interactive) { this.cwd = savedCwd; this.env.PWD = savedCwd; } // スクリプトはサブシェルで動く
+    }
+    return code;
+  }
+
+  runStmt(text, ctx) {
+    const chunks = this.run(text, { record: false, noRoute: true });
+    for (const c of chunks) (c.fd === 2 ? ctx.err : ctx.out)(c.text);
+    if (chunks.loopSignal) throw chunks.loopSignal;
+    return this.lastCode;
+  }
+
+  execStmts(stmts, from, to, ctx, name, st) {
+    let code = this.lastCode;
+    let i = from;
+    while (i < to) {
+      if (this.exitRequested) break;
+      if (++st.steps > MAX_SCRIPT_STEPS) throw new ScriptError('実行ステップ数の上限を超えました（無限ループの可能性）');
+      const s = stmts[i];
+      const kw = s.split(/\s/, 1)[0];
+      if (kw === 'if') { const end = blockEnd(stmts, i, 'fi'); code = this.execIf(stmts, i, end, ctx, name, st); i = end + 1; continue; }
+      if (kw === 'for') { const end = blockEnd(stmts, i, 'done'); code = this.execFor(stmts, i, end, ctx, name, st); i = end + 1; continue; }
+      if (kw === 'while' || kw === 'until') { const end = blockEnd(stmts, i, 'done'); code = this.execWhile(stmts, i, end, ctx, name, st); i = end + 1; continue; }
+      if (kw === 'break' || kw === 'continue') throw new LoopSignal(kw);
+      if (['then', 'else', 'elif', 'fi', 'do', 'done'].includes(kw)) throw new ScriptError(`構文エラー: 予期しない '${kw}' の近く`);
+      if (['case', 'esac', 'function', '{', '}', 'select'].includes(kw)) throw new ScriptError(`'${kw}' はこのシミュレーターでは未対応です`);
+      if (/^[A-Za-z_][A-Za-z0-9_]*\(\)/.test(s)) throw new ScriptError('関数定義はこのシミュレーターでは未対応です');
+      code = this.runStmt(s, ctx);
+      i++;
+    }
+    return code;
+  }
+
+  execIf(stmts, i, end, ctx, name, st) {
+    // 分岐を収集: [{cond, from, to}]（else は cond=null）
+    const branches = [];
+    let j = i;
+    while (j < end) {
+      const kw = stmts[j].split(/\s/, 1)[0];
+      const cond = kw === 'else' ? null : stmts[j].slice(kw.length).trim();
+      if (kw !== 'else') { if (stmts[j + 1] !== 'then') throw new ScriptError("構文エラー: 'then' が必要です"); }
+      const bodyFrom = kw === 'else' ? j + 1 : j + 2;
+      let k = bodyFrom, depth = 0;
+      for (; k < end; k++) {
+        const w = stmts[k].split(/\s/, 1)[0];
+        if (w === 'if') depth++;
+        else if (w === 'fi') depth--;
+        else if (depth === 0 && (w === 'elif' || w === 'else')) break;
+      }
+      branches.push({ cond, from: bodyFrom, to: k });
+      j = k;
+    }
+    for (const b of branches) {
+      if (b.cond === null || this.runStmt(b.cond, ctx) === 0) return this.execStmts(stmts, b.from, b.to, ctx, name, st);
+    }
+    return 0;
+  }
+
+  loopBody(stmts, from, to, ctx, name, st) {
+    try { this.execStmts(stmts, from, to, ctx, name, st); }
+    catch (e) { if (e instanceof LoopSignal) return e.kind; throw e; }
+    return null;
+  }
+
+  execFor(stmts, i, end, ctx, name, st) {
+    const m = stmts[i].match(/^for\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+in(?:\s+(.*))?)?$/s);
+    if (!m) throw new ScriptError('構文エラー: for VAR in WORDS の形式が必要です');
+    if (stmts[i + 1] !== 'do') throw new ScriptError("構文エラー: 'do' が必要です");
+    const items = [];
+    if (m[2] === undefined && !/\sin\b/.test(stmts[i])) items.push(...this.positional);
+    else for (const t of tokenize(m[2] || '')) { if (t.word) items.push(...this.expandWord(t.word)); }
+    let code = 0;
+    this.loopDepth++;
+    try {
+      for (const item of items) {
+        if (++st.loops > MAX_SCRIPT_STEPS) throw new ScriptError('ループ回数の上限を超えました');
+        this.env[m[1]] = item;
+        const sig = this.loopBody(stmts, i + 2, end, ctx, name, st);
+        if (sig === 'break') break;
+        if (this.exitRequested) break;
         code = this.lastCode;
       }
-    } finally {
-      this.positional = savedPos;
-      this.cwd = savedCwd; // スクリプトはサブシェルで動く
-      this.env.PWD = savedCwd;
-      this.depth--;
-    }
+    } finally { this.loopDepth--; }
+    return code;
+  }
+
+  execWhile(stmts, i, end, ctx, name, st) {
+    const kw = stmts[i].split(/\s/, 1)[0];
+    const cond = stmts[i].slice(kw.length).trim();
+    if (stmts[i + 1] !== 'do') throw new ScriptError("構文エラー: 'do' が必要です");
+    let code = 0;
+    this.loopDepth++;
+    try {
+      for (;;) {
+        if (++st.loops > MAX_SCRIPT_STEPS) throw new ScriptError('ループ回数の上限を超えました（無限ループの可能性）');
+        const c = this.runStmt(cond, ctx);
+        if (kw === 'while' ? c !== 0 : c === 0) break;
+        const sig = this.loopBody(stmts, i + 2, end, ctx, name, st);
+        if (sig === 'break') break;
+        if (this.exitRequested) break;
+        code = this.lastCode;
+      }
+    } finally { this.loopDepth--; }
     return code;
   }
 
@@ -973,7 +1189,68 @@ class Shell {
 function quoteAll(s) { return s.replace(/[\s\S]/g, ch => (/[*?[\]]/.test(ch) ? '\u0000' + ch : ch)); }
 function fsMsg(e) { return e instanceof FsError ? (ERRMSG[e.code] || e.code) : String(e.message || e); }
 
-Object.assign(exports, { ShellSyntaxError, tokenize, parse, escapeRe, Shell, fsMsg });
+class ScriptError extends Error {}
+class LoopSignal extends Error { constructor(kind) { super(kind); this.kind = kind; } }
+
+// 対応する閉じキーワード(fi/done)の位置を探す
+function blockEnd(stmts, i, close) {
+  const opens = close === 'fi' ? ['if'] : ['for', 'while', 'until'];
+  let depth = 0;
+  for (let j = i; j < stmts.length; j++) {
+    const w = stmts[j].split(/\s/, 1)[0];
+    if (opens.includes(w)) depth++;
+    else if (w === close) { depth--; if (depth === 0) return j; }
+  }
+  throw new ScriptError(`構文エラー: 対応する '${close}' がありません`);
+}
+
+/**
+ * スクリプト本文を「文」の配列に分割する。
+ * 改行と ; で分割（クォート・$( )・バッククォート内は除く）、# コメントを除去し、
+ * then / do / else / fi / done は単独の文として切り出す。
+ */
+function splitScript(text) {
+  const stmts = [];
+  let buf = '', i = 0, inS = false, inD = false, paren = 0, btick = false;
+  const pushStmt = (t) => {
+    t = t.trim();
+    while (t) {
+      let m = t.match(/^(then|do|else)(?:\s+([\s\S]*))?$/);
+      if (!m) m = t.match(/^(fi|done)(?:\s+([\s\S]*))?$/);
+      if (!m) break;
+      stmts.push(m[1]); t = (m[2] || '').trim();
+    }
+    if (t) stmts.push(t);
+  };
+  const boundary = () => { pushStmt(buf); buf = ''; };
+  while (i < text.length) {
+    const c = text[i], prev = text[i - 1];
+    if (inS) { buf += c; if (c === "'") inS = false; i++; continue; }
+    if (c === '\\') {
+      if (text[i + 1] === '\n') { i += 2; continue; }
+      buf += c + (text[i + 1] ?? ''); i += 2; continue;
+    }
+    if (inD) { buf += c; if (c === '"') inD = false; i++; continue; }
+    if (c === "'") { inS = true; buf += c; i++; continue; }
+    if (c === '"') { inD = true; buf += c; i++; continue; }
+    if (c === '`') { btick = !btick; buf += c; i++; continue; }
+    if (c === '(' && prev === '$') paren++;
+    else if (c === '(' && paren > 0) paren++;
+    else if (c === ')' && paren > 0) paren--;
+    const top = paren === 0 && !btick;
+    if (c === '#' && top && (i === 0 || /[\s;]/.test(prev))) { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (top && c === ';') { boundary(); i++; continue; }
+    if (top && c === '\n') {
+      if (/(&&|\|\||\|)\s*$/.test(buf)) { buf += ' '; i++; continue; } // 行末の && || | は継続
+      boundary(); i++; continue;
+    }
+    buf += c; i++;
+  }
+  boundary();
+  return stmts;
+}
+
+Object.assign(exports, { ShellSyntaxError, tokenize, parse, escapeRe, Shell, fsMsg, LoopSignal, splitScript });
 
 };
 __mods["js/manpages.js"] = function (module, exports, __require) {
@@ -1013,6 +1290,133 @@ const MANPAGES = {
 };
 
 Object.assign(exports, { MANPAGES });
+
+};
+__mods["js/hash.js"] = function (module, exports, __require) {
+// ============================================================
+// 純JSのハッシュ実装（MD5 / SHA-1 / SHA-256）。外部依存なし。
+// 教材として実機と同じ値を返すために実装（暗号用途ではなく学習用）。
+// 入力は JS 文字列を UTF-8 バイト列として扱う。
+// ============================================================
+
+function utf8Bytes(str) {
+  const out = [];
+  for (const ch of str) {
+    const c = ch.codePointAt(0);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return out;
+}
+const hex = (words, le) => words.map(w => {
+  let s = '';
+  for (let i = 0; i < 4; i++) { const b = le ? (w >>> (8 * i)) & 255 : (w >>> (24 - 8 * i)) & 255; s += b.toString(16).padStart(2, '0'); }
+  return s;
+}).join('');
+const rotl = (x, n) => (x << n) | (x >>> (32 - n));
+const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+
+// パディング: 0x80, 0x00..., 長さ(ビット) を 8 バイトで末尾に（be: ビッグエンディアン）
+function pad(bytes, be) {
+  const b = bytes.slice();
+  const bitLen = bytes.length * 8;
+  b.push(0x80);
+  while (b.length % 64 !== 56) b.push(0);
+  const hi = Math.floor(bitLen / 0x100000000), lo = bitLen >>> 0;
+  const lenBytes = be
+    ? [hi >>> 24, hi >>> 16, hi >>> 8, hi, lo >>> 24, lo >>> 16, lo >>> 8, lo]
+    : [lo, lo >>> 8, lo >>> 16, lo >>> 24, hi, hi >>> 8, hi >>> 16, hi >>> 24];
+  for (const x of lenBytes) b.push(x & 255);
+  return b;
+}
+
+// ---------- MD5 ----------
+const MD5_S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+const MD5_K = Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0);
+function md5(str) {
+  const b = pad(utf8Bytes(str), false);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  for (let off = 0; off < b.length; off += 64) {
+    const M = [];
+    for (let i = 0; i < 16; i++) M.push((b[off + i * 4]) | (b[off + i * 4 + 1] << 8) | (b[off + i * 4 + 2] << 16) | (b[off + i * 4 + 3] << 24));
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+      else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+      F = (F + A + MD5_K[i] + M[g]) >>> 0;
+      A = D; D = C; C = B;
+      B = (B + rotl(F, MD5_S[i])) >>> 0;
+    }
+    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+  }
+  return hex([a0, b0, c0, d0], true);
+}
+
+// ---------- SHA-1 ----------
+function sha1(str) {
+  const b = pad(utf8Bytes(str), true);
+  let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+  for (let off = 0; off < b.length; off += 64) {
+    const w = [];
+    for (let i = 0; i < 16; i++) w.push(((b[off + i * 4] << 24) | (b[off + i * 4 + 1] << 16) | (b[off + i * 4 + 2] << 8) | b[off + i * 4 + 3]) >>> 0);
+    for (let i = 16; i < 80; i++) w.push(rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1) >>> 0);
+    let a = h0, bb = h1, c = h2, d = h3, e = h4;
+    for (let i = 0; i < 80; i++) {
+      let f, k;
+      if (i < 20) { f = (bb & c) | (~bb & d); k = 0x5a827999; }
+      else if (i < 40) { f = bb ^ c ^ d; k = 0x6ed9eba1; }
+      else if (i < 60) { f = (bb & c) | (bb & d) | (c & d); k = 0x8f1bbcdc; }
+      else { f = bb ^ c ^ d; k = 0xca62c1d6; }
+      const t = (rotl(a, 5) + f + e + k + w[i]) >>> 0;
+      e = d; d = c; c = rotl(bb, 30) >>> 0; bb = a; a = t;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + bb) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+  }
+  return hex([h0, h1, h2, h3, h4], false);
+}
+
+// ---------- SHA-256 ----------
+const SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+function sha256(str) {
+  const b = pad(utf8Bytes(str), true);
+  const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  for (let off = 0; off < b.length; off += 64) {
+    const w = [];
+    for (let i = 0; i < 16; i++) w.push(((b[off + i * 4] << 24) | (b[off + i * 4 + 1] << 16) | (b[off + i * 4 + 2] << 8) | b[off + i * 4 + 3]) >>> 0);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w.push((w[i - 16] + s0 + w[i - 7] + s1) >>> 0);
+    }
+    let [a, bb, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & bb) ^ (a & c) ^ (bb & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = bb; bb = a; a = (t1 + t2) >>> 0;
+    }
+    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + bb) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+  }
+  return hex(H, false);
+}
+
+const HASHERS = { md5, sha1, sha256 };
+
+Object.assign(exports, { md5, sha1, sha256, HASHERS });
 
 };
 __mods["js/awk.js"] = function (module, exports, __require) {
@@ -1485,45 +1889,45 @@ class Interp {
   }
   lval(node) {
     if (node.k === 'var') return { get: () => this.vars[node.name], set: (v) => this.setVar(node.name, v) };
-    if (node.k === 'field') { const i = this.eval(node.e); return { get: () => this.getField(i), set: (v) => this.setField(i, v) }; }
-    const key = toStr(this.eval(node.e)); const a = this.arr(node.name);
+    if (node.k === 'field') { const i = this.ev(node.e); return { get: () => this.getField(i), set: (v) => this.setField(i, v) }; }
+    const key = toStr(this.ev(node.e)); const a = this.arr(node.name);
     return { get: () => a.get(key), set: (v) => a.set(key, v) };
   }
-  eval(n) {
+  ev(n) {
     this.tick();
     switch (n.k) {
       case 'num': return n.v;
       case 'str': return n.v;
       case 'regex': return this.regex(n.v).test(this.record) ? 1 : 0;
-      case 'group': return this.eval(n.e);
+      case 'group': return this.ev(n.e);
       case 'var': return this.vars[n.name];
-      case 'field': return this.getField(this.eval(n.e));
-      case 'index': { const a = this.arr(n.name), key = toStr(this.eval(n.e)); if (!a.has(key)) a.set(key, undefined); return a.get(key); }
+      case 'field': return this.getField(this.ev(n.e));
+      case 'index': { const a = this.arr(n.name), key = toStr(this.ev(n.e)); if (!a.has(key)) a.set(key, undefined); return a.get(key); }
       case 'assign': {
         const lv = this.lval(n.l);
         let v;
-        if (n.op === '=') v = this.eval(n.r);
-        else { const x = toNum(lv.get()), y = toNum(this.eval(n.r)); v = n.op === '+=' ? x + y : n.op === '-=' ? x - y : n.op === '*=' ? x * y : n.op === '/=' ? this.div(x, y) : n.op === '%=' ? this.mod(x, y) : x ** y; }
+        if (n.op === '=') v = this.ev(n.r);
+        else { const x = toNum(lv.get()), y = toNum(this.ev(n.r)); v = n.op === '+=' ? x + y : n.op === '-=' ? x - y : n.op === '*=' ? x * y : n.op === '/=' ? this.div(x, y) : n.op === '%=' ? this.mod(x, y) : x ** y; }
         lv.set(v); return v;
       }
-      case 'cond': return toBool(this.eval(n.c)) ? this.eval(n.a) : this.eval(n.b);
-      case 'or': return toBool(this.eval(n.l)) || toBool(this.eval(n.r)) ? 1 : 0;
-      case 'and': return toBool(this.eval(n.l)) && toBool(this.eval(n.r)) ? 1 : 0;
-      case 'not': return toBool(this.eval(n.e)) ? 0 : 1;
-      case 'neg': return -toNum(this.eval(n.e));
-      case 'pos': return toNum(this.eval(n.e));
+      case 'cond': return toBool(this.ev(n.c)) ? this.ev(n.a) : this.ev(n.b);
+      case 'or': return toBool(this.ev(n.l)) || toBool(this.ev(n.r)) ? 1 : 0;
+      case 'and': return toBool(this.ev(n.l)) && toBool(this.ev(n.r)) ? 1 : 0;
+      case 'not': return toBool(this.ev(n.e)) ? 0 : 1;
+      case 'neg': return -toNum(this.ev(n.e));
+      case 'pos': return toNum(this.ev(n.e));
       case 'bin': {
-        const x = toNum(this.eval(n.l)), y = toNum(this.eval(n.r));
+        const x = toNum(this.ev(n.l)), y = toNum(this.ev(n.r));
         switch (n.op) { case '+': return x + y; case '-': return x - y; case '*': return x * y; case '/': return this.div(x, y); case '%': return this.mod(x, y); default: return x ** y; }
       }
-      case 'rel': return this.compare(n.op, this.eval(n.l), this.eval(n.r), this.isStrNode(n.l) || this.isStrNode(n.r)) ? 1 : 0;
+      case 'rel': return this.compare(n.op, this.ev(n.l), this.ev(n.r), this.isStrNode(n.l) || this.isStrNode(n.r)) ? 1 : 0;
       case 'match': {
-        const s = toStr(this.eval(n.l));
-        const re = n.r.k === 'regex' ? this.regex(n.r.v) : this.regex(toStr(this.eval(n.r)));
+        const s = toStr(this.ev(n.l));
+        const re = n.r.k === 'regex' ? this.regex(n.r.v) : this.regex(toStr(this.ev(n.r)));
         return re.test(s) !== n.neg ? 1 : 0;
       }
-      case 'concat': return toStr(this.eval(n.l)) + toStr(this.eval(n.r));
-      case 'in': return this.arr(n.arr).has(toStr(this.eval(n.key))) ? 1 : 0;
+      case 'concat': return toStr(this.ev(n.l)) + toStr(this.ev(n.r));
+      case 'in': return this.arr(n.arr).has(toStr(this.ev(n.key))) ? 1 : 0;
       case 'incdec': {
         const lv = this.lval(n.t); const old = toNum(lv.get()); const nv = n.op === '++' ? old + 1 : old - 1;
         lv.set(nv); return n.pre ? nv : old;
@@ -1537,7 +1941,7 @@ class Interp {
 
   call(n) {
     const a = n.args;
-    const sarg = (i) => toStr(this.eval(a[i]));
+    const sarg = (i) => toStr(this.ev(a[i]));
     const need = (min, max = min) => { if (a.length < min || a.length > max) throw new AwkError(`${n.name}: 引数の数が不正です`); };
     switch (n.name) {
       case 'length': {
@@ -1546,24 +1950,24 @@ class Interp {
         return sarg(0).length;
       }
       case 'substr': {
-        need(2, 3); const s = sarg(0); const m = Math.round(toNum(this.eval(a[1])));
-        const len = a.length === 3 ? Math.round(toNum(this.eval(a[2]))) : Infinity;
+        need(2, 3); const s = sarg(0); const m = Math.round(toNum(this.ev(a[1])));
+        const len = a.length === 3 ? Math.round(toNum(this.ev(a[2]))) : Infinity;
         const start = Math.max(1, m); const end = Math.min(s.length + 1, m + len);
         return end <= start ? '' : s.slice(start - 1, end - 1);
       }
       case 'index': need(2); return sarg(0).indexOf(sarg(1)) + 1;
       case 'tolower': need(1); return sarg(0).toLowerCase();
       case 'toupper': need(1); return sarg(0).toUpperCase();
-      case 'sprintf': { if (!a.length) throw new AwkError('sprintf: フォーマットがありません'); return sprintf(sarg(0), a.slice(1).map(x => this.eval(x))); }
-      case 'int': need(1); return Math.trunc(toNum(this.eval(a[0])));
-      case 'sqrt': need(1); return Math.sqrt(toNum(this.eval(a[0])));
-      case 'exp': need(1); return Math.exp(toNum(this.eval(a[0])));
-      case 'log': need(1); return Math.log(toNum(this.eval(a[0])));
-      case 'sin': need(1); return Math.sin(toNum(this.eval(a[0])));
-      case 'cos': need(1); return Math.cos(toNum(this.eval(a[0])));
-      case 'atan2': need(2); return Math.atan2(toNum(this.eval(a[0])), toNum(this.eval(a[1])));
+      case 'sprintf': { if (!a.length) throw new AwkError('sprintf: フォーマットがありません'); return sprintf(sarg(0), a.slice(1).map(x => this.ev(x))); }
+      case 'int': need(1); return Math.trunc(toNum(this.ev(a[0])));
+      case 'sqrt': need(1); return Math.sqrt(toNum(this.ev(a[0])));
+      case 'exp': need(1); return Math.exp(toNum(this.ev(a[0])));
+      case 'log': need(1); return Math.log(toNum(this.ev(a[0])));
+      case 'sin': need(1); return Math.sin(toNum(this.ev(a[0])));
+      case 'cos': need(1); return Math.cos(toNum(this.ev(a[0])));
+      case 'atan2': need(2); return Math.atan2(toNum(this.ev(a[0])), toNum(this.ev(a[1])));
       case 'rand': this.seed = (this.seed * 1103515245 + 12345) & 0x7fffffff; return this.seed / 0x80000000;
-      case 'srand': { const old = this.seed; this.seed = a.length ? Math.trunc(toNum(this.eval(a[0]))) : 0; return old; }
+      case 'srand': { const old = this.seed; this.seed = a.length ? Math.trunc(toNum(this.ev(a[0]))) : 0; return old; }
       case 'split': {
         need(2, 3);
         if (a[1].k !== 'var') throw new AwkError('split の第2引数は配列名です');
@@ -1605,22 +2009,22 @@ class Interp {
     this.tick();
     switch (st.k) {
       case 'block': for (const s of st.body) this.exec(s); return;
-      case 'expr': this.eval(st.e); return;
+      case 'expr': this.ev(st.e); return;
       case 'print': {
-        const vals = st.args.length ? st.args.map(e => toStr(this.eval(e))) : [this.record];
+        const vals = st.args.length ? st.args.map(e => toStr(this.ev(e))) : [this.record];
         this.emit(vals.join(toStr(this.vars.OFS)) + toStr(this.vars.ORS)); return;
       }
       case 'printf': {
         if (!st.args.length) throw new AwkError('printf: フォーマットがありません');
-        const vals = st.args.map(e => this.eval(e));
+        const vals = st.args.map(e => this.ev(e));
         this.emit(sprintf(toStr(vals[0]), vals.slice(1))); return;
       }
-      case 'if': if (toBool(this.eval(st.c))) this.exec(st.then); else if (st.els) this.exec(st.els); return;
-      case 'while': this.loop(() => toBool(this.eval(st.c)), st.body); return;
-      case 'do': { let first = true; this.loop(() => { if (first) { first = false; return true; } return toBool(this.eval(st.c)); }, st.body); return; }
+      case 'if': if (toBool(this.ev(st.c))) this.exec(st.then); else if (st.els) this.exec(st.els); return;
+      case 'while': this.loop(() => toBool(this.ev(st.c)), st.body); return;
+      case 'do': { let first = true; this.loop(() => { if (first) { first = false; return true; } return toBool(this.ev(st.c)); }, st.body); return; }
       case 'for': {
         if (st.init) this.exec(st.init);
-        this.loop(() => (st.c ? toBool(this.eval(st.c)) : true), st.body, st.inc ? () => this.exec(st.inc) : null); return;
+        this.loop(() => (st.c ? toBool(this.ev(st.c)) : true), st.body, st.inc ? () => this.exec(st.inc) : null); return;
       }
       case 'forin': {
         for (const key of [...this.arr(st.arr).keys()]) {
@@ -1629,11 +2033,11 @@ class Interp {
         }
         return;
       }
-      case 'delete': if (st.e) this.arr(st.name).delete(toStr(this.eval(st.e))); else this.arr(st.name).clear(); return;
+      case 'delete': if (st.e) this.arr(st.name).delete(toStr(this.ev(st.e))); else this.arr(st.name).clear(); return;
       case 'break': throw new BreakSignal();
       case 'continue': throw new ContinueSignal();
       case 'next': throw new NextSignal();
-      case 'exit': throw new ExitSignal(st.e ? Math.trunc(toNum(this.eval(st.e))) : 0);
+      case 'exit': throw new ExitSignal(st.e ? Math.trunc(toNum(this.ev(st.e))) : 0);
       default: throw new AwkError(`内部エラー: 未知の文 ${st.k}`);
     }
   }
@@ -1649,10 +2053,10 @@ class Interp {
     for (const it of mains) {
       if (it.pat2) {
         let active = this.range.get(it);
-        if (!active) { if (!toBool(this.eval(it.pat))) continue; active = true; }
-        if (toBool(this.eval(it.pat2))) active = false;
+        if (!active) { if (!toBool(this.ev(it.pat))) continue; active = true; }
+        if (toBool(this.ev(it.pat2))) active = false;
         this.range.set(it, active);
-      } else if (it.pat && !toBool(this.eval(it.pat))) continue;
+      } else if (it.pat && !toBool(this.ev(it.pat))) continue;
       if (it.action) this.exec(it.action); else this.emit(this.record + toStr(this.vars.ORS));
     }
   }
@@ -1873,8 +2277,9 @@ __mods["js/commands.js"] = function (module, exports, __require) {
 // ctx: { sh, stdin, out(text), err(text) }
 // ============================================================
 const { FsError, ERRMSG, modeString, lsDate, isoDate, nodeSize } = __require("js/vfs.js");
-const { escapeRe } = __require("js/shell.js");
+const { escapeRe, LoopSignal } = __require("js/shell.js");
 const { MANPAGES } = __require("js/manpages.js");
+const { HASHERS } = __require("js/hash.js");
 const { runAwk, AwkError } = __require("js/awk.js");
 const { parseSed, runSedLines, SedError } = __require("js/sed.js");
 
@@ -2914,14 +3319,41 @@ function makeCommands(getCmds) {
   C.sha256sum = (args, ctx) => hashCmd(args, ctx, 'sha256');
   C.sha1sum = (args, ctx) => hashCmd(args, ctx, 'sha1');
   function hashCmd(args, ctx, algo) {
+    const name = algo + 'sum';
+    const { opts, operands } = parseOpts(args, { c: 'bool', b: 'bool', t: 'bool', q: 'bool', w: 'bool', s: 'bool', '--check': 'bool', '--quiet': 'bool', '--status': 'bool', '--warn': 'bool' });
+    const hashFn = HASHERS[algo];
+    // -c: 「ハッシュ  ファイル名」の一覧と照合（改ざん検知）
+    const quiet = opts.q || opts['--quiet'], status = opts.s || opts['--status'];
+    if (opts.c || opts['--check']) {
+      const lists = operands.length ? operands : ['-'];
+      let failed = 0, missing = 0, total = 0, code = 0;
+      for (const lf of lists) {
+        const text = lf === '-' ? ctx.stdin : safeRead(ctx, lf, name);
+        if (text == null) { code = 1; continue; }
+        for (const raw of text.split('\n')) {
+          const line = raw.trim(); if (!line) continue;
+          const m = line.match(/^([0-9a-fA-F]+)\s+\*?(.+)$/);
+          if (!m) { if (!opts.w) continue; ctx.err(`${name}: ${lf}: 書式が不正な行があります\n`); continue; }
+          total++;
+          let data;
+          try { data = ctx.sh.vfs.readFile(m[2], ctx.sh.cwd, ctx.sh.user); }
+          catch (e) { missing++; ctx.out(`${m[2]}: FAILED open or read\n`); continue; }
+          const okHash = hashFn(data).toLowerCase() === m[1].toLowerCase();
+          if (!okHash) failed++;
+          if (!(quiet && okHash) && !status) ctx.out(`${m[2]}: ${okHash ? 'OK' : 'FAILED'}\n`);
+        }
+      }
+      if (failed) ctx.err(`${name}: WARNING: ${failed} computed checksum${failed > 1 ? 's' : ''} did NOT match\n`);
+      if (missing) ctx.err(`${name}: WARNING: ${missing} listed file${missing > 1 ? 's' : ''} could not be read\n`);
+      return (failed || missing || code) ? 1 : 0;
+    }
     let code = 0;
-    const srcs = args.filter(a => !a.startsWith('-'));
-    const list = srcs.length ? srcs : ['-'];
+    const list = operands.length ? operands : ['-'];
     for (const p of list) {
       let data;
       if (p === '-') data = ctx.stdin;
-      else { data = safeRead(ctx, p, algo + 'sum'); if (data == null) { code = 1; continue; } }
-      ctx.out(`${simpleHash(data, algo)}  ${p}\n`);
+      else { data = safeRead(ctx, p, name); if (data == null) { code = 1; continue; } }
+      ctx.out(`${hashFn(data)}  ${p}\n`);
     }
     return code;
   }
@@ -3019,6 +3451,75 @@ function makeCommands(getCmds) {
     try { const node = lookup(ctx, p); if (caps === '-r' || !caps) delete node.caps; else node.caps = caps; } catch (e) { ctx.err(`setcap: ${fsMsg(e)}\n`); return 1; }
     return 0;
   };
+
+  // ---------- test / [ ] / [[ ]] ----------
+  function evalTest(args, ctx, dbl) {
+    let pos = 0;
+    const sh = ctx.sh, vfs = sh.vfs;
+    const node = (p) => { try { return vfs.lookup(p, sh.cwd, null, { allowMissing: true }); } catch { return null; } };
+    const UNARY = new Set(['-e', '-f', '-d', '-r', '-w', '-x', '-s', '-z', '-n', '-L', '-h']);
+    const BIN = new Set(['=', '==', '!=', '-eq', '-ne', '-lt', '-le', '-gt', '-ge', '=~', '<', '>']);
+    const num = (x) => { if (!/^-?\d+$/.test(String(x).trim())) throw new Error(`${x}: integer expression expected`); return parseInt(x, 10); };
+    const unary = (op, a) => {
+      if (op === '-z') return a === '';
+      if (op === '-n') return a !== '';
+      const n = node(a);
+      if (!n) return false;
+      switch (op) {
+        case '-e': return true;
+        case '-f': return n.type === 'f';
+        case '-d': return n.type === 'd';
+        case '-s': return n.type === 'd' || (n.content || '').length > 0;
+        case '-r': return vfs.can(n, sh.user, 4);
+        case '-w': return vfs.can(n, sh.user, 2);
+        case '-x': return vfs.can(n, sh.user, 1);
+        default: return false; // -L/-h: シンボリックリンクは未対応
+      }
+    };
+    const binary = (l, op, r) => {
+      switch (op) {
+        case '=': case '==': return dbl ? globMatchStr(r, l) : l === r;
+        case '!=': return dbl ? !globMatchStr(r, l) : l !== r;
+        case '-eq': return num(l) === num(r);
+        case '-ne': return num(l) !== num(r);
+        case '-lt': return num(l) < num(r);
+        case '-le': return num(l) <= num(r);
+        case '-gt': return num(l) > num(r);
+        case '-ge': return num(l) >= num(r);
+        case '=~': try { return new RegExp(posixToJs(r, true)).test(l); } catch { throw new Error(`無効な正規表現: ${r}`); }
+        case '<': return l < r;
+        default: return l > r;
+      }
+    };
+    const parseOr = () => { let l = parseAnd(); while (args[pos] === '-o' || args[pos] === '||') { pos++; const r = parseAnd(); l = l || r; } return l; };
+    const parseAnd = () => { let l = parseNot(); while (args[pos] === '-a' || args[pos] === '&&') { pos++; const r = parseNot(); l = l && r; } return l; };
+    const parseNot = () => { if (args[pos] === '!') { pos++; return !parseNot(); } return primary(); };
+    const primary = () => {
+      if (args[pos] === '(') { pos++; const v = parseOr(); if (args[pos] !== ')') throw new Error("missing ')'"); pos++; return v; }
+      const rem = args.length - pos;
+      if (rem >= 3 && BIN.has(args[pos + 1])) { const l = args[pos], op = args[pos + 1], r = args[pos + 2]; pos += 3; return binary(l, op, r); }
+      if (rem >= 2 && UNARY.has(args[pos])) { const op = args[pos], a = args[pos + 1]; pos += 2; return unary(op, a); }
+      if (rem >= 1) return args[pos++] !== '';
+      throw new Error('argument expected');
+    };
+    if (!args.length) return false;
+    const v = parseOr();
+    if (pos < args.length) throw new Error(`too many arguments`);
+    return v;
+  }
+  function globMatchStr(pat, str) { return globRe(pat).test(str); }
+  C.test = (args, ctx) => { try { return evalTest(args, ctx, false) ? 0 : 1; } catch (e) { ctx.err(`test: ${e.message}\n`); return 2; } };
+  C['['] = (args, ctx) => {
+    if (args[args.length - 1] !== ']') { ctx.err("[: missing `]'\n"); return 2; }
+    try { return evalTest(args.slice(0, -1), ctx, false) ? 0 : 1; } catch (e) { ctx.err(`[: ${e.message}\n`); return 2; }
+  };
+  C['[['] = (args, ctx) => {
+    if (args[args.length - 1] !== ']]') { ctx.err("[[: missing `]]'\n"); return 2; }
+    try { return evalTest(args.slice(0, -1), ctx, true) ? 0 : 1; } catch (e) { ctx.err(`[[: ${e.message}\n`); return 2; }
+  };
+  C[':'] = () => 0;
+  C['break'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("break: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('break'); };
+  C['continue'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("continue: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('continue'); };
 
   C.bash = (args, ctx) => {
     // bash script.sh [args...] / bash -c 'command'。同じ安全なパーサーで解釈する（実シェルは使わない）
@@ -3239,22 +3740,6 @@ function computeMode(cur, spec) {
   return mode;
 }
 
-// 教育用の軽量ハッシュ（暗号用途ではない。固定の16進表現を得るため）
-function simpleHash(str, algo) {
-  const len = algo === 'md5' ? 32 : algo === 'sha1' ? 40 : 64;
-  let h = new Array(len / 2).fill(0);
-  let acc = algo === 'md5' ? 0x67 : algo === 'sha1' ? 0x1a : 0x6a;
-  for (let i = 0; i < str.length; i++) {
-    const c = str.charCodeAt(i);
-    for (let j = 0; j < h.length; j++) {
-      acc = (acc * 31 + c + j * 7 + i) & 0xff;
-      h[j] = (h[j] + acc + ((c << (j % 5)) & 0xff)) & 0xff;
-    }
-  }
-  // 追加撹拌
-  for (let round = 0; round < 3; round++) for (let j = 0; j < h.length; j++) h[j] = (h[j] * 131 + h[(j + 1) % h.length] + round) & 0xff;
-  return h.map(b => b.toString(16).padStart(2, '0')).join('');
-}
 function b64encode(str) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   const bytes = []; for (const ch of str) { const c = ch.codePointAt(0); if (c < 0x80) bytes.push(c); else if (c < 0x800) { bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f)); } else { bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); } }
@@ -3282,7 +3767,7 @@ function b64decode(str) {
 }
 
 
-Object.assign(exports, { makeCommands, posixToJs, OptError, simpleHash, b64encode });
+Object.assign(exports, { makeCommands, posixToJs, OptError, b64encode });
 
 };
 __mods["js/netcommands.js"] = function (module, exports, __require) {

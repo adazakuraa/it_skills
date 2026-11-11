@@ -4,8 +4,9 @@
 // ctx: { sh, stdin, out(text), err(text) }
 // ============================================================
 import { FsError, ERRMSG, modeString, lsDate, isoDate, nodeSize } from './vfs.js';
-import { escapeRe } from './shell.js';
+import { escapeRe, LoopSignal } from './shell.js';
 import { MANPAGES } from './manpages.js';
+import { HASHERS } from './hash.js';
 import { runAwk, AwkError } from './awk.js';
 import { parseSed, runSedLines, SedError } from './sed.js';
 
@@ -1045,14 +1046,41 @@ export function makeCommands(getCmds) {
   C.sha256sum = (args, ctx) => hashCmd(args, ctx, 'sha256');
   C.sha1sum = (args, ctx) => hashCmd(args, ctx, 'sha1');
   function hashCmd(args, ctx, algo) {
+    const name = algo + 'sum';
+    const { opts, operands } = parseOpts(args, { c: 'bool', b: 'bool', t: 'bool', q: 'bool', w: 'bool', s: 'bool', '--check': 'bool', '--quiet': 'bool', '--status': 'bool', '--warn': 'bool' });
+    const hashFn = HASHERS[algo];
+    // -c: 「ハッシュ  ファイル名」の一覧と照合（改ざん検知）
+    const quiet = opts.q || opts['--quiet'], status = opts.s || opts['--status'];
+    if (opts.c || opts['--check']) {
+      const lists = operands.length ? operands : ['-'];
+      let failed = 0, missing = 0, total = 0, code = 0;
+      for (const lf of lists) {
+        const text = lf === '-' ? ctx.stdin : safeRead(ctx, lf, name);
+        if (text == null) { code = 1; continue; }
+        for (const raw of text.split('\n')) {
+          const line = raw.trim(); if (!line) continue;
+          const m = line.match(/^([0-9a-fA-F]+)\s+\*?(.+)$/);
+          if (!m) { if (!opts.w) continue; ctx.err(`${name}: ${lf}: 書式が不正な行があります\n`); continue; }
+          total++;
+          let data;
+          try { data = ctx.sh.vfs.readFile(m[2], ctx.sh.cwd, ctx.sh.user); }
+          catch (e) { missing++; ctx.out(`${m[2]}: FAILED open or read\n`); continue; }
+          const okHash = hashFn(data).toLowerCase() === m[1].toLowerCase();
+          if (!okHash) failed++;
+          if (!(quiet && okHash) && !status) ctx.out(`${m[2]}: ${okHash ? 'OK' : 'FAILED'}\n`);
+        }
+      }
+      if (failed) ctx.err(`${name}: WARNING: ${failed} computed checksum${failed > 1 ? 's' : ''} did NOT match\n`);
+      if (missing) ctx.err(`${name}: WARNING: ${missing} listed file${missing > 1 ? 's' : ''} could not be read\n`);
+      return (failed || missing || code) ? 1 : 0;
+    }
     let code = 0;
-    const srcs = args.filter(a => !a.startsWith('-'));
-    const list = srcs.length ? srcs : ['-'];
+    const list = operands.length ? operands : ['-'];
     for (const p of list) {
       let data;
       if (p === '-') data = ctx.stdin;
-      else { data = safeRead(ctx, p, algo + 'sum'); if (data == null) { code = 1; continue; } }
-      ctx.out(`${simpleHash(data, algo)}  ${p}\n`);
+      else { data = safeRead(ctx, p, name); if (data == null) { code = 1; continue; } }
+      ctx.out(`${hashFn(data)}  ${p}\n`);
     }
     return code;
   }
@@ -1150,6 +1178,75 @@ export function makeCommands(getCmds) {
     try { const node = lookup(ctx, p); if (caps === '-r' || !caps) delete node.caps; else node.caps = caps; } catch (e) { ctx.err(`setcap: ${fsMsg(e)}\n`); return 1; }
     return 0;
   };
+
+  // ---------- test / [ ] / [[ ]] ----------
+  function evalTest(args, ctx, dbl) {
+    let pos = 0;
+    const sh = ctx.sh, vfs = sh.vfs;
+    const node = (p) => { try { return vfs.lookup(p, sh.cwd, null, { allowMissing: true }); } catch { return null; } };
+    const UNARY = new Set(['-e', '-f', '-d', '-r', '-w', '-x', '-s', '-z', '-n', '-L', '-h']);
+    const BIN = new Set(['=', '==', '!=', '-eq', '-ne', '-lt', '-le', '-gt', '-ge', '=~', '<', '>']);
+    const num = (x) => { if (!/^-?\d+$/.test(String(x).trim())) throw new Error(`${x}: integer expression expected`); return parseInt(x, 10); };
+    const unary = (op, a) => {
+      if (op === '-z') return a === '';
+      if (op === '-n') return a !== '';
+      const n = node(a);
+      if (!n) return false;
+      switch (op) {
+        case '-e': return true;
+        case '-f': return n.type === 'f';
+        case '-d': return n.type === 'd';
+        case '-s': return n.type === 'd' || (n.content || '').length > 0;
+        case '-r': return vfs.can(n, sh.user, 4);
+        case '-w': return vfs.can(n, sh.user, 2);
+        case '-x': return vfs.can(n, sh.user, 1);
+        default: return false; // -L/-h: シンボリックリンクは未対応
+      }
+    };
+    const binary = (l, op, r) => {
+      switch (op) {
+        case '=': case '==': return dbl ? globMatchStr(r, l) : l === r;
+        case '!=': return dbl ? !globMatchStr(r, l) : l !== r;
+        case '-eq': return num(l) === num(r);
+        case '-ne': return num(l) !== num(r);
+        case '-lt': return num(l) < num(r);
+        case '-le': return num(l) <= num(r);
+        case '-gt': return num(l) > num(r);
+        case '-ge': return num(l) >= num(r);
+        case '=~': try { return new RegExp(posixToJs(r, true)).test(l); } catch { throw new Error(`無効な正規表現: ${r}`); }
+        case '<': return l < r;
+        default: return l > r;
+      }
+    };
+    const parseOr = () => { let l = parseAnd(); while (args[pos] === '-o' || args[pos] === '||') { pos++; const r = parseAnd(); l = l || r; } return l; };
+    const parseAnd = () => { let l = parseNot(); while (args[pos] === '-a' || args[pos] === '&&') { pos++; const r = parseNot(); l = l && r; } return l; };
+    const parseNot = () => { if (args[pos] === '!') { pos++; return !parseNot(); } return primary(); };
+    const primary = () => {
+      if (args[pos] === '(') { pos++; const v = parseOr(); if (args[pos] !== ')') throw new Error("missing ')'"); pos++; return v; }
+      const rem = args.length - pos;
+      if (rem >= 3 && BIN.has(args[pos + 1])) { const l = args[pos], op = args[pos + 1], r = args[pos + 2]; pos += 3; return binary(l, op, r); }
+      if (rem >= 2 && UNARY.has(args[pos])) { const op = args[pos], a = args[pos + 1]; pos += 2; return unary(op, a); }
+      if (rem >= 1) return args[pos++] !== '';
+      throw new Error('argument expected');
+    };
+    if (!args.length) return false;
+    const v = parseOr();
+    if (pos < args.length) throw new Error(`too many arguments`);
+    return v;
+  }
+  function globMatchStr(pat, str) { return globRe(pat).test(str); }
+  C.test = (args, ctx) => { try { return evalTest(args, ctx, false) ? 0 : 1; } catch (e) { ctx.err(`test: ${e.message}\n`); return 2; } };
+  C['['] = (args, ctx) => {
+    if (args[args.length - 1] !== ']') { ctx.err("[: missing `]'\n"); return 2; }
+    try { return evalTest(args.slice(0, -1), ctx, false) ? 0 : 1; } catch (e) { ctx.err(`[: ${e.message}\n`); return 2; }
+  };
+  C['[['] = (args, ctx) => {
+    if (args[args.length - 1] !== ']]') { ctx.err("[[: missing `]]'\n"); return 2; }
+    try { return evalTest(args.slice(0, -1), ctx, true) ? 0 : 1; } catch (e) { ctx.err(`[[: ${e.message}\n`); return 2; }
+  };
+  C[':'] = () => 0;
+  C['break'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("break: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('break'); };
+  C['continue'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("continue: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('continue'); };
 
   C.bash = (args, ctx) => {
     // bash script.sh [args...] / bash -c 'command'。同じ安全なパーサーで解釈する（実シェルは使わない）
@@ -1370,22 +1467,6 @@ function computeMode(cur, spec) {
   return mode;
 }
 
-// 教育用の軽量ハッシュ（暗号用途ではない。固定の16進表現を得るため）
-function simpleHash(str, algo) {
-  const len = algo === 'md5' ? 32 : algo === 'sha1' ? 40 : 64;
-  let h = new Array(len / 2).fill(0);
-  let acc = algo === 'md5' ? 0x67 : algo === 'sha1' ? 0x1a : 0x6a;
-  for (let i = 0; i < str.length; i++) {
-    const c = str.charCodeAt(i);
-    for (let j = 0; j < h.length; j++) {
-      acc = (acc * 31 + c + j * 7 + i) & 0xff;
-      h[j] = (h[j] + acc + ((c << (j % 5)) & 0xff)) & 0xff;
-    }
-  }
-  // 追加撹拌
-  for (let round = 0; round < 3; round++) for (let j = 0; j < h.length; j++) h[j] = (h[j] * 131 + h[(j + 1) % h.length] + round) & 0xff;
-  return h.map(b => b.toString(16).padStart(2, '0')).join('');
-}
 function b64encode(str) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   const bytes = []; for (const ch of str) { const c = ch.codePointAt(0); if (c < 0x80) bytes.push(c); else if (c < 0x800) { bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f)); } else { bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); } }
@@ -1411,4 +1492,4 @@ function b64decode(str) {
   let out = ''; for (let i = 0; i < bytes.length;) { const b = bytes[i]; if (b < 0x80) { out += String.fromCharCode(b); i++; } else if (b < 0xe0) { out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i + 1] & 0x3f)); i += 2; } else { out += String.fromCharCode(((b & 0xf) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f)); i += 3; } }
   return out;
 }
-export { simpleHash, b64encode };
+export { b64encode };
