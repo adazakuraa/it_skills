@@ -38,7 +38,11 @@ export function buildEnvironment(mission) {
     if (u.sudo) { const sudo = vfs.groupByName('sudo'); if (!sudo.members.includes(u.name)) sudo.members.push(u.name); }
     for (const g of (u.groups || [])) { let grp = vfs.groupByName(g); if (!grp) { grp = { name: g, gid: nextGid++, members: [] }; vfs.groups.push(grp); } if (!grp.members.includes(u.name)) grp.members.push(u.name); }
   }
-  for (const g of (e.groups || [])) { if (!vfs.groupByName(g.name)) vfs.groups.push({ name: g.name, gid: g.gid != null ? g.gid : nextGid++, members: g.members || [] }); }
+  for (const g of (e.groups || [])) {
+    const ex = vfs.groupByName(g.name);
+    if (!ex) vfs.groups.push({ name: g.name, gid: g.gid != null ? g.gid : nextGid++, members: [...(g.members || [])] });
+    else for (const mem of (g.members || [])) if (!ex.members.includes(mem)) ex.members.push(mem);
+  }
 
   // プレイヤーをファイル作成前に登録（owner 指定を効かせるため）
   const userName = e.user || 'analyst';
@@ -87,8 +91,15 @@ export function buildEnvironment(mission) {
   }
   rebuildPasswd(vfs, e.shadow);
 
-  // --- プレイヤーのホーム（未作成なら） ---
+  // --- プレイヤーのホーム（未作成なら）＋既定のドットファイル ---
   if (!vfs.exists(`/home/${userName}`)) vfs.addDir(`/home/${userName}`, { owner: userName, group: userName });
+  for (const [name, content] of [
+    ['.bashrc', '# ~/.bashrc: executed by bash for non-login shells.\n# (シミュレーター用の簡易版)\nalias ll=\'ls -la\'\n'],
+    ['.profile', '# ~/.profile: executed by the command interpreter for login shells.\nif [ -d "$HOME/bin" ]; then PATH="$HOME/bin:$PATH"; fi\n'],
+  ]) {
+    const hp = `/home/${userName}/${name}`;
+    if (!vfs.exists(hp)) vfs.addFile(hp, content, { owner: userName, mode: 0o644 });
+  }
   rebuildPasswd(vfs);
   const player = vfs.userByName(userName);
   const cwd = e.cwd || player.home;

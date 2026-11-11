@@ -123,7 +123,7 @@ export function makeCommands(getCmds) {
       if (opts.l) {
         ctx.out(`total ${names.length}\n`);
         for (const n of names) ctx.out(fmtEntry(n, getNode(n), n) + '\n');
-      } else if (opts['1'] || opts.l) {
+      } else if (opts['1'] || !ctx.tty) {
         for (const n of names) ctx.out(fmtEntry(n, getNode(n), n) + '\n');
       } else {
         ctx.out(names.map(n => {
@@ -140,7 +140,7 @@ export function makeCommands(getCmds) {
     };
     if (filesToShow.length) {
       if (opts.l) for (const f of filesToShow) ctx.out(fmtEntry(f.name, f.node, f.name) + '\n');
-      else ctx.out(filesToShow.map(f => f.name).join('  ') + '\n');
+      else ctx.out(filesToShow.map(f => f.name).join(ctx.tty && !opts['1'] ? '  ' : '\n') + '\n');
     }
     dirsToList.forEach((d, i) => {
       if (filesToShow.length && i === 0) ctx.out('\n');
@@ -1150,6 +1150,35 @@ export function makeCommands(getCmds) {
     try { const node = lookup(ctx, p); if (caps === '-r' || !caps) delete node.caps; else node.caps = caps; } catch (e) { ctx.err(`setcap: ${fsMsg(e)}\n`); return 1; }
     return 0;
   };
+
+  C.bash = (args, ctx) => {
+    // bash script.sh [args...] / bash -c 'command'。同じ安全なパーサーで解釈する（実シェルは使わない）
+    let i = 0; let cmdStr = null;
+    for (; i < args.length; i++) {
+      const a = args[i];
+      if (a === '-c') { cmdStr = args[i + 1]; i += 2; break; }
+      if (a === '--') { i++; break; }
+      if (a.startsWith('-') && a !== '-') continue; // -e -x -u などは無視
+      break;
+    }
+    const sh = ctx.sh;
+    if (sh.depth >= 8) { ctx.err('bash: 入れ子が深すぎます\n'); return 1; }
+    if (cmdStr != null) {
+      sh.depth++;
+      try {
+        const chunks = sh.run(cmdStr, { record: false });
+        for (const c of chunks) (c.fd === 2 ? ctx.err : ctx.out)(c.text);
+        return sh.lastCode;
+      } finally { sh.depth--; }
+    }
+    const file = args[i];
+    if (!file) { ctx.err('bash: 対話シェルはこのシミュレーターでは未対応です（bash スクリプト名 か bash -c \'コマンド\' を指定）\n'); return 1; }
+    let content;
+    try { content = sh.vfs.readFile(file, sh.cwd, sh.user); }
+    catch (e) { ctx.err(`bash: ${file}: ${fsMsg(e)}\n`); return 127; }
+    return sh.runScript(content, args.slice(i + 1), ctx, file);
+  };
+  C.sh = C.bash;
 
   C.crontab = (args, ctx) => {
     if (args.includes('-l')) {

@@ -233,7 +233,7 @@ Oct 14 03:00:09 sshd[9]: Failed password for root from 185.22.3.7
           check: { type: 'answer', any: ['185.22.3.7'], normalizeIp: true },
           answerHint: '最多のIP',
           hints: ['grep "Failed password" auth.log | awk \'{print $NF}\' | sort | uniq -c | sort -rn', '$NF は行の最終列(IP)', '185.22.3.7 が最多'],
-          explain: '185.22.3.7 が5回失敗で最多＝主要な総当たり攻撃元。awk の $NF(最終フィールド)でIPを抜き、集計パイプで定量化した。この数値を根拠に、閾値超過のIPを fail2ban やファイアウォールで自動遮断する。検知の定量化が自動防御の土台。',
+          explain: '185.22.3.7 が6回失敗で最多＝主要な総当たり攻撃元。awk の $NF(最終フィールド)でIPを抜き、集計パイプで定量化した。この数値を根拠に、閾値超過のIPを fail2ban やファイアウォールで自動遮断する。検知の定量化が自動防御の土台。',
         },
         {
           q: '総当たりに紛れて、1件だけ認証に「成功」したログイン(Accepted)があります。そのアカウント名を答えてください（正規か要確認の対象）。',

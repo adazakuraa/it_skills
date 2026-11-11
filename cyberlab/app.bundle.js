@@ -816,6 +816,7 @@ class Shell {
     let code;
     const ctx = {
       sh: this,
+      tty: !!toTerminal && !outTarget, // 標準出力が端末か（ls の整形などに影響）
       stdin,
       out: text => { ordered.push({ fd: 1, text }); },
       err: text => { ordered.push({ fd: 2, text }); },
@@ -1991,7 +1992,7 @@ function makeCommands(getCmds) {
       if (opts.l) {
         ctx.out(`total ${names.length}\n`);
         for (const n of names) ctx.out(fmtEntry(n, getNode(n), n) + '\n');
-      } else if (opts['1'] || opts.l) {
+      } else if (opts['1'] || !ctx.tty) {
         for (const n of names) ctx.out(fmtEntry(n, getNode(n), n) + '\n');
       } else {
         ctx.out(names.map(n => {
@@ -2008,7 +2009,7 @@ function makeCommands(getCmds) {
     };
     if (filesToShow.length) {
       if (opts.l) for (const f of filesToShow) ctx.out(fmtEntry(f.name, f.node, f.name) + '\n');
-      else ctx.out(filesToShow.map(f => f.name).join('  ') + '\n');
+      else ctx.out(filesToShow.map(f => f.name).join(ctx.tty && !opts['1'] ? '  ' : '\n') + '\n');
     }
     dirsToList.forEach((d, i) => {
       if (filesToShow.length && i === 0) ctx.out('\n');
@@ -3019,6 +3020,35 @@ function makeCommands(getCmds) {
     return 0;
   };
 
+  C.bash = (args, ctx) => {
+    // bash script.sh [args...] / bash -c 'command'。同じ安全なパーサーで解釈する（実シェルは使わない）
+    let i = 0; let cmdStr = null;
+    for (; i < args.length; i++) {
+      const a = args[i];
+      if (a === '-c') { cmdStr = args[i + 1]; i += 2; break; }
+      if (a === '--') { i++; break; }
+      if (a.startsWith('-') && a !== '-') continue; // -e -x -u などは無視
+      break;
+    }
+    const sh = ctx.sh;
+    if (sh.depth >= 8) { ctx.err('bash: 入れ子が深すぎます\n'); return 1; }
+    if (cmdStr != null) {
+      sh.depth++;
+      try {
+        const chunks = sh.run(cmdStr, { record: false });
+        for (const c of chunks) (c.fd === 2 ? ctx.err : ctx.out)(c.text);
+        return sh.lastCode;
+      } finally { sh.depth--; }
+    }
+    const file = args[i];
+    if (!file) { ctx.err('bash: 対話シェルはこのシミュレーターでは未対応です（bash スクリプト名 か bash -c \'コマンド\' を指定）\n'); return 1; }
+    let content;
+    try { content = sh.vfs.readFile(file, sh.cwd, sh.user); }
+    catch (e) { ctx.err(`bash: ${file}: ${fsMsg(e)}\n`); return 127; }
+    return sh.runScript(content, args.slice(i + 1), ctx, file);
+  };
+  C.sh = C.bash;
+
   C.crontab = (args, ctx) => {
     if (args.includes('-l')) {
       try { ctx.out(ctx.sh.vfs.readFile(`/var/spool/cron/crontabs/${ctx.sh.user.name}`, '/', ctx.sh.user)); return 0; }
@@ -3601,7 +3631,11 @@ function buildEnvironment(mission) {
     if (u.sudo) { const sudo = vfs.groupByName('sudo'); if (!sudo.members.includes(u.name)) sudo.members.push(u.name); }
     for (const g of (u.groups || [])) { let grp = vfs.groupByName(g); if (!grp) { grp = { name: g, gid: nextGid++, members: [] }; vfs.groups.push(grp); } if (!grp.members.includes(u.name)) grp.members.push(u.name); }
   }
-  for (const g of (e.groups || [])) { if (!vfs.groupByName(g.name)) vfs.groups.push({ name: g.name, gid: g.gid != null ? g.gid : nextGid++, members: g.members || [] }); }
+  for (const g of (e.groups || [])) {
+    const ex = vfs.groupByName(g.name);
+    if (!ex) vfs.groups.push({ name: g.name, gid: g.gid != null ? g.gid : nextGid++, members: [...(g.members || [])] });
+    else for (const mem of (g.members || [])) if (!ex.members.includes(mem)) ex.members.push(mem);
+  }
 
   // プレイヤーをファイル作成前に登録（owner 指定を効かせるため）
   const userName = e.user || 'analyst';
@@ -3650,8 +3684,15 @@ function buildEnvironment(mission) {
   }
   rebuildPasswd(vfs, e.shadow);
 
-  // --- プレイヤーのホーム（未作成なら） ---
+  // --- プレイヤーのホーム（未作成なら）＋既定のドットファイル ---
   if (!vfs.exists(`/home/${userName}`)) vfs.addDir(`/home/${userName}`, { owner: userName, group: userName });
+  for (const [name, content] of [
+    ['.bashrc', '# ~/.bashrc: executed by bash for non-login shells.\n# (シミュレーター用の簡易版)\nalias ll=\'ls -la\'\n'],
+    ['.profile', '# ~/.profile: executed by the command interpreter for login shells.\nif [ -d "$HOME/bin" ]; then PATH="$HOME/bin:$PATH"; fi\n'],
+  ]) {
+    const hp = `/home/${userName}/${name}`;
+    if (!vfs.exists(hp)) vfs.addFile(hp, content, { owner: userName, mode: 0o644 });
+  }
   rebuildPasswd(vfs);
   const player = vfs.userByName(userName);
   const cwd = e.cwd || player.home;
@@ -4082,7 +4123,7 @@ const stage0 = {
           check: { type: 'answer', any: ['/home/analyst'] },
           answerHint: 'pwd の出力をそのまま入力',
           hints: ['いま自分がいる場所を表示するコマンドがある', 'print working directory の略', 'pwd と入力して実行し、表示されたパスを答える'],
-          explain: 'pwd はカレントディレクトリの絶対パスを表示する。ホームディレクトリは慣例的に /home/ユーザー名 に置かれる。',
+          explain: 'pwd (print working directory) はカレントディレクトリの絶対パスを表示する。ホームディレクトリは慣例的に /home/ユーザー名 に置かれ、ログイン直後はここが現在地になる。ファイル操作の前に pwd で現在地を確かめる習慣は、誤ったディレクトリで rm や mv をしてしまう事故を防ぐ。',
         },
         {
           q: 'このディレクトリには隠しファイルを含めていくつのエントリ（. と .. を除く通常/隠しファイル）がありますか。ls -a で確認して数を答えてください。',
@@ -4143,14 +4184,14 @@ const stage0 = {
           { path: '/opt/training/day2/lesson.txt', content: 'Day2: 権限の考え方。\n' },
         ],
       },
-      quick: ['cd /opt/training', 'ls', 'cd ..', 'cat readme.txt', 'cd day1', 'pwd'],
+      quick: ['cd /opt/training', 'ls', 'cat readme.txt', 'cd day1', 'pwd', 'cd ..'],
       tasks: [
         {
           q: '/opt/training に移動し、その場所の絶対パスを答えてください。',
           narration: '絶対パスを使えば、今どこにいても一発で目的地へ飛べる。cd /opt/training を実行しよう。',
           check: { type: 'answer', any: ['/opt/training'] },
           hints: ['cd に絶対パスを渡す', 'cd /opt/training', '移動後に pwd で確認してその値を答える'],
-          explain: 'cd に / で始まる絶対パスを渡すと、現在地に関係なくそこへ移動できる。',
+          explain: 'cd に / で始まる絶対パスを渡すと、現在地に関係なくそこへ移動できる。絶対パスは「どこから見ても同じ場所」を指すので、手順書やスクリプトでは相対パスより事故が少ない。移動後は pwd で現在地を確認できる。',
         },
         {
           q: 'day1 ディレクトリの中の lesson.txt に書かれている「合言葉」を答えてください。',
@@ -4325,7 +4366,7 @@ const stage1 = {
           narration: 'find は -type d でディレクトリだけに絞れる。構造の把握に役立つ。',
           check: { type: 'answer', any: ['/opt/app'] },
           hints: ['find /opt -type d を実行', '出力の中で conf と logs を子に持つもの', '/opt/app が conf/ と logs/ の親'],
-          explain: '-type d でディレクトリのみ、-type f でファイルのみに絞れる。構造調査では両方を使い分ける。',
+          explain: '-type d でディレクトリのみ、-type f でファイルのみに絞れる。構造調査ではまず -type d でどんな区画に分かれているかを掴み、次に -type f で個々のファイルを探す、という順で使い分けると全体像を素早く把握できる。',
         },
       ],
       review: {
@@ -4389,7 +4430,7 @@ INFO cache cleared
           narration: 'ログは書き手によって ERROR / error / Error と表記が揺れる。-i で大小を無視し、-c で件数だけ数えると速い。',
           check: { type: 'answer', any: ['3', '３'] },
           hints: ['大小無視は -i、件数は -c', 'grep -ic error error.log', 'ERROR 2行 + error 1行 = 3行'],
-          explain: 'grep -i で大文字小文字を無視、-c でマッチした行数を返す。表記揺れのあるログ調査では -i が必須。',
+          explain: 'grep -i で大文字小文字を無視、-c でマッチした行数を返す。ログは書き手によって ERROR / error / Error と表記が揺れるため、-i を付けないと「見えているのに数えられていない」行が出る。件数だけ欲しいときは -c が速い。',
         },
         {
           q: 'access.log で /login に対して認証失敗(401)を繰り返している攻撃元のIPアドレスを特定してください。',
@@ -4480,7 +4521,7 @@ INFO cache cleared
         {
           q: '401（認証失敗）だけに絞ってから攻撃元IPを集計します。401 を含む行のうち最多のIPのアクセス「回数」を答えてください。',
           narration: 'grep と cut とパイプを組み合わせる。まず grep 401 で失敗行だけにし、そこから同じ集計をかける。道具を足し引きするだけで分析の切り口を変えられるのがパイプの強み。',
-          check: { type: 'answer', any: ['5', '５'] },
+          check: { type: 'answer', any: ['4', '４'] },
           hints: ['grep 401 access.log | cut -d" " -f1 | sort | uniq -c', '203.0.113.9 の行だけが 401 を持つ', 'その件数(回数)を数字で答える'],
           explain: 'grep（絞り込み）→ cut（列抽出）→ sort|uniq -c（集計）と、単機能の道具を直列につないで分析した。同じ部品で「全アクセス」と「失敗のみ」など観点を切り替えられる。これがフィルタ指向の強力さ。',
         },
@@ -4829,7 +4870,7 @@ Oct 14 09:30:00 intra-07 sshd[3001]: Accepted publickey for analyst from 198.51.
           narration: '総当たり攻撃の規模をまず掴む。grep で失敗行を抽出し件数を数える。',
           check: { type: 'answer', any: ['6', '６'] },
           hints: ['grep -c "Failed password" /var/log/auth.log', 'クォートで囲むとスペースを含む語を1つのパターンにできる', '6回失敗している'],
-          explain: '短時間に6回の認証失敗が同一IPから発生。典型的なSSH総当たり。grep -c で件数を即座に把握できる。',
+          explain: '短時間（約10秒間）に6回の認証失敗が同一IPから発生しており、典型的なSSH総当たり攻撃の形をしている。正規ユーザーの打ち間違いなら、これほど短い間隔で複数のアカウント名(admin/root/backup)を試すことはない。grep -c で件数を即座に把握し、攻撃の規模を見積もる。',
         },
         {
           q: '総当たりの末に、ログインに「成功」してしまったアカウント名を答えてください。',
@@ -7931,7 +7972,7 @@ Oct 14 03:00:09 sshd[9]: Failed password for root from 185.22.3.7
           check: { type: 'answer', any: ['185.22.3.7'], normalizeIp: true },
           answerHint: '最多のIP',
           hints: ['grep "Failed password" auth.log | awk \'{print $NF}\' | sort | uniq -c | sort -rn', '$NF は行の最終列(IP)', '185.22.3.7 が最多'],
-          explain: '185.22.3.7 が5回失敗で最多＝主要な総当たり攻撃元。awk の $NF(最終フィールド)でIPを抜き、集計パイプで定量化した。この数値を根拠に、閾値超過のIPを fail2ban やファイアウォールで自動遮断する。検知の定量化が自動防御の土台。',
+          explain: '185.22.3.7 が6回失敗で最多＝主要な総当たり攻撃元。awk の $NF(最終フィールド)でIPを抜き、集計パイプで定量化した。この数値を根拠に、閾値超過のIPを fail2ban やファイアウォールで自動遮断する。検知の定量化が自動防御の土台。',
         },
         {
           q: '総当たりに紛れて、1件だけ認証に「成功」したログイン(Accepted)があります。そのアカウント名を答えてください（正規か要確認の対象）。',
@@ -8152,7 +8193,7 @@ const stageCTF = {
           narration: 'まず偵察。nmap で開放ポートとサービスを把握する。',
           check: { type: 'answer', any: ['80'] },
           hints: ['nmap target.lab', 'service が http の行', '80番'],
-          explain: 'nmap で 22(SSH)と 80(HTTP)を確認。Webがあるので、まずはそこを調べるのが定石。',
+          explain: 'nmap で 22(SSH)と 80(HTTP)を確認。SSHは認証が必要で総当たりは遅く目立つのに対し、Webは設定ミスや情報漏洩が見つかりやすい。まず公開ページ側(robots.txt・隠しパス)から調べるのが偵察の定石になる。',
         },
         {
           q: 'Webを偵察して情報漏洩を見つけ、最終的なフラグ FLAG{...} の中身を奪取してください。',
@@ -8192,10 +8233,11 @@ const stageCTF = {
       quick: ['sudo -l', 'id', 'find / -perm -4000 -type f 2>/dev/null', 'sudo cat /root/flag.txt'],
       tasks: [
         {
-          q: 'まず自分が sudo で何を許可されているか確認します。sudo -l の結果、管理者操作が「許可されている(may run)」か「いない(not allowed)」か、allowed か notallowed で答えてください。',
+          q: 'まず自分が sudo で何を許可されているか確認します。sudo -l の出力に表示される、実行を許可されているコマンドの範囲（括弧の後ろ）を答えてください。',
           narration: '権限昇格の第一歩は sudo -l。自分に許された特権操作を確認する。',
-          check: { type: 'answer', any: ['allowed'], ci: true },
-          hints: ['sudo -l を実行', 'may run the following commands と出るか', 'ALL が許可されている→allowed'],
+          check: { type: 'answer', any: ['ALL'], ci: true },
+          answerHint: '許可範囲(大文字3文字)',
+          hints: ['sudo -l を実行', '(ALL : ALL) ___ の形で最後に範囲が書かれている', 'ALL＝あらゆるコマンドを許可'],
           explain: 'sudo -l で、この analyst が sudo で管理者操作を実行できる(設定ミス/過剰権限)と判明。権限昇格はまず「自分の持つ特権」の棚卸しから。sudo 権限があれば root への昇格は容易。',
         },
         {

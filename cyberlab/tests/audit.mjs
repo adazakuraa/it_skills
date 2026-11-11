@@ -53,6 +53,58 @@ for (const st of STAGES) {
   if (hands / st.missions.length < 0.3) add('MID', st.id, `実技ミッションの割合が低い(${hands}/${st.missions.length})`);
 }
 
+
+// ============================================================
+// 追加監査: (1) quick コマンドの実行可否 (2) 回答式タスクの正解が環境から導出可能か
+// ============================================================
+const FAIL_SIGNALS = /command not found|未対応|内部エラー|invalid option|unrecognized option|syntax error|unknown predicate|No such file or directory|Cannot read|is not a function/;
+
+function collectAnswers(check, acc = []) {
+  if (!check) return acc;
+  if (check.type === 'answer') { for (const a of (check.any || (check.equals != null ? [check.equals] : []))) acc.push(String(a)); }
+  if (check.of) check.of.forEach(c => collectAnswers(c, acc));
+  return acc;
+}
+const norm = (x) => String(x).toLowerCase().replace(/\s+/g, '');
+
+for (const m of allMissions()) {
+  const { shell, vfs } = buildEnvironment(m);
+  let corpus = '';
+  const lineCounts = new Set();
+  const runAll = (cmds, label) => {
+    for (const line of cmds) {
+      const chunks = shell.run(line, { record: false });
+      const out = chunks.map(c => c.text).join('');
+      corpus += '\n' + out;
+      lineCounts.add(String(out.split('\n').filter(l => l.trim()).length));
+      const errText = chunks.filter(c => c.fd === 2).map(c => c.text).join('');
+      if (label === 'quick' && FAIL_SIGNALS.test(errText)) add('MID', m.id, `quick コマンドが失敗: ${line} → ${errText.trim().slice(0, 70)}`);
+    }
+  };
+  // quick は別環境で順に実行（solution とは独立）
+  runAll(m.quick || [], 'quick');
+  const { shell: sh2 } = buildEnvironment(m);
+  for (const line of (m.solution || [])) { const o = sh2.run(line, { record: false }).map(c => c.text).join(''); corpus += '\n' + o; lineCounts.add(String(o.split('\n').filter(l => l.trim()).length)); }
+  // 環境ファイル・ネットワーク定義も「調べれば分かる情報」として含める
+  const envText = JSON.stringify(m.env || {});
+  const hay = norm(corpus + envText);
+
+  m.tasks.forEach((t, i) => {
+    if (isMcq(t) || /1\).*2\)/.test(t.q || '') || !needsAnswer(t) || t.noInput) return;
+    const answers = collectAnswers(t.check);
+    if (!answers.length) return;
+    // 数値・1文字の回答は件数などの導出値なので文字列照合の対象外
+    const checkable = answers.filter(a => !/^\d{1,4}$/.test(a) && a.length > 1 && !/^(yes|no|done|ok|はい|いいえ)$/i.test(a));
+    if (checkable.length && !checkable.some(a => hay.includes(norm(a)))) add('HIGH', `${m.id}#${i + 1}`, `正解 ${JSON.stringify(checkable.slice(0, 2))} が環境/出力のどこにも現れない（導出不能の可能性）`);
+    // 数値回答: 出力(solution+quick)に独立した数字トークンとして現れるか
+    const nums = answers.filter(a => /^\d{1,6}$/.test(a));
+    if (nums.length) {
+      const tokens = new Set([...(corpus.match(/(?<![\w.])\d+(?![\w.])/g) || []), ...lineCounts]);
+      if (!nums.some(a => tokens.has(a))) add('MID', `${m.id}#${i + 1}`, `数値の正解 ${nums[0]} が quick/solution の出力に現れない（要手計算・要検証）`);
+    }
+  });
+}
+
 const order = ['HIGH', 'MID', 'LOW'];
 const counts = {};
 for (const sev of order) counts[sev] = issues.filter(i => i.sev === sev).length;

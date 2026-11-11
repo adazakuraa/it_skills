@@ -41,7 +41,7 @@ export const stageCTF = {
           narration: 'まず偵察。nmap で開放ポートとサービスを把握する。',
           check: { type: 'answer', any: ['80'] },
           hints: ['nmap target.lab', 'service が http の行', '80番'],
-          explain: 'nmap で 22(SSH)と 80(HTTP)を確認。Webがあるので、まずはそこを調べるのが定石。',
+          explain: 'nmap で 22(SSH)と 80(HTTP)を確認。SSHは認証が必要で総当たりは遅く目立つのに対し、Webは設定ミスや情報漏洩が見つかりやすい。まず公開ページ側(robots.txt・隠しパス)から調べるのが偵察の定石になる。',
         },
         {
           q: 'Webを偵察して情報漏洩を見つけ、最終的なフラグ FLAG{...} の中身を奪取してください。',
@@ -81,10 +81,11 @@ export const stageCTF = {
       quick: ['sudo -l', 'id', 'find / -perm -4000 -type f 2>/dev/null', 'sudo cat /root/flag.txt'],
       tasks: [
         {
-          q: 'まず自分が sudo で何を許可されているか確認します。sudo -l の結果、管理者操作が「許可されている(may run)」か「いない(not allowed)」か、allowed か notallowed で答えてください。',
+          q: 'まず自分が sudo で何を許可されているか確認します。sudo -l の出力に表示される、実行を許可されているコマンドの範囲（括弧の後ろ）を答えてください。',
           narration: '権限昇格の第一歩は sudo -l。自分に許された特権操作を確認する。',
-          check: { type: 'answer', any: ['allowed'], ci: true },
-          hints: ['sudo -l を実行', 'may run the following commands と出るか', 'ALL が許可されている→allowed'],
+          check: { type: 'answer', any: ['ALL'], ci: true },
+          answerHint: '許可範囲(大文字3文字)',
+          hints: ['sudo -l を実行', '(ALL : ALL) ___ の形で最後に範囲が書かれている', 'ALL＝あらゆるコマンドを許可'],
           explain: 'sudo -l で、この analyst が sudo で管理者操作を実行できる(設定ミス/過剰権限)と判明。権限昇格はまず「自分の持つ特権」の棚卸しから。sudo 権限があれば root への昇格は容易。',
         },
         {

@@ -55,7 +55,7 @@ export const stage1 = {
           narration: 'find は -type d でディレクトリだけに絞れる。構造の把握に役立つ。',
           check: { type: 'answer', any: ['/opt/app'] },
           hints: ['find /opt -type d を実行', '出力の中で conf と logs を子に持つもの', '/opt/app が conf/ と logs/ の親'],
-          explain: '-type d でディレクトリのみ、-type f でファイルのみに絞れる。構造調査では両方を使い分ける。',
+          explain: '-type d でディレクトリのみ、-type f でファイルのみに絞れる。構造調査ではまず -type d でどんな区画に分かれているかを掴み、次に -type f で個々のファイルを探す、という順で使い分けると全体像を素早く把握できる。',
         },
       ],
       review: {
@@ -119,7 +119,7 @@ INFO cache cleared
           narration: 'ログは書き手によって ERROR / error / Error と表記が揺れる。-i で大小を無視し、-c で件数だけ数えると速い。',
           check: { type: 'answer', any: ['3', '３'] },
           hints: ['大小無視は -i、件数は -c', 'grep -ic error error.log', 'ERROR 2行 + error 1行 = 3行'],
-          explain: 'grep -i で大文字小文字を無視、-c でマッチした行数を返す。表記揺れのあるログ調査では -i が必須。',
+          explain: 'grep -i で大文字小文字を無視、-c でマッチした行数を返す。ログは書き手によって ERROR / error / Error と表記が揺れるため、-i を付けないと「見えているのに数えられていない」行が出る。件数だけ欲しいときは -c が速い。',
         },
         {
           q: 'access.log で /login に対して認証失敗(401)を繰り返している攻撃元のIPアドレスを特定してください。',
@@ -210,7 +210,7 @@ INFO cache cleared
         {
           q: '401（認証失敗）だけに絞ってから攻撃元IPを集計します。401 を含む行のうち最多のIPのアクセス「回数」を答えてください。',
           narration: 'grep と cut とパイプを組み合わせる。まず grep 401 で失敗行だけにし、そこから同じ集計をかける。道具を足し引きするだけで分析の切り口を変えられるのがパイプの強み。',
-          check: { type: 'answer', any: ['5', '５'] },
+          check: { type: 'answer', any: ['4', '４'] },
           hints: ['grep 401 access.log | cut -d" " -f1 | sort | uniq -c', '203.0.113.9 の行だけが 401 を持つ', 'その件数(回数)を数字で答える'],
           explain: 'grep（絞り込み）→ cut（列抽出）→ sort|uniq -c（集計）と、単機能の道具を直列につないで分析した。同じ部品で「全アクセス」と「失敗のみ」など観点を切り替えられる。これがフィルタ指向の強力さ。',
         },

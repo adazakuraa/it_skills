@@ -338,6 +338,7 @@ export class Shell {
     let code;
     const ctx = {
       sh: this,
+      tty: !!toTerminal && !outTarget, // 標準出力が端末か（ls の整形などに影響）
       stdin,
       out: text => { ordered.push({ fd: 1, text }); },
       err: text => { ordered.push({ fd: 2, text }); },
