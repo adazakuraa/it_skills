@@ -24,6 +24,7 @@ import { stageApiSec } from './stage-apisec.js';
 import { stageCloud } from './stage-cloud.js';
 import { stageDetect } from './stage-detect.js';
 import { stageAISec } from './stage-aisec.js';
+import { stagePacket } from './stage-packet.js';
 
 export const STAGES = [
   stage0,          // 入門: ターミナル基礎
@@ -38,6 +39,7 @@ export const STAGES = [
   stageNetBasics,  // ネットワーク理論
   stage4,          // ネットワーク調査(実技)
   stageNetAdv,     // ネットワーク調査 II(深掘り)
+  stagePacket,     // パケット解析(tcpdump)
   stageSecBasics,  // セキュリティ基礎理論
   stageCrypto,     // 暗号・ハッシュ(実技)
   stage3,          // ログ解析・インシデント
