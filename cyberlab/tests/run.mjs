@@ -240,6 +240,31 @@ function engineTests() {
 }
 
 
+
+// ---------- ユーザー・グループ管理の回帰テスト ----------
+function userAdminTests() {
+  const { shell: s } = buildEnvironment({ env: { user: 'admin', sudo: true, users: [{ name: 'alice' }], processes: [{ pid: 5000, user: 'alice', cmd: 'sleep 999' }] } });
+  const run = (l) => s.run(l).map(c => (c.fd === 2 ? '[E]' : '') + c.text).join('');
+  ok(run('useradd bob').includes('Permission denied'), 'useradd は root 権限が必要');
+  run('sudo useradd -m -s /usr/sbin/nologin svc');
+  ok(run('grep svc /etc/passwd') === 'svc:x:1002:1002::/home/svc:/usr/sbin/nologin\n', 'useradd が /etc/passwd を更新');
+  ok(/svc\s+svc/.test(run('ls -ld /home/svc')), 'useradd -m がホームを作成');
+  ok(run('sudo passwd -S svc') === 'svc L 2026-10-14 0 99999 7 -1\n', '新規アカウントはロック状態');
+  run('sudo groupadd rep; sudo usermod -aG rep alice; sudo gpasswd -a svc rep');
+  ok(run('grep rep /etc/group') === 'rep:x:1003:alice,svc\n', 'usermod -aG / gpasswd -a でグループに追加');
+  run('sudo usermod -G rep alice');
+  ok(run('id alice').includes('groups=1000(alice),1003(rep)'), 'usermod -G (-aなし) は補助グループを置き換える');
+  ok(run('sudo usermod -aG nosuch alice') === "[E]usermod: group 'nosuch' does not exist\n", '存在しないグループはエラー');
+  run('sudo usermod -L alice');
+  ok(run('sudo passwd -S alice').startsWith('alice L'), 'usermod -L でロック');
+  ok(run('sudo userdel alice').includes('currently used by process 5000'), '稼働中プロセスのあるユーザーは削除できない');
+  run('sudo kill 5000; sudo userdel -r alice');
+  ok(run('sudo grep alice /etc/passwd /etc/group /etc/shadow') === '', 'userdel -r で関連エントリを削除');
+  ok(run('sudo -u svc whoami') === 'svc\n', 'sudo -u で別ユーザーとして実行');
+  ok(run('sudo -u svc cat /etc/shadow').includes('Permission denied'), 'sudo -u で権限が一般ユーザーに落ちる');
+  ok(run('sudo groupdel svc').includes('primary group'), '主グループは削除できない');
+}
+
 // ---------- シェルスクリプト機能の回帰テスト ----------
 function scriptTests() {
   const env = { user: 't', files: [
@@ -301,6 +326,7 @@ function bundleTests() {
 cmdTests();
 engineTests();
 scriptTests();
+userAdminTests();
 securityStaticTests();
 structureTests();
 missionTests();

@@ -405,6 +405,16 @@ class VFS {
     return f;
   }
 
+  /** /etc/passwd と /etc/group を users/groups から再生成（アカウント操作後に呼ぶ） */
+  syncAccountFiles() {
+    let passwd = '';
+    for (const u of [...this.users].sort((a, b) => a.uid - b.uid)) passwd += `${u.name}:x:${u.uid}:${u.gid}:${u.gecos || ''}:${u.home}:${u.shell}\n`;
+    let group = '';
+    for (const g of [...this.groups].sort((a, b) => a.gid - b.gid)) group += `${g.name}:x:${g.gid}:${g.members.join(',')}\n`;
+    this.addFile('/etc/passwd', passwd, { mode: 0o644 });
+    this.addFile('/etc/group', group, { mode: 0o644 });
+  }
+
   // ---------- snapshot ----------
   serialize() {
     return { root: this.root, users: this.users, groups: this.groups, clock: this.clock };
@@ -2860,17 +2870,25 @@ function makeCommands(getCmds) {
   C.su = (args, ctx) => { ctx.err('su: このシミュレーターではユーザー切り替えは sudo で再現しています\n'); return 1; };
 
   C.sudo = (args, ctx) => {
-    if (!args.length) { ctx.err('usage: sudo command\n'); return 1; }
+    if (!args.length) { ctx.err('usage: sudo [-u user] command\n'); return 1; }
     if (args[0] === '-l') { ctx.out(ctx.sh.sudoAllowed ? `User ${ctx.sh.user.name} may run the following commands:\n    (ALL : ALL) ALL\n` : `${ctx.sh.user.name} is not allowed to run sudo on ${ctx.sh.hostname}.\n`); return 0; }
+    let target = 'root', i = 0;
+    while (i < args.length && args[i].startsWith('-')) {
+      if (args[i] === '-u') { target = args[i + 1]; i += 2; }
+      else if (args[i] === '--') { i++; break; }
+      else { ctx.err(`sudo: invalid option -- '${args[i].replace(/^-+/, '')}'\n`); return 1; }
+    }
+    const cmd = args.slice(i);
+    if (!cmd.length) { ctx.err('usage: sudo [-u user] command\n'); return 1; }
     if (!ctx.sh.sudoAllowed) { ctx.err(`${ctx.sh.user.name} is not in the sudoers file. This incident will be reported.\n`); return 1; }
+    const asUser = ctx.sh.vfs.userByName(target) || (target === 'root' ? { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash' } : null);
+    if (!asUser) { ctx.err(`sudo: unknown user ${target}\n`); return 1; }
     const savedUser = ctx.sh.user;
-    const root = ctx.sh.vfs.userByName('root') || { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash' };
-    ctx.sh.user = root;
-    try { return ctx.sh.exec(args, ctx); }
+    ctx.sh.user = asUser;
+    try { return ctx.sh.exec(cmd, ctx); }
     finally { ctx.sh.user = savedUser; }
   };
 
-  C.passwd = (args, ctx) => { ctx.out('パスワード変更はこのシミュレーターでは省略されています。\n'); return 0; };
 
   // ---------------- プロセス・サービス ----------------
   C.ps = (args, ctx) => {
@@ -4075,6 +4093,243 @@ function prefixToMask(prefix) {
 Object.assign(exports, { makeNetCommands });
 
 };
+__mods["js/useradmin.js"] = function (module, exports, __require) {
+// ============================================================
+// ユーザー・グループ管理コマンド（仮想の /etc/passwd /etc/group /etc/shadow を更新）
+// すべて仮想FS上の操作。root 権限（sudo）が必要。
+// ============================================================
+
+const NAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+// getopt 風: 結合フラグ(-aG)・値付き(-s /bin/sh, -s/bin/sh, -G g1,g2)に対応
+function parseArgs(args, valueFlags, boolFlags) {
+  const opts = {}; const operands = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.length > 1 && a[0] === '-' && a !== '--') {
+      for (let j = 1; j < a.length; j++) {
+        const f = a[j];
+        if (boolFlags.includes(f)) opts[f] = true;
+        else if (valueFlags.includes(f)) { opts[f] = a.length > j + 1 ? a.slice(j + 1) : args[++i]; break; }
+        else return { error: `invalid option -- '${f}'` };
+      }
+    } else operands.push(a);
+  }
+  return { opts, operands };
+}
+
+function shadowLines(vfs) {
+  const n = vfs.lookup('/etc/shadow', '/', null, { allowMissing: true });
+  return n ? n.content.split('\n').filter(Boolean) : [];
+}
+function writeShadow(vfs, lines) {
+  const n = vfs.lookup('/etc/shadow', '/', null, { allowMissing: true });
+  const text = lines.length ? lines.join('\n') + '\n' : '';
+  if (n) n.content = text; else vfs.addFile('/etc/shadow', text, { mode: 0o640, owner: 'root', group: 'root' });
+}
+function isLocked(vfs, name) {
+  const l = shadowLines(vfs).find(x => x.split(':')[0] === name);
+  return !!l && (l.split(':')[1] || '').startsWith('!');
+}
+function setLock(vfs, name, lock) {
+  const lines = shadowLines(vfs);
+  let found = false;
+  const out = lines.map(l => {
+    const f = l.split(':');
+    if (f[0] !== name) return l;
+    found = true;
+    const h = f[1] || '';
+    f[1] = lock ? (h.startsWith('!') ? h : '!' + h) : h.replace(/^!+/, '');
+    return f.join(':');
+  });
+  if (!found) out.push(`${name}:${lock ? '!' : '*'}:19700:0:99999:7:::`);
+  writeShadow(vfs, out);
+}
+
+function makeUserAdminCommands() {
+  const U = {};
+  const root = (ctx, cmd) => { if (ctx.sh.user.uid !== 0) { ctx.err(`${cmd}: Permission denied.\n${cmd}: cannot lock /etc/passwd; try again later.\n`); return false; } return true; };
+  const findGroup = (vfs, spec) => vfs.groupByName(spec) || (/^\d+$/.test(spec) ? vfs.groupById(parseInt(spec, 10)) : null);
+  const nextId = (used, start) => { let n = start; while (used.has(n)) n++; return n; };
+
+  U.useradd = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, ['s', 'g', 'G', 'u', 'd', 'c', 'k'], ['m', 'M', 'r', 'N', 'U']);
+    if (error) { ctx.err(`useradd: ${error}\n`); return 2; }
+    if (!root(ctx, 'useradd')) return 1;
+    const name = operands[0];
+    if (!name) { ctx.err('Usage: useradd [options] LOGIN\n'); return 2; }
+    if (!NAME_RE.test(name)) { ctx.err(`useradd: invalid user name '${name}'\n`); return 3; }
+    if (vfs.userByName(name)) { ctx.err(`useradd: user '${name}' already exists\n`); return 9; }
+    const usedUids = new Set(vfs.users.map(u => u.uid));
+    let uid;
+    if (opts.u != null) {
+      uid = parseInt(opts.u, 10);
+      if (!Number.isInteger(uid) || uid < 0) { ctx.err(`useradd: invalid user ID '${opts.u}'\n`); return 3; }
+      if (usedUids.has(uid)) { ctx.err(`useradd: UID ${uid} is not unique\n`); return 4; }
+    } else uid = nextId(usedUids, Math.max(1000, ...vfs.users.filter(u => u.uid < 60000).map(u => u.uid + 1)));
+    let gid;
+    if (opts.g != null) {
+      const g = findGroup(vfs, opts.g);
+      if (!g) { ctx.err(`useradd: group '${opts.g}' does not exist\n`); return 6; }
+      gid = g.gid;
+    } else {
+      if (vfs.groupByName(name)) { ctx.err(`useradd: group ${name} exists - if you want to add this user to that group, use -g.\n`); return 9; }
+      const usedGids = new Set(vfs.groups.map(g => g.gid));
+      gid = usedGids.has(uid) ? nextId(usedGids, 1000) : uid;
+      vfs.groups.push({ name, gid, members: [] });
+    }
+    const extra = [];
+    if (opts.G) for (const gn of opts.G.split(',').filter(Boolean)) {
+      const g = vfs.groupByName(gn);
+      if (!g) { ctx.err(`useradd: group '${gn}' does not exist\n`); return 6; }
+      extra.push(g);
+    }
+    const home = opts.d || (opts.r ? `/var/lib/${name}` : `/home/${name}`);
+    vfs.users.push({ name, uid, gid, home, shell: opts.s || '/bin/sh', gecos: opts.c || '' });
+    for (const g of extra) if (!g.members.includes(name)) g.members.push(name);
+    vfs.syncAccountFiles();
+    setLock(vfs, name, true); // パスワード未設定＝ロック状態で作られる
+    if (opts.m && !opts.M) {
+      vfs.addDir(home, { mode: 0o755, owner: name, group: vfs.gname(gid) });
+      vfs.addFile(`${home}/.bashrc`, '# ~/.bashrc\n', { owner: name, group: vfs.gname(gid), mode: 0o644 });
+      vfs.addFile(`${home}/.profile`, '# ~/.profile\n', { owner: name, group: vfs.gname(gid), mode: 0o644 });
+    }
+    return 0;
+  };
+
+  U.usermod = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, ['s', 'g', 'G', 'd', 'c', 'l'], ['a', 'L', 'U']);
+    if (error) { ctx.err(`usermod: ${error}\n`); return 2; }
+    if (!root(ctx, 'usermod')) return 1;
+    const name = operands[0];
+    if (!name) { ctx.err('Usage: usermod [options] LOGIN\n'); return 2; }
+    const u = vfs.userByName(name);
+    if (!u) { ctx.err(`usermod: user '${name}' does not exist\n`); return 6; }
+    if (opts.a && opts.G == null) { ctx.err('usermod: option -a は -G と一緒に指定してください\n'); return 2; }
+    if (opts.G != null) {
+      const wanted = opts.G.split(',').filter(Boolean);
+      for (const gn of wanted) if (!vfs.groupByName(gn)) { ctx.err(`usermod: group '${gn}' does not exist\n`); return 6; }
+      if (!opts.a) for (const g of vfs.groups) g.members = g.members.filter(m => m !== name); // -a なしは置き換え
+      for (const gn of wanted) { const g = vfs.groupByName(gn); if (!g.members.includes(name)) g.members.push(name); }
+    }
+    if (opts.g != null) { const g = findGroup(vfs, opts.g); if (!g) { ctx.err(`usermod: group '${opts.g}' does not exist\n`); return 6; } u.gid = g.gid; }
+    if (opts.s != null) u.shell = opts.s;
+    if (opts.d != null) u.home = opts.d;
+    if (opts.c != null) u.gecos = opts.c;
+    if (opts.l != null) {
+      if (!NAME_RE.test(opts.l)) { ctx.err(`usermod: invalid user name '${opts.l}'\n`); return 3; }
+      for (const g of vfs.groups) g.members = g.members.map(m => (m === name ? opts.l : m));
+      writeShadow(vfs, shadowLines(vfs).map(l => (l.split(':')[0] === name ? [opts.l, ...l.split(':').slice(1)].join(':') : l)));
+      u.name = opts.l;
+    }
+    if (opts.L) setLock(vfs, u.name, true);
+    if (opts.U) setLock(vfs, u.name, false);
+    vfs.syncAccountFiles();
+    return 0;
+  };
+
+  U.userdel = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, [], ['r', 'f']);
+    if (error) { ctx.err(`userdel: ${error}\n`); return 2; }
+    if (!root(ctx, 'userdel')) return 1;
+    const name = operands[0];
+    if (!name) { ctx.err('Usage: userdel [options] LOGIN\n'); return 2; }
+    const u = vfs.userByName(name);
+    if (!u) { ctx.err(`userdel: user '${name}' does not exist\n`); return 6; }
+    const proc = ctx.sh.processes.find(p => p.user === name);
+    if (proc && !opts.f) { ctx.err(`userdel: user ${name} is currently used by process ${proc.pid}\n`); return 8; }
+    vfs.users = vfs.users.filter(x => x.name !== name);
+    for (const g of vfs.groups) g.members = g.members.filter(m => m !== name);
+    const pg = vfs.groupByName(name);
+    if (pg && pg.gid === u.gid && !vfs.users.some(x => x.gid === pg.gid) && !pg.members.length) vfs.groups = vfs.groups.filter(g => g !== pg);
+    writeShadow(vfs, shadowLines(vfs).filter(l => l.split(':')[0] !== name));
+    vfs.syncAccountFiles();
+    if (opts.r) { try { vfs.remove(u.home, '/', null, { recursive: true }); } catch { /* ホームが無い場合は無視 */ } }
+    return 0;
+  };
+
+  U.groupadd = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, ['g'], ['r']);
+    if (error) { ctx.err(`groupadd: ${error}\n`); return 2; }
+    if (!root(ctx, 'groupadd')) return 1;
+    const name = operands[0];
+    if (!name) { ctx.err('Usage: groupadd [options] GROUP\n'); return 2; }
+    if (!NAME_RE.test(name)) { ctx.err(`groupadd: '${name}' is not a valid group name\n`); return 3; }
+    if (vfs.groupByName(name)) { ctx.err(`groupadd: group '${name}' already exists\n`); return 9; }
+    const used = new Set(vfs.groups.map(g => g.gid));
+    let gid;
+    if (opts.g != null) { gid = parseInt(opts.g, 10); if (!Number.isInteger(gid) || gid < 0) { ctx.err(`groupadd: invalid group ID '${opts.g}'\n`); return 3; } if (used.has(gid)) { ctx.err(`groupadd: GID '${gid}' already exists\n`); return 4; } }
+    else gid = nextId(used, Math.max(1000, ...vfs.groups.filter(g => g.gid < 60000).map(g => g.gid + 1)));
+    vfs.groups.push({ name, gid, members: [] });
+    vfs.syncAccountFiles();
+    return 0;
+  };
+
+  U.groupdel = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    if (!root(ctx, 'groupdel')) return 1;
+    const name = args.find(a => !a.startsWith('-'));
+    if (!name) { ctx.err('Usage: groupdel GROUP\n'); return 2; }
+    const g = vfs.groupByName(name);
+    if (!g) { ctx.err(`groupdel: group '${name}' does not exist\n`); return 6; }
+    const prim = vfs.users.find(u => u.gid === g.gid);
+    if (prim) { ctx.err(`groupdel: cannot remove the primary group of user '${prim.name}'\n`); return 8; }
+    vfs.groups = vfs.groups.filter(x => x !== g);
+    vfs.syncAccountFiles();
+    return 0;
+  };
+
+  U.gpasswd = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, ['a', 'd'], []);
+    if (error) { ctx.err(`gpasswd: ${error}\n`); return 2; }
+    if (!root(ctx, 'gpasswd')) return 1;
+    const gname = operands[0];
+    const g = gname && vfs.groupByName(gname);
+    if (!g) { ctx.err(`gpasswd: group '${gname || ''}' does not exist\n`); return 3; }
+    if (opts.a != null) {
+      if (!vfs.userByName(opts.a)) { ctx.err(`gpasswd: user '${opts.a}' does not exist\n`); return 3; }
+      if (!g.members.includes(opts.a)) g.members.push(opts.a);
+      ctx.out(`Adding user ${opts.a} to group ${gname}\n`);
+    } else if (opts.d != null) {
+      if (!g.members.includes(opts.d)) { ctx.err(`gpasswd: user '${opts.d}' is not a member of '${gname}'\n`); return 3; }
+      g.members = g.members.filter(m => m !== opts.d);
+      ctx.out(`Removing user ${opts.d} from group ${gname}\n`);
+    } else { ctx.err('Usage: gpasswd (-a USER | -d USER) GROUP\n'); return 2; }
+    vfs.syncAccountFiles();
+    return 0;
+  };
+
+  U.passwd = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const flags = args.filter(a => a.startsWith('-'));
+    const target = args.find(a => !a.startsWith('-')) || ctx.sh.user.name;
+    const u = vfs.userByName(target);
+    if (!u) { ctx.err(`passwd: user '${target}' does not exist\n`); return 1; }
+    if (flags.includes('-S')) {
+      if (ctx.sh.user.uid !== 0 && target !== ctx.sh.user.name) { ctx.err(`passwd: You may not view or modify password information for ${target}.\n`); return 1; }
+      ctx.out(`${target} ${isLocked(vfs, target) ? 'L' : 'P'} 2026-10-14 0 99999 7 -1\n`); return 0;
+    }
+    if (ctx.sh.user.uid !== 0 && target !== ctx.sh.user.name) { ctx.err(`passwd: You may not view or modify password information for ${target}.\n`); return 1; }
+    if (flags.includes('-l') || flags.includes('-u')) {
+      if (ctx.sh.user.uid !== 0) { ctx.err('passwd: Permission denied.\n'); return 1; }
+      setLock(vfs, target, flags.includes('-l')); ctx.out('passwd: password expiry information changed.\n'); return 0;
+    }
+    ctx.err('(シミュレーター: パスワードの対話入力は省略され、変更は記録されません)\n');
+    ctx.out('passwd: password updated successfully\n');
+    return 0;
+  };
+
+  return U;
+}
+
+Object.assign(exports, { isLocked, makeUserAdminCommands });
+
+};
 __mods["js/env.js"] = function (module, exports, __require) {
 // ============================================================
 // ミッション環境ビルダー：ミッション定義(env)からVFS/シェルを構築する
@@ -4083,6 +4338,7 @@ const { VFS } = __require("js/vfs.js");
 const { Shell } = __require("js/shell.js");
 const { makeCommands } = __require("js/commands.js");
 const { makeNetCommands } = __require("js/netcommands.js");
+const { makeUserAdminCommands } = __require("js/useradmin.js");
 
 const DEFAULT_USERS = [
   { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash', gecos: 'root' },
@@ -4184,7 +4440,7 @@ function buildEnvironment(mission) {
 
   const commandsRef = {};
   const commands = makeCommands(() => commandsRef);
-  Object.assign(commands, makeNetCommands());
+  Object.assign(commands, makeNetCommands(), makeUserAdminCommands());
   Object.assign(commandsRef, commands);
 
   const net = buildNetwork(e.network, hostname);
@@ -4454,6 +4710,7 @@ __mods["js/checker.js"] = function (module, exports, __require) {
 // ミッション達成判定（宣言的）。実行履歴ではなく「結果の状態」で判定する。
 // ============================================================
 const { nodeSize } = __require("js/vfs.js");
+const { isLocked } = __require("js/useradmin.js");
 
 function norm(s) { return String(s == null ? '' : s).trim(); }
 
@@ -4532,6 +4789,28 @@ function evaluate(check, answer, runtime) {
       if (!s) return { ok: false, detail: `サービス ${check.name} が見つかりません` };
       if (check.active != null && s.active !== check.active) return { ok: false, detail: `サービス ${check.name} の状態が目標と違います` };
       if (check.enabled != null && s.enabled !== check.enabled) return { ok: false, detail: `サービス ${check.name} の自動起動設定が目標と違います` };
+      return { ok: true };
+    }
+    case 'user': {
+      // { type:'user', name, exists?, shell?, locked?, home?, inGroup?, notInGroup?, primaryGroup? }
+      const u = vfs.userByName(check.name);
+      if (check.exists === false) return u ? { ok: false, detail: `ユーザー ${check.name} がまだ存在します` } : { ok: true };
+      if (!u) return { ok: false, detail: `ユーザー ${check.name} が存在しません` };
+      if (check.shell != null && u.shell !== check.shell) return { ok: false, detail: `${check.name} のログインシェルが ${u.shell} です（目標 ${check.shell}）` };
+      if (check.home != null && u.home !== check.home) return { ok: false, detail: `${check.name} のホームが ${u.home} です（目標 ${check.home}）` };
+      if (check.primaryGroup != null && vfs.gname(u.gid) !== check.primaryGroup) return { ok: false, detail: `${check.name} の主グループが ${vfs.gname(u.gid)} です` };
+      if (check.locked != null && isLocked(vfs, check.name) !== check.locked) return { ok: false, detail: `${check.name} のロック状態が目標と違います` };
+      const groupsOf = vfs.gidsOf(u).map(g => vfs.gname(g));
+      if (check.inGroup != null && !groupsOf.includes(check.inGroup)) return { ok: false, detail: `${check.name} が ${check.inGroup} グループに所属していません` };
+      if (check.notInGroup != null && groupsOf.includes(check.notInGroup)) return { ok: false, detail: `${check.name} がまだ ${check.notInGroup} グループに所属しています` };
+      return { ok: true };
+    }
+    case 'group': {
+      const g = vfs.groupByName(check.name);
+      if (check.exists === false) return g ? { ok: false, detail: `グループ ${check.name} がまだ存在します` } : { ok: true };
+      if (!g) return { ok: false, detail: `グループ ${check.name} が存在しません` };
+      if (check.member != null && !g.members.includes(check.member)) return { ok: false, detail: `${check.member} が ${check.name} のメンバーではありません` };
+      if (check.notMember != null && g.members.includes(check.notMember)) return { ok: false, detail: `${check.notMember} がまだ ${check.name} のメンバーです` };
       return { ok: true };
     }
     case 'env': {
@@ -7949,6 +8228,125 @@ ERROR auth failed from 192.168.1.50
       ],
       review: { steps: ['ls -l で現状確認', 'sudo chown user で所有者変更', 'user:group で両方変更', '権限(chmod)と合わせて設計'], commands: [{ cmd: 'sudo chown webadmin /var/www/html/report.html', meaning: '所有者を変更' }, { cmd: 'sudo chown webadmin:webadmin ...', meaning: '所有者とグループを変更' }], why: '所有権設計はアクセス制御の半分。chmod(権限)とchown(所有)を組み合わせて初めて適切な制御になる。', practice: 'Webコンテンツの所有者をwww-dataに、共有ディレクトリをチームグループに、など日常運用。', related: ['chmod', 'ユーザー/グループ', '最小権限'] },
       learned: ['chown', 'chgrp', 'ownership', 'group-ownership'], solution: ['sudo chown webadmin /var/www/html/report.html', 'sudo chown webadmin:webadmin /var/www/html/report.html'],
+    },
+
+    {
+      id: 'l2-07-useradd',
+      title: '最小権限のサービスアカウントを作る',
+      minutes: 12,
+      objectives: ['useradd / groupadd / usermod でアカウントとグループを作る', 'ログイン不可のサービスアカウントを設計する', 'グループ権限で共有ディレクトリを制御する'],
+      prereq: ['l2-05-users', 'l2-06-chown'],
+      briefing: '夜間バッチが /srv/reports にレポートを出力する。専用のサービスアカウントを作って動かしたい。「誰でもログインできる便利なアカウント」ではなく、必要な権限だけを持つアカウントにするのが設計の要点だ。',
+      concepts: [{
+        title: 'アカウントとグループの管理',
+        why: 'サービスを root や共用アカウントで動かすと、侵害されたとき被害が一気に広がる。専用アカウントに最小限の権限だけを与えれば、被害を局所化できる。',
+        problem: '対話ログインは不要で、特定のディレクトリにだけ書き込めるアカウントを作りたい。',
+        how: 'useradd -m -s /usr/sbin/nologin 名前 でログイン不可(nologin)のアカウントを作る。groupadd でグループを作り、usermod -aG グループ 名前 で所属を追加（-a を忘れると既存の所属が消える）。共有ディレクトリは chown :グループ と chmod 770 で、そのグループだけが読み書きできるようにする。',
+        example: '$ sudo useradd -m -s /usr/sbin/nologin svc_report\n$ sudo groupadd reporters\n$ sudo usermod -aG reporters svc_report',
+        relation: 'サービスアカウントとグループを作り、共有ディレクトリをそのグループ専用にする。',
+      }],
+      env: {
+        hostname: 'batch-01', user: 'analyst', sudo: true,
+        users: [{ name: 'alice' }],
+        dirs: [{ path: '/srv/reports', mode: 0o755, owner: 'root', group: 'root' }],
+        files: [],
+      },
+      quick: ['id alice', 'cat /etc/group', 'sudo useradd -m -s /usr/sbin/nologin svc_report', 'sudo groupadd reporters', 'sudo usermod -aG reporters svc_report', 'sudo chown :reporters /srv/reports', 'sudo chmod 770 /srv/reports', 'ls -ld /srv/reports', 'id svc_report'],
+      tasks: [
+        {
+          q: 'レポート出力用のサービスアカウント svc_report を作成してください。対話ログインはできないよう、ログインシェルを /usr/sbin/nologin にします。作成できたら done。',
+          narration: 'アカウント作成は root 権限が必要なので sudo を付ける。-s でログインシェルを指定。-m はホームディレクトリも作るオプション。',
+          check: { type: 'user', name: 'svc_report', shell: '/usr/sbin/nologin' },
+          noInput: true,
+          hints: ['useradd にはログインシェルを指定する -s オプションがある', 'sudo useradd -m -s /usr/sbin/nologin svc_report', 'tail -1 /etc/passwd で最後の列が /usr/sbin/nologin になっているか確認'],
+          explain: 'nologin をシェルにしたアカウントは、対話ログイン(SSH/コンソール)ができない「サービス専用」アカウントになる。侵害されても攻撃者はこのアカウントでシェルを得られず、悪用の余地が狭まる。useradd は新規アカウントをロック(パスワード未設定)状態で作るので、パスワード認証で入られる心配もない。',
+        },
+        {
+          q: 'reporters グループを新規作成し、svc_report と alice の両方をそのグループのメンバーにしてください。どちらも既存の所属グループは消さないこと。完了したら done。',
+          narration: 'groupadd でグループを作り、usermod -aG で所属を追加する。-a (append) を付けないと、そのユーザーの他の補助グループが消えてしまうので注意。',
+          check: { type: 'all', of: [{ type: 'group', name: 'reporters', member: 'svc_report' }, { type: 'group', name: 'reporters', member: 'alice' }] },
+          noInput: true,
+          hints: ['まず groupadd でグループを作る', 'sudo groupadd reporters / sudo usermod -aG reporters svc_report と alice の両方', 'grep reporters /etc/group で2人のメンバーが並ぶか確認'],
+          explain: 'usermod -aG の -a は「追加」。付け忘れて -G だけで実行すると、指定したグループ以外の補助グループが全部外れる事故になる(例: sudo グループから外れて管理者権限を失う)。gpasswd -a ユーザー グループ でも同様に追加できる。権限は個人ではなくグループ単位で付与すると、人の入れ替わりに強い設計になる。',
+        },
+        {
+          q: '/srv/reports を reporters グループ専用にしてください。グループを reporters にし、所有者とグループには読み書き実行を許可、その他には一切許可しない(770)設定にします。完了したら done。',
+          narration: '所有権(chown)と権限(chmod)の組み合わせ。グループに権限を与え、無関係なユーザー(その他)には何も与えない、が最小権限の形。',
+          check: { type: 'all', of: [{ type: 'state', path: '/srv/reports', group: 'reporters' }, { type: 'state', path: '/srv/reports', mode: '770' }] },
+          noInput: true,
+          hints: ['グループの変更は chown :グループ(または chgrp)、権限は chmod', 'sudo chown :reporters /srv/reports と sudo chmod 770 /srv/reports', 'ls -ld /srv/reports が drwxrwx--- ... root reporters になっていれば成功'],
+          explain: '770 (rwxrwx---) は所有者とグループだけがアクセスでき、その他は完全に遮断される。これで reporters に属するアカウントだけが /srv/reports を使える。実運用では、新しいメンバーが必要になったら usermod -aG するだけでよく、ディレクトリ側の設定は変えずに済む。アカウント(誰が)・グループ(どの役割)・権限(何ができる)を分けて設計するのが基本。',
+        },
+      ],
+      review: {
+        steps: ['useradd -s /usr/sbin/nologin でサービスアカウント作成', 'groupadd でグループ作成', 'usermod -aG で所属を追加（-a を忘れない）', 'chown :グループ + chmod 770 で共有ディレクトリを制御'],
+        commands: [{ cmd: 'sudo useradd -m -s /usr/sbin/nologin svc_report', meaning: 'ログイン不可のサービスアカウントを作成' }, { cmd: 'sudo usermod -aG reporters svc_report', meaning: 'グループに追加（既存の所属は維持）' }, { cmd: 'sudo chmod 770 /srv/reports', meaning: '所有者とグループのみに許可' }],
+        why: 'アカウント管理は最小権限の実装そのもの。役割ごとにアカウントとグループを分けておくと、侵害時の被害を局所化でき、監査もしやすい。',
+        practice: 'バッチ・Webアプリ・バックアップなど、サービスごとの専用アカウント作成。共有ディレクトリのグループ権限設計。useradd -r でシステムアカウントを作る運用。',
+        related: ['最小権限', 'chmod/chown', 'sudoers', 'アカウント棚卸し'],
+      },
+      learned: ['useradd', 'usermod', 'groupadd', 'nologin', 'group-permission', 'least-privilege'],
+      solution: ['sudo useradd -m -s /usr/sbin/nologin svc_report', 'sudo groupadd reporters', 'sudo usermod -aG reporters svc_report', 'sudo usermod -aG reporters alice', 'sudo chown :reporters /srv/reports', 'sudo chmod 770 /srv/reports'],
+    },
+
+    {
+      id: 'l2-08-offboarding',
+      title: '退職者アカウントを無効化する',
+      minutes: 12,
+      objectives: ['アカウントのロックと権限剥奪を行う', '稼働中プロセスと鍵の後始末を行う', 'オフボーディングの手順を理解する'],
+      prereq: ['l2-07-useradd'],
+      briefing: '管理者の bob が退職した。アカウントを即座に使えなくしたいが、すぐ削除すると「誰が何をしたか」の証跡や所有ファイルの扱いに困る。まず無効化し、特権を外し、動いているものを止める——手順を踏んで安全に閉じる。',
+      concepts: [{
+        title: 'アカウントのオフボーディング',
+        why: '退職者や不要アカウントが残っていると、パスワードや鍵が漏れたときの侵入口になる。「消す」前に「使えなくする」手順を確実に実行する。',
+        problem: '退職者のアカウントを、証跡を残したまま、確実にログイン不能・権限なしにしたい。',
+        how: 'usermod -L(または passwd -l)でパスワードをロック。ただしロックはパスワード認証にしか効かないので、SSH公開鍵(authorized_keys)も無効化する。sudo グループから外す(gpasswd -d)。そのユーザーで動いているプロセスを止める(kill)。ファイルを引き継いだ後に userdel -r で削除。',
+        example: '$ sudo usermod -L bob\n$ sudo gpasswd -d bob sudo\n$ sudo kill 4321',
+        relation: 'bob のアカウントをロックし、特権を外し、動作中のプロセスを止め、鍵を無効化する。',
+      }],
+      env: {
+        hostname: 'srv-hr', user: 'analyst', sudo: true,
+        users: [{ name: 'bob', sudo: true }],
+        dirs: [{ path: '/home/bob/.ssh', mode: 0o700, owner: 'bob' }],
+        files: [{ path: '/home/bob/.ssh/authorized_keys', owner: 'bob', mode: 0o600, content: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI_bob_key bob@laptop\n' }],
+        processes: [{ pid: 5100, user: 'bob', cmd: 'sleep 99999', cpu: 0.0 }, { pid: 5101, user: 'bob', cmd: '/home/bob/sync.sh', cpu: 0.4 }],
+      },
+      quick: ['id bob', 'sudo passwd -S bob', 'ps aux', 'cat /home/bob/.ssh/authorized_keys', 'sudo usermod -L bob', 'sudo gpasswd -d bob sudo', 'sudo kill 5100', 'sudo rm /home/bob/.ssh/authorized_keys'],
+      tasks: [
+        {
+          q: 'まず bob のアカウントをロックしてください（パスワードでログインできなくする）。続けて、管理者権限を持つ sudo グループからも外してください。両方できたら done。',
+          narration: '「ロック」と「権限剥奪」は別の操作。ロックだけでは、すでに持っている管理者権限が残ってしまう(鍵認証や稼働中セッションなど別経路から使われうる)。両方行う。',
+          check: { type: 'user', name: 'bob', locked: true, notInGroup: 'sudo' },
+          noInput: true,
+          hints: ['ロックは usermod -L か passwd -l、グループから外すのは gpasswd -d', 'sudo usermod -L bob と sudo gpasswd -d bob sudo', 'sudo passwd -S bob が L(ロック)になり、id bob に sudo が無ければ成功'],
+          explain: 'usermod -L は shadow のパスワードハッシュ先頭に ! を付けて認証を拒否させる(元のハッシュは残るので、復帰時は -U で戻せる)。gpasswd -d で sudo グループから外すと管理者権限も失う。「ログインを止める」と「権限を剥ぐ」を別々に確実に行うのが要点。',
+        },
+        {
+          q: 'bob のプロセスがまだ動いています。ps aux で bob 所有のプロセスをすべて特定し、停止してください。すべて止まったら done。',
+          narration: 'アカウントをロックしても、すでに動いているプロセスは止まらない。ps aux で USER 列が bob の行を探してすべて kill する。',
+          check: { type: 'all', of: [{ type: 'process', absent: 'sleep 99999' }, { type: 'process', absent: '/home/bob/sync.sh' }] },
+          noInput: true,
+          hints: ['ps aux で USER が bob の行を探す', 'PID は 5100 と 5101。sudo kill で停止', 'ps aux で bob のプロセスが無くなったか確認'],
+          explain: 'ロックは新規ログインを止めるだけで、稼働中のプロセスは動き続ける。今回の /home/bob/sync.sh のようにバックグラウンドで走るスクリプトは、気づかないと退職後もデータを外部へ送り続けるかもしれない。アカウント停止の手順には「そのユーザーのプロセスをすべて止める」を必ず含める。',
+        },
+        {
+          q: 'パスワードをロックしても、SSH公開鍵認証では入れてしまいます。bob の authorized_keys を削除して、鍵でのログインも封じてください。削除できたら done。',
+          narration: 'SSHは公開鍵があればパスワード不要でログインできる。パスワードのロックでは防げない「裏口」を閉じる。',
+          check: { type: 'state', path: '/home/bob/.ssh/authorized_keys', exists: false },
+          noInput: true,
+          hints: ['authorized_keys は /home/bob/.ssh/ にある', 'sudo rm /home/bob/.ssh/authorized_keys', 'ls -la /home/bob/.ssh で消えたか確認'],
+          explain: 'パスワードロック(usermod -L)は、パスワード認証だけを止める。公開鍵認証は別経路なので、authorized_keys を消さなければ退職者が鍵で入れてしまう(SSH設定で UsePAM/PubkeyAuthentication の挙動にも依存する)。オフボーディングは「パスワード・鍵・権限・プロセス」の4点セットで確認する。最後に、ファイルの引き継ぎが済んでから userdel -r で削除する。',
+        },
+      ],
+      review: {
+        steps: ['usermod -L でパスワードをロック', 'gpasswd -d で sudo などの特権グループから外す', 'ps aux で bob のプロセスを特定して kill', 'authorized_keys を削除して鍵認証も封じる', '引き継ぎ後に userdel -r で削除'],
+        commands: [{ cmd: 'sudo usermod -L bob', meaning: 'パスワードをロック' }, { cmd: 'sudo gpasswd -d bob sudo', meaning: 'sudo グループから外す' }, { cmd: 'sudo kill 5100', meaning: '稼働中のプロセスを停止' }, { cmd: 'sudo rm /home/bob/.ssh/authorized_keys', meaning: 'SSH鍵を無効化' }],
+        why: '退職者アカウントの残存は典型的な侵入経路。ロック・権限・プロセス・鍵を漏れなく閉じることが、内部不正と乗っ取りの両方を防ぐ。',
+        practice: 'オフボーディング手順書、定期的なアカウント棚卸し(最終ログイン日の確認)、IdPでの一括無効化、SSH鍵のライフサイクル管理。',
+        related: ['アカウント棚卸し', 'authorized_keys', 'sudoers', '最小権限'],
+      },
+      learned: ['account-lock', 'offboarding', 'usermod-L', 'gpasswd', 'ssh-key-revocation'],
+      solution: ['sudo usermod -L bob', 'sudo gpasswd -d bob sudo', 'sudo kill 5100', 'sudo kill 5101', 'sudo rm /home/bob/.ssh/authorized_keys'],
     },
   ],
 };

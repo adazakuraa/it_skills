@@ -5,6 +5,7 @@ import { VFS } from './vfs.js';
 import { Shell } from './shell.js';
 import { makeCommands } from './commands.js';
 import { makeNetCommands } from './netcommands.js';
+import { makeUserAdminCommands } from './useradmin.js';
 
 const DEFAULT_USERS = [
   { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash', gecos: 'root' },
@@ -106,7 +107,7 @@ export function buildEnvironment(mission) {
 
   const commandsRef = {};
   const commands = makeCommands(() => commandsRef);
-  Object.assign(commands, makeNetCommands());
+  Object.assign(commands, makeNetCommands(), makeUserAdminCommands());
   Object.assign(commandsRef, commands);
 
   const net = buildNetwork(e.network, hostname);

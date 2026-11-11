@@ -267,6 +267,16 @@ export class VFS {
     return f;
   }
 
+  /** /etc/passwd と /etc/group を users/groups から再生成（アカウント操作後に呼ぶ） */
+  syncAccountFiles() {
+    let passwd = '';
+    for (const u of [...this.users].sort((a, b) => a.uid - b.uid)) passwd += `${u.name}:x:${u.uid}:${u.gid}:${u.gecos || ''}:${u.home}:${u.shell}\n`;
+    let group = '';
+    for (const g of [...this.groups].sort((a, b) => a.gid - b.gid)) group += `${g.name}:x:${g.gid}:${g.members.join(',')}\n`;
+    this.addFile('/etc/passwd', passwd, { mode: 0o644 });
+    this.addFile('/etc/group', group, { mode: 0o644 });
+  }
+
   // ---------- snapshot ----------
   serialize() {
     return { root: this.root, users: this.users, groups: this.groups, clock: this.clock };

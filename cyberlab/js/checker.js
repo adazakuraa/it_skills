@@ -2,6 +2,7 @@
 // ミッション達成判定（宣言的）。実行履歴ではなく「結果の状態」で判定する。
 // ============================================================
 import { nodeSize } from './vfs.js';
+import { isLocked } from './useradmin.js';
 
 function norm(s) { return String(s == null ? '' : s).trim(); }
 
@@ -80,6 +81,28 @@ export function evaluate(check, answer, runtime) {
       if (!s) return { ok: false, detail: `サービス ${check.name} が見つかりません` };
       if (check.active != null && s.active !== check.active) return { ok: false, detail: `サービス ${check.name} の状態が目標と違います` };
       if (check.enabled != null && s.enabled !== check.enabled) return { ok: false, detail: `サービス ${check.name} の自動起動設定が目標と違います` };
+      return { ok: true };
+    }
+    case 'user': {
+      // { type:'user', name, exists?, shell?, locked?, home?, inGroup?, notInGroup?, primaryGroup? }
+      const u = vfs.userByName(check.name);
+      if (check.exists === false) return u ? { ok: false, detail: `ユーザー ${check.name} がまだ存在します` } : { ok: true };
+      if (!u) return { ok: false, detail: `ユーザー ${check.name} が存在しません` };
+      if (check.shell != null && u.shell !== check.shell) return { ok: false, detail: `${check.name} のログインシェルが ${u.shell} です（目標 ${check.shell}）` };
+      if (check.home != null && u.home !== check.home) return { ok: false, detail: `${check.name} のホームが ${u.home} です（目標 ${check.home}）` };
+      if (check.primaryGroup != null && vfs.gname(u.gid) !== check.primaryGroup) return { ok: false, detail: `${check.name} の主グループが ${vfs.gname(u.gid)} です` };
+      if (check.locked != null && isLocked(vfs, check.name) !== check.locked) return { ok: false, detail: `${check.name} のロック状態が目標と違います` };
+      const groupsOf = vfs.gidsOf(u).map(g => vfs.gname(g));
+      if (check.inGroup != null && !groupsOf.includes(check.inGroup)) return { ok: false, detail: `${check.name} が ${check.inGroup} グループに所属していません` };
+      if (check.notInGroup != null && groupsOf.includes(check.notInGroup)) return { ok: false, detail: `${check.name} がまだ ${check.notInGroup} グループに所属しています` };
+      return { ok: true };
+    }
+    case 'group': {
+      const g = vfs.groupByName(check.name);
+      if (check.exists === false) return g ? { ok: false, detail: `グループ ${check.name} がまだ存在します` } : { ok: true };
+      if (!g) return { ok: false, detail: `グループ ${check.name} が存在しません` };
+      if (check.member != null && !g.members.includes(check.member)) return { ok: false, detail: `${check.member} が ${check.name} のメンバーではありません` };
+      if (check.notMember != null && g.members.includes(check.notMember)) return { ok: false, detail: `${check.notMember} がまだ ${check.name} のメンバーです` };
       return { ok: true };
     }
     case 'env': {

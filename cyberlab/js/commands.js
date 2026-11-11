@@ -587,17 +587,25 @@ export function makeCommands(getCmds) {
   C.su = (args, ctx) => { ctx.err('su: このシミュレーターではユーザー切り替えは sudo で再現しています\n'); return 1; };
 
   C.sudo = (args, ctx) => {
-    if (!args.length) { ctx.err('usage: sudo command\n'); return 1; }
+    if (!args.length) { ctx.err('usage: sudo [-u user] command\n'); return 1; }
     if (args[0] === '-l') { ctx.out(ctx.sh.sudoAllowed ? `User ${ctx.sh.user.name} may run the following commands:\n    (ALL : ALL) ALL\n` : `${ctx.sh.user.name} is not allowed to run sudo on ${ctx.sh.hostname}.\n`); return 0; }
+    let target = 'root', i = 0;
+    while (i < args.length && args[i].startsWith('-')) {
+      if (args[i] === '-u') { target = args[i + 1]; i += 2; }
+      else if (args[i] === '--') { i++; break; }
+      else { ctx.err(`sudo: invalid option -- '${args[i].replace(/^-+/, '')}'\n`); return 1; }
+    }
+    const cmd = args.slice(i);
+    if (!cmd.length) { ctx.err('usage: sudo [-u user] command\n'); return 1; }
     if (!ctx.sh.sudoAllowed) { ctx.err(`${ctx.sh.user.name} is not in the sudoers file. This incident will be reported.\n`); return 1; }
+    const asUser = ctx.sh.vfs.userByName(target) || (target === 'root' ? { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash' } : null);
+    if (!asUser) { ctx.err(`sudo: unknown user ${target}\n`); return 1; }
     const savedUser = ctx.sh.user;
-    const root = ctx.sh.vfs.userByName('root') || { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash' };
-    ctx.sh.user = root;
-    try { return ctx.sh.exec(args, ctx); }
+    ctx.sh.user = asUser;
+    try { return ctx.sh.exec(cmd, ctx); }
     finally { ctx.sh.user = savedUser; }
   };
 
-  C.passwd = (args, ctx) => { ctx.out('パスワード変更はこのシミュレーターでは省略されています。\n'); return 0; };
 
   // ---------------- プロセス・サービス ----------------
   C.ps = (args, ctx) => {
