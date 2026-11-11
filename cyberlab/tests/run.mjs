@@ -1,5 +1,6 @@
 // 自動テスト：コマンド挙動＋全ミッションが solution で解けるか
 import fs from 'fs';
+import vm from 'vm';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { buildEnvironment } from '../js/env.js';
@@ -314,6 +315,32 @@ function securityStaticTests() {
   }
 }
 
+
+// ---------- バンドルしたコードがソース直実行と同じ結果を返すか ----------
+// (循環参照・巻き上げなど、バンドル特有の不具合の検出。本番(index.html)はバンドルを読むため重要)
+function bundledEngineTests() {
+  const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  let api;
+  try { api = vm.runInNewContext(bundle(baseDir, { entry: 'js/env.js', expose: true }).code, {}); }
+  catch (e) { ok(false, `バンドルの評価に失敗: ${e.message}`); return; }
+  const env = { user: 't', sudo: true, files: [
+    { path: '/home/t/log.txt', owner: 't', content: '10.0.0.1 GET /a 200\n10.0.0.2 GET /login 401\nTODO fix\n' },
+    { path: '/home/t/c.pcap', owner: 't', content: '10:15:01.000100 IP 10.0.0.5.51234 > 10.0.0.9.80: Flags [S], seq 1, win 1, length 0\n' },
+  ] };
+  const direct = buildEnvironment({ env }).shell, bundled = api.buildEnvironment({ env }).shell;
+  const cmds = [
+    "awk '/login/' log.txt", "awk -F: '$3==0' /etc/passwd", "awk '{c[$1]++} END{for(k in c) print k, c[k]}' log.txt",
+    "sed -n '2p' log.txt", "sed -E 's/([0-9]+)\\.([0-9]+)/\\2.\\1/' log.txt", "grep -c 'login\\|TODO' log.txt", 'grep -A1 login log.txt',
+    'find . -name "*.txt" -o -name "*.pcap"', 'for f in a b; do echo $f; done', 'echo $((2*21)) $(whoami)', '[[ abc == a* ]] && echo m',
+    'sha256sum log.txt', 'echo -n password | md5sum', 'tcpdump -nr c.pcap port 80', 'sudo useradd -m x; id x', 'echo 666c6167 | xxd -r -p', 'jq -n 1',
+  ];
+  for (const c of cmds) {
+    const a = direct.run(c, { record: false }).map(x => x.text).join('');
+    const b = bundled.run(c, { record: false }).map(x => x.text).join('');
+    ok(a === b, `バンドル版とソース版で結果が違う: ${c} → bundle=${JSON.stringify(b.slice(0, 60))} / src=${JSON.stringify(a.slice(0, 60))}`);
+  }
+}
+
 // ---------- バンドルが最新か検証（node build.mjs の実行忘れを検出） ----------
 function bundleTests() {
   const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -328,6 +355,7 @@ engineTests();
 scriptTests();
 userAdminTests();
 securityStaticTests();
+bundledEngineTests();
 structureTests();
 missionTests();
 bundleTests();

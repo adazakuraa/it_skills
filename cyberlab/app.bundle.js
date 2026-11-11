@@ -1429,6 +1429,47 @@ const HASHERS = { md5, sha1, sha256 };
 Object.assign(exports, { md5, sha1, sha256, HASHERS });
 
 };
+__mods["js/regex.js"] = function (module, exports, __require) {
+// 依存のない葉モジュール（循環参照を避けるため commands.js から分離）
+// POSIX 正規表現(BRE/ERE) → JavaScript RegExp ソース変換。
+// BRE(既定): \| \( \) \{ \} \+ \? が特殊、素の | ( ) { } + ? はリテラル。ERE(-E): 逆。
+const POSIX_CLASS = { alpha: 'A-Za-z', digit: '0-9', alnum: 'A-Za-z0-9', upper: 'A-Z', lower: 'a-z', space: ' \\t\\n\\r\\f\\v', blank: ' \\t', punct: '!-\\/:-@\\[-`{-~', xdigit: '0-9A-Fa-f' };
+function posixToJs(pat, ere) {
+  let out = ''; let i = 0; let inBr = false;
+  const SPECIAL = '|(){}+?';
+  while (i < pat.length) {
+    const c = pat[i];
+    if (inBr) {
+      if (c === ']') { inBr = false; out += ']'; i++; continue; }
+      if (c === '[' && pat[i + 1] === ':') {
+        const end = pat.indexOf(':]', i + 2);
+        if (end > 0) { out += POSIX_CLASS[pat.slice(i + 2, end)] ?? ''; i = end + 2; continue; }
+      }
+      out += c === '\\' ? '\\\\' : c; i++; continue;
+    }
+    if (c === '[') {
+      inBr = true; out += '['; i++;
+      if (pat[i] === '^') { out += '^'; i++; }
+      if (pat[i] === ']') { out += '\\]'; i++; }
+      continue;
+    }
+    if (c === '\\') {
+      const n = pat[i + 1]; i += 2;
+      if (n === undefined) { out += '\\\\'; break; }
+      if (SPECIAL.includes(n)) { out += ere ? '\\' + n : n; continue; }
+      if (n === '<' || n === '>') { out += '\\b'; continue; }
+      out += '\\' + n; continue;
+    }
+    if (!ere && SPECIAL.includes(c)) { out += '\\' + c; i++; continue; }
+    out += c; i++;
+  }
+  return out;
+}
+
+
+Object.assign(exports, { posixToJs });
+
+};
 __mods["js/awk.js"] = function (module, exports, __require) {
 // ============================================================
 // 安全な AWK インタプリタ（eval / Function 不使用）。
@@ -1436,7 +1477,7 @@ __mods["js/awk.js"] = function (module, exports, __require) {
 //       print/printf, 正規表現, 主要な組み込み関数・変数。
 // 非対応(明示エラー): getline, system, パイプ/ファイルへの出力, ユーザー定義関数
 // ============================================================
-const { posixToJs } = __require("js/commands.js");
+const { posixToJs } = __require("js/regex.js");
 
 class AwkError extends Error {}
 
@@ -2103,7 +2144,7 @@ function runAwk({ program, inputs, vars, FS, out }) {
 
 
 
-Object.assign(exports, { AwkError, runAwk, parseProgram });
+Object.assign(exports, { AwkError, sprintf, runAwk, parseProgram });
 
 };
 __mods["js/sed.js"] = function (module, exports, __require) {
@@ -2114,7 +2155,7 @@ __mods["js/sed.js"] = function (module, exports, __require) {
 //       複数コマンド(; または改行、-e 複数)、BRE/ERE、後方参照 \1..\9 と &
 // 非対応(明示エラー): { } ブロック, ホールドスペース(h/g/x), n/N/D/P, w/r ファイル操作
 // ============================================================
-const { posixToJs } = __require("js/commands.js");
+const { posixToJs } = __require("js/regex.js");
 
 class SedError extends Error {}
 
@@ -2290,7 +2331,8 @@ const { FsError, ERRMSG, modeString, lsDate, isoDate, nodeSize } = __require("js
 const { escapeRe, LoopSignal } = __require("js/shell.js");
 const { MANPAGES } = __require("js/manpages.js");
 const { HASHERS } = __require("js/hash.js");
-const { runAwk, AwkError } = __require("js/awk.js");
+const { runAwk, AwkError, sprintf: awkSprintf } = __require("js/awk.js");
+const { posixToJs } = __require("js/regex.js");
 const { parseSed, runSedLines, SedError } = __require("js/sed.js");
 
 function fsMsg(e) { return e instanceof FsError ? (ERRMSG[e.code] || e.code) : String(e && e.message || e); }
@@ -2990,9 +3032,16 @@ function makeCommands(getCmds) {
     return 0;
   };
   C.printf = (args, ctx) => {
-    const fmt = args[0] || '';
-    let ai = 1;
-    const out = fmt.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/%[sd]/g, () => args[ai++] ?? '');
+    if (!args.length) { ctx.err('printf: usage: printf format [arguments]\n'); return 2; }
+    // フォーマット中のバックスラッシュエスケープ: \n \t \r \\ \" \a \b \f \v \e \NNN(8進) \xHH
+    const SIMPLE = { n: '\n', t: '\t', r: '\r', '\\': '\\', '"': '"', a: '\x07', b: '\b', f: '\f', v: '\v', e: '\x1b' };
+    const fmt = args[0].replace(/\\(?:([0-7]{1,3})|x([0-9a-fA-F]{1,2})|([\s\S]))/g, (m, o, h, c) => (o != null ? String.fromCharCode(parseInt(o, 8)) : h != null ? String.fromCharCode(parseInt(h, 16)) : (SIMPLE[c] ?? '\\' + c)));
+    const rest = args.slice(1);
+    const nconv = (fmt.match(/%[-+ #0]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[diouxXeEfFgGcs%]/g) || []).filter(m => m !== '%%').length;
+    // 引数が余ればフォーマットを繰り返し適用する（bash の printf と同じ）
+    let out = '';
+    if (!nconv) out = awkSprintf(fmt, []);
+    else { let idx = 0; do { out += awkSprintf(fmt, rest.slice(idx, idx + nconv)); idx += nconv; } while (idx < rest.length); }
     ctx.out(out);
     return 0;
   };
@@ -3539,6 +3588,49 @@ function makeCommands(getCmds) {
   C['break'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("break: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('break'); };
   C['continue'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("continue: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('continue'); };
 
+  C.strings = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { n: 'val', a: 'bool' });
+    const min = opts.n != null ? parseInt(opts.n, 10) : 4;
+    if (!(min > 0)) { ctx.err('strings: invalid minimum string length\n'); return 1; }
+    const srcs = operands.length ? operands : ['-'];
+    let code = 0;
+    for (const p of srcs) {
+      const data = p === '-' ? ctx.stdin : safeRead(ctx, p, 'strings');
+      if (data == null) { code = 1; continue; }
+      for (const m of data.split(/[^\x20-\x7e\t]+/)) if (m.length >= min) ctx.out(m + '\n');
+    }
+    return code;
+  };
+
+  C.xxd = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { r: 'bool', p: 'bool', l: 'val', c: 'val' });
+    const src = operands[0];
+    const data = src && src !== '-' ? safeRead(ctx, src, 'xxd') : ctx.stdin;
+    if (data == null) return 1;
+    // -r -p: プレーン16進(空白・改行は無視) → バイト列に戻す
+    if (opts.r) {
+      const hexstr = data.replace(/[^0-9a-fA-F]/g, '');
+      if (hexstr.length % 2) { ctx.err('xxd: 16進数の桁数が奇数です\n'); return 1; }
+      const bytes = hexstr.match(/../g) || [];
+      let out = '';
+      for (const b of bytes) out += String.fromCharCode(parseInt(b, 16));
+      try { out = decodeURIComponent(escape(out)); } catch { /* バイナリのまま */ }
+      ctx.out(out);
+      return 0;
+    }
+    const bytes = [];
+    for (const ch of data) { const c = ch.codePointAt(0); if (c < 0x80) bytes.push(c); else for (const b of unescape(encodeURIComponent(ch))) bytes.push(b.charCodeAt(0)); }
+    if (opts.p) { ctx.out((bytes.map(b => b.toString(16).padStart(2, '0')).join('').match(/.{1,60}/g) || []).join('\n') + '\n'); return 0; }
+    const w = opts.c ? parseInt(opts.c, 10) : 16;
+    for (let off = 0; off < bytes.length; off += w) {
+      const chunk = bytes.slice(off, off + w);
+      const hex = [];
+      for (let i = 0; i < w; i += 2) hex.push((chunk[i] !== undefined ? chunk[i].toString(16).padStart(2, '0') : '  ') + (chunk[i + 1] !== undefined ? chunk[i + 1].toString(16).padStart(2, '0') : '  '));
+      ctx.out(`${off.toString(16).padStart(8, '0')}: ${hex.join(' ')}  ${chunk.map(b => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.')).join('')}\n`);
+    }
+    return 0;
+  };
+
   C.bash = (args, ctx) => {
     // bash script.sh [args...] / bash -c 'command'。同じ安全なパーサーで解釈する（実シェルは使わない）
     let i = 0; let cmdStr = null;
@@ -3580,41 +3672,6 @@ function makeCommands(getCmds) {
   return C;
 }
 
-
-// POSIX 正規表現(BRE/ERE) → JavaScript RegExp ソース変換。
-// BRE(既定): \| \( \) \{ \} \+ \? が特殊、素の | ( ) { } + ? はリテラル。ERE(-E): 逆。
-const POSIX_CLASS = { alpha: 'A-Za-z', digit: '0-9', alnum: 'A-Za-z0-9', upper: 'A-Z', lower: 'a-z', space: ' \\t\\n\\r\\f\\v', blank: ' \\t', punct: '!-\\/:-@\\[-`{-~', xdigit: '0-9A-Fa-f' };
-function posixToJs(pat, ere) {
-  let out = ''; let i = 0; let inBr = false;
-  const SPECIAL = '|(){}+?';
-  while (i < pat.length) {
-    const c = pat[i];
-    if (inBr) {
-      if (c === ']') { inBr = false; out += ']'; i++; continue; }
-      if (c === '[' && pat[i + 1] === ':') {
-        const end = pat.indexOf(':]', i + 2);
-        if (end > 0) { out += POSIX_CLASS[pat.slice(i + 2, end)] ?? ''; i = end + 2; continue; }
-      }
-      out += c === '\\' ? '\\\\' : c; i++; continue;
-    }
-    if (c === '[') {
-      inBr = true; out += '['; i++;
-      if (pat[i] === '^') { out += '^'; i++; }
-      if (pat[i] === ']') { out += '\\]'; i++; }
-      continue;
-    }
-    if (c === '\\') {
-      const n = pat[i + 1]; i += 2;
-      if (n === undefined) { out += '\\\\'; break; }
-      if (SPECIAL.includes(n)) { out += ere ? '\\' + n : n; continue; }
-      if (n === '<' || n === '>') { out += '\\b'; continue; }
-      out += '\\' + n; continue;
-    }
-    if (!ere && SPECIAL.includes(c)) { out += '\\' + c; i++; continue; }
-    out += c; i++;
-  }
-  return out;
-}
 
 // ---------- jq (簡易版) ----------
 // 対応: . / .key / .a.b / .[] / .key[] / .key[0] / .["k"] / | / keys / length
@@ -3785,7 +3842,7 @@ function b64decode(str) {
 }
 
 
-Object.assign(exports, { makeCommands, posixToJs, OptError, b64encode });
+Object.assign(exports, { makeCommands, OptError, b64encode });
 
 };
 __mods["js/netcommands.js"] = function (module, exports, __require) {
@@ -4330,6 +4387,131 @@ function makeUserAdminCommands() {
 Object.assign(exports, { isLocked, makeUserAdminCommands });
 
 };
+__mods["js/tcpdump.js"] = function (module, exports, __require) {
+// ============================================================
+// tcpdump（キャプチャファイル読み取り版）。実際のパケット取得は行わない。
+// キャプチャファイルは tcpdump 出力形式のテキスト:
+//   HH:MM:SS.ffffff IP 送信元.ポート > 宛先.ポート: 詳細
+//   <TAB>ペイロード行（-A のときだけ表示）
+// フィルタは BPF の一部: host/src host/dst host/port/src port/dst port/tcp/udp/icmp/ip と and/or/not/( )
+// ============================================================
+
+const HEADER_RE = /^(\d{2}:\d{2}:\d{2}\.\d+) IP (\S+) > (\S+?): (.*)$/;
+const ADDR_RE = /^((?:\d+\.){3}\d+)(?:\.(\d+))?$/;
+
+function parsePackets(text) {
+  const pkts = [];
+  for (const line of text.split('\n')) {
+    if (line.startsWith('\t')) { if (pkts.length) pkts[pkts.length - 1].payload.push(line.slice(1)); continue; }
+    if (!line.trim()) continue;
+    const m = line.match(HEADER_RE);
+    if (!m) continue;
+    const s = m[2].match(ADDR_RE), d = m[3].match(ADDR_RE);
+    if (!s || !d) continue;
+    const det = m[4];
+    pkts.push({
+      raw: line, time: m[1], detail: det, payload: [],
+      src: { ip: s[1], port: s[2] ? Number(s[2]) : null }, dst: { ip: d[1], port: d[2] ? Number(d[2]) : null },
+      proto: det.startsWith('Flags [') ? 'tcp' : /^ICMP/.test(det) ? 'icmp' : 'udp',
+    });
+  }
+  return pkts;
+}
+
+// ---- フィルタ式 ----
+function compileFilter(expr) {
+  const toks = expr.match(/\(|\)|&&|\|\||!|[^\s()]+/g) || [];
+  let pos = 0;
+  const fail = (m) => { throw new Error(`syntax error in filter expression: ${m}`); };
+  const peek = () => toks[pos];
+  const num = (t) => { if (!/^\d+$/.test(t || '')) fail(`数値が必要です (${t ?? '末尾'})`); return Number(t); };
+  const parseOr = () => { let l = parseAnd(); while (peek() === 'or' || peek() === '||') { pos++; const r = parseAnd(); const a = l; l = (p) => a(p) || r(p); } return l; };
+  const parseAnd = () => {
+    let l = parseNot();
+    while (peek() === 'and' || peek() === '&&') { pos++; const r = parseNot(); const a = l; l = (p) => a(p) && r(p); }
+    return l;
+  };
+  const parseNot = () => { if (peek() === 'not' || peek() === '!') { pos++; const i = parseNot(); return (p) => !i(p); } return primary(); };
+  const primary = () => {
+    const t = toks[pos++];
+    if (t === undefined) fail('式が途中で終わっています');
+    if (t === '(') { const v = parseOr(); if (toks[pos++] !== ')') fail("')' が必要です"); return v; }
+    if (t === 'tcp' || t === 'udp' || t === 'icmp') return (p) => p.proto === t;
+    if (t === 'ip') return () => true;
+    let dir = null;
+    let k = t;
+    if (k === 'src' || k === 'dst') { dir = k; k = toks[pos++]; }
+    if (k === 'host') { const h = toks[pos++]; if (!h) fail('host の後にアドレスが必要です'); return (p) => (dir === 'src' ? p.src.ip === h : dir === 'dst' ? p.dst.ip === h : p.src.ip === h || p.dst.ip === h); }
+    if (k === 'port') { const n = num(toks[pos++]); return (p) => (dir === 'src' ? p.src.port === n : dir === 'dst' ? p.dst.port === n : p.src.port === n || p.dst.port === n); }
+    fail(`未対応の条件 '${t}'`);
+  };
+  const f = parseOr();
+  if (pos < toks.length) fail(`余分なトークン '${toks[pos]}'`);
+  return f;
+}
+
+function makeTcpdump() {
+  const T = {};
+  T.tcpdump = (args, ctx) => {
+    const sh = ctx.sh, vfs = sh.vfs;
+    let file = null, outFile = null, count = Infinity, ascii = false, noTime = false, iface = null;
+    const rest = [];
+    const BOOL = 'nvAqtXeSlpU', VAL = 'rwcis';
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a.length > 1 && a[0] === '-' && !/^-\d/.test(a)) {
+        // getopt 風: -nr FILE / -nAr / -c10 / -vv などの結合フラグ
+        for (let j = 1; j < a.length; j++) {
+          const f = a[j];
+          if (BOOL.includes(f)) { if (f === 'A') ascii = true; if (f === 't') noTime = true; continue; }
+          if (VAL.includes(f)) {
+            const v = a.length > j + 1 ? a.slice(j + 1) : args[++i];
+            if (v == null) { ctx.err(`tcpdump: option requires an argument -- '${f}'\n`); return 1; }
+            if (f === 'r') file = v; else if (f === 'w') outFile = v; else if (f === 'i') iface = v;
+            else if (f === 'c') { count = parseInt(v, 10); if (!(count > 0)) { ctx.err(`tcpdump: invalid packet count ${v}\n`); return 1; } }
+            break;
+          }
+          ctx.err(`tcpdump: invalid option -- '${f}'\nTry 'man tcpdump' for more information.\n`); return 1;
+        }
+      } else rest.push(a);
+    }
+    if (!file) {
+      if (sh.user.uid !== 0) { ctx.err(`tcpdump: ${iface || 'eth0'}: You don't have permission to perform this capture on that device\n(socket: Operation not permitted)\n`); return 1; }
+      ctx.err('tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\n');
+      ctx.err(`listening on ${iface || 'eth0'}, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n`);
+      ctx.err('(シミュレーター: 仮想NICには実トラフィックがありません。キャプチャファイルは -r で読んでください)\n');
+      ctx.out('0 packets captured\n');
+      return 0;
+    }
+    let text;
+    try { text = vfs.readFile(file, sh.cwd, sh.user); }
+    catch (e) { ctx.err(`tcpdump: ${file}: ${e.code === 'EACCES' ? 'Permission denied' : 'No such file or directory'}\n`); return 1; }
+    let pred;
+    try { pred = rest.length ? compileFilter(rest.join(' ')) : () => true; }
+    catch (e) { ctx.err(`tcpdump: ${e.message}\n`); return 1; }
+    ctx.err(`reading from file ${file}, link-type EN10MB (Ethernet), snapshot length 262144\n`);
+    let n = 0; const saved = [];
+    for (const p of parsePackets(text)) {
+      if (!pred(p)) continue;
+      if (n >= count) break;
+      n++;
+      if (outFile) { saved.push(p.raw, ...p.payload.map(l => '\t' + l)); continue; }
+      ctx.out((noTime ? p.raw.replace(/^\S+ /, '') : p.raw) + '\n');
+      if (ascii) for (const l of p.payload) ctx.out(l + '\n');
+    }
+    if (outFile) {
+      try { vfs.writeFile(outFile, sh.cwd, sh.user, saved.length ? saved.join('\n') + '\n' : ''); }
+      catch (e) { ctx.err(`tcpdump: ${outFile}: ${e.code === 'EACCES' ? 'Permission denied' : 'cannot write'}\n`); return 1; }
+      ctx.err(`${n} packets captured\n`);
+    }
+    return 0;
+  };
+  return T;
+}
+
+Object.assign(exports, { parsePackets, makeTcpdump });
+
+};
 __mods["js/env.js"] = function (module, exports, __require) {
 // ============================================================
 // ミッション環境ビルダー：ミッション定義(env)からVFS/シェルを構築する
@@ -4339,6 +4521,7 @@ const { Shell } = __require("js/shell.js");
 const { makeCommands } = __require("js/commands.js");
 const { makeNetCommands } = __require("js/netcommands.js");
 const { makeUserAdminCommands } = __require("js/useradmin.js");
+const { makeTcpdump } = __require("js/tcpdump.js");
 
 const DEFAULT_USERS = [
   { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash', gecos: 'root' },
@@ -4440,7 +4623,7 @@ function buildEnvironment(mission) {
 
   const commandsRef = {};
   const commands = makeCommands(() => commandsRef);
-  Object.assign(commands, makeNetCommands(), makeUserAdminCommands());
+  Object.assign(commands, makeNetCommands(), makeUserAdminCommands(), makeTcpdump());
   Object.assign(commandsRef, commands);
 
   const net = buildNetwork(e.network, hostname);

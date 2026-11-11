@@ -4,7 +4,7 @@
 //       print/printf, 正規表現, 主要な組み込み関数・変数。
 // 非対応(明示エラー): getline, system, パイプ/ファイルへの出力, ユーザー定義関数
 // ============================================================
-import { posixToJs } from './commands.js';
+import { posixToJs } from './regex.js';
 
 export class AwkError extends Error {}
 
@@ -388,7 +388,7 @@ function fmtOne(flags, width, prec, conv, arg) {
   }
   return s;
 }
-function sprintf(fmt, args) {
+export function sprintf(fmt, args) {
   let ai = 0;
   return fmt.replace(/%([-+ #0]*)(\*|\d+)?(?:\.(\*|\d+))?([diouxXeEfFgGcs%])/g, (m, flags, w, pr, conv) => {
     if (conv === '%') return '%';

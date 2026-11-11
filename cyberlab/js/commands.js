@@ -7,7 +7,8 @@ import { FsError, ERRMSG, modeString, lsDate, isoDate, nodeSize } from './vfs.js
 import { escapeRe, LoopSignal } from './shell.js';
 import { MANPAGES } from './manpages.js';
 import { HASHERS } from './hash.js';
-import { runAwk, AwkError } from './awk.js';
+import { runAwk, AwkError, sprintf as awkSprintf } from './awk.js';
+import { posixToJs } from './regex.js';
 import { parseSed, runSedLines, SedError } from './sed.js';
 
 function fsMsg(e) { return e instanceof FsError ? (ERRMSG[e.code] || e.code) : String(e && e.message || e); }
@@ -707,9 +708,16 @@ export function makeCommands(getCmds) {
     return 0;
   };
   C.printf = (args, ctx) => {
-    const fmt = args[0] || '';
-    let ai = 1;
-    const out = fmt.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/%[sd]/g, () => args[ai++] ?? '');
+    if (!args.length) { ctx.err('printf: usage: printf format [arguments]\n'); return 2; }
+    // フォーマット中のバックスラッシュエスケープ: \n \t \r \\ \" \a \b \f \v \e \NNN(8進) \xHH
+    const SIMPLE = { n: '\n', t: '\t', r: '\r', '\\': '\\', '"': '"', a: '\x07', b: '\b', f: '\f', v: '\v', e: '\x1b' };
+    const fmt = args[0].replace(/\\(?:([0-7]{1,3})|x([0-9a-fA-F]{1,2})|([\s\S]))/g, (m, o, h, c) => (o != null ? String.fromCharCode(parseInt(o, 8)) : h != null ? String.fromCharCode(parseInt(h, 16)) : (SIMPLE[c] ?? '\\' + c)));
+    const rest = args.slice(1);
+    const nconv = (fmt.match(/%[-+ #0]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[diouxXeEfFgGcs%]/g) || []).filter(m => m !== '%%').length;
+    // 引数が余ればフォーマットを繰り返し適用する（bash の printf と同じ）
+    let out = '';
+    if (!nconv) out = awkSprintf(fmt, []);
+    else { let idx = 0; do { out += awkSprintf(fmt, rest.slice(idx, idx + nconv)); idx += nconv; } while (idx < rest.length); }
     ctx.out(out);
     return 0;
   };
@@ -1256,6 +1264,49 @@ export function makeCommands(getCmds) {
   C['break'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("break: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('break'); };
   C['continue'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("continue: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('continue'); };
 
+  C.strings = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { n: 'val', a: 'bool' });
+    const min = opts.n != null ? parseInt(opts.n, 10) : 4;
+    if (!(min > 0)) { ctx.err('strings: invalid minimum string length\n'); return 1; }
+    const srcs = operands.length ? operands : ['-'];
+    let code = 0;
+    for (const p of srcs) {
+      const data = p === '-' ? ctx.stdin : safeRead(ctx, p, 'strings');
+      if (data == null) { code = 1; continue; }
+      for (const m of data.split(/[^\x20-\x7e\t]+/)) if (m.length >= min) ctx.out(m + '\n');
+    }
+    return code;
+  };
+
+  C.xxd = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { r: 'bool', p: 'bool', l: 'val', c: 'val' });
+    const src = operands[0];
+    const data = src && src !== '-' ? safeRead(ctx, src, 'xxd') : ctx.stdin;
+    if (data == null) return 1;
+    // -r -p: プレーン16進(空白・改行は無視) → バイト列に戻す
+    if (opts.r) {
+      const hexstr = data.replace(/[^0-9a-fA-F]/g, '');
+      if (hexstr.length % 2) { ctx.err('xxd: 16進数の桁数が奇数です\n'); return 1; }
+      const bytes = hexstr.match(/../g) || [];
+      let out = '';
+      for (const b of bytes) out += String.fromCharCode(parseInt(b, 16));
+      try { out = decodeURIComponent(escape(out)); } catch { /* バイナリのまま */ }
+      ctx.out(out);
+      return 0;
+    }
+    const bytes = [];
+    for (const ch of data) { const c = ch.codePointAt(0); if (c < 0x80) bytes.push(c); else for (const b of unescape(encodeURIComponent(ch))) bytes.push(b.charCodeAt(0)); }
+    if (opts.p) { ctx.out((bytes.map(b => b.toString(16).padStart(2, '0')).join('').match(/.{1,60}/g) || []).join('\n') + '\n'); return 0; }
+    const w = opts.c ? parseInt(opts.c, 10) : 16;
+    for (let off = 0; off < bytes.length; off += w) {
+      const chunk = bytes.slice(off, off + w);
+      const hex = [];
+      for (let i = 0; i < w; i += 2) hex.push((chunk[i] !== undefined ? chunk[i].toString(16).padStart(2, '0') : '  ') + (chunk[i + 1] !== undefined ? chunk[i + 1].toString(16).padStart(2, '0') : '  '));
+      ctx.out(`${off.toString(16).padStart(8, '0')}: ${hex.join(' ')}  ${chunk.map(b => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.')).join('')}\n`);
+    }
+    return 0;
+  };
+
   C.bash = (args, ctx) => {
     // bash script.sh [args...] / bash -c 'command'。同じ安全なパーサーで解釈する（実シェルは使わない）
     let i = 0; let cmdStr = null;
@@ -1297,41 +1348,6 @@ export function makeCommands(getCmds) {
   return C;
 }
 
-
-// POSIX 正規表現(BRE/ERE) → JavaScript RegExp ソース変換。
-// BRE(既定): \| \( \) \{ \} \+ \? が特殊、素の | ( ) { } + ? はリテラル。ERE(-E): 逆。
-const POSIX_CLASS = { alpha: 'A-Za-z', digit: '0-9', alnum: 'A-Za-z0-9', upper: 'A-Z', lower: 'a-z', space: ' \\t\\n\\r\\f\\v', blank: ' \\t', punct: '!-\\/:-@\\[-`{-~', xdigit: '0-9A-Fa-f' };
-export function posixToJs(pat, ere) {
-  let out = ''; let i = 0; let inBr = false;
-  const SPECIAL = '|(){}+?';
-  while (i < pat.length) {
-    const c = pat[i];
-    if (inBr) {
-      if (c === ']') { inBr = false; out += ']'; i++; continue; }
-      if (c === '[' && pat[i + 1] === ':') {
-        const end = pat.indexOf(':]', i + 2);
-        if (end > 0) { out += POSIX_CLASS[pat.slice(i + 2, end)] ?? ''; i = end + 2; continue; }
-      }
-      out += c === '\\' ? '\\\\' : c; i++; continue;
-    }
-    if (c === '[') {
-      inBr = true; out += '['; i++;
-      if (pat[i] === '^') { out += '^'; i++; }
-      if (pat[i] === ']') { out += '\\]'; i++; }
-      continue;
-    }
-    if (c === '\\') {
-      const n = pat[i + 1]; i += 2;
-      if (n === undefined) { out += '\\\\'; break; }
-      if (SPECIAL.includes(n)) { out += ere ? '\\' + n : n; continue; }
-      if (n === '<' || n === '>') { out += '\\b'; continue; }
-      out += '\\' + n; continue;
-    }
-    if (!ere && SPECIAL.includes(c)) { out += '\\' + c; i++; continue; }
-    out += c; i++;
-  }
-  return out;
-}
 
 // ---------- jq (簡易版) ----------
 // 対応: . / .key / .a.b / .[] / .key[] / .key[0] / .["k"] / | / keys / length

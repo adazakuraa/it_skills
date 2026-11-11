@@ -5,7 +5,7 @@
 //       複数コマンド(; または改行、-e 複数)、BRE/ERE、後方参照 \1..\9 と &
 // 非対応(明示エラー): { } ブロック, ホールドスペース(h/g/x), n/N/D/P, w/r ファイル操作
 // ============================================================
-import { posixToJs } from './commands.js';
+import { posixToJs } from './regex.js';
 
 export class SedError extends Error {}
 
