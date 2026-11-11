@@ -1,5 +1,6 @@
 // 自動テスト：コマンド挙動＋全ミッションが solution で解けるか
 import fs from 'fs';
+import vm from 'vm';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { buildEnvironment } from '../js/env.js';
@@ -121,9 +122,9 @@ function cmdTests() {
   s = freshShell(env);
   ok(sh(s, 'cat /data/private 2>/dev/null') === '', 'stderr to /dev/null discards error');
 
-  // command substitution should error gracefully, not eval
+  // コマンド置換は自前パーサーで安全に実行される（eval ではない）
   s = freshShell(env);
-  ok(shErr(s, 'echo $(whoami)').includes('未対応'), 'command substitution rejected (no eval)');
+  ok(sh(s, 'echo $(whoami)') === 'tester\n', 'command substitution runs in the sandboxed shell');
 
   // unknown command
   ok(shErr(s, 'frobnicate').includes('command not found'), 'unknown command');
@@ -182,6 +183,164 @@ function structureTests() {
   }
 }
 
+
+// ---------- エンジン(awk/sed/grep/find/head)の回帰テスト ----------
+function engineTests() {
+  const env = { user: 't', files: [
+    { path: '/home/t/log.txt', owner: 't', content: '10.0.0.1 GET /a 200 120\n10.0.0.2 GET /b 404 0\n10.0.0.1 POST /login 401 15\n10.0.0.3 GET /a 200 300\n10.0.0.1 POST /login 401 15\n' },
+    { path: '/home/t/c.ini', owner: 't', content: '# comment\ndebug=true\nhost=localhost\nport=8080\n\n# end\nname=app\n' },
+    { path: '/home/t/m.txt', owner: 't', content: 'alpha 1\nTODO fix\nbeta 2\nINTERNAL x\ngamma 3\ndelta 4\nTODO again\n' },
+    { path: '/home/t/d/a.log', owner: 't', content: 'x\n' }, { path: '/home/t/d/b.txt', owner: 't', content: 'y\n' }, { path: '/home/t/d/c.conf', owner: 't', content: 'z\n' },
+  ] };
+  const { shell: s } = buildEnvironment({ env });
+  const run = (l) => s.run(l).map(c => (c.fd === 2 ? '[E]' : '') + c.text).join('');
+  run('cd /home/t');
+  const eq = (name, cmd, want) => { const got = run(cmd); ok(got === want, `${name}: ${cmd} → ${JSON.stringify(got)} (期待 ${JSON.stringify(want)})`); };
+
+  // awk: 条件のみ・条件+アクション（条件を無視して全行出力していた旧バグの回帰）
+  eq('awk cond', "awk '$4==401' log.txt", '10.0.0.1 POST /login 401 15\n10.0.0.1 POST /login 401 15\n');
+  eq('awk cond+print', "awk '$4>=400 {print $1, $3}' log.txt", '10.0.0.2 /b\n10.0.0.1 /login\n10.0.0.1 /login\n');
+  eq('awk passwd uid0', "awk -F: '$3==0' /etc/passwd", 'root:x:0:0:root:/root:/bin/bash\n');
+  eq('awk str cmp', "awk -F: '$7==\"/bin/bash\" {print $1}' /etc/passwd | head -1", 'root\n');
+  eq('awk array', "awk '{c[$1]++} END{for(k in c) print k, c[k]}' log.txt", '10.0.0.1 3\n10.0.0.2 1\n10.0.0.3 1\n');
+  eq('awk sum', "awk '{s+=$5} END{print s}' log.txt", '450\n');
+  eq('awk printf', "awk '{s+=$5;n++} END{printf \"%.2f\\n\", s/n}' log.txt", '90.00\n');
+  eq('awk range', "awk 'NR==2,NR==3{print NR\":\"$3}' log.txt", '2:/b\n3:/login\n');
+  eq('awk -v', "awk -v t=400 '$4>=t{n++} END{print n}' log.txt", '3\n');
+  eq('awk BEGIN', "awk 'BEGIN{print 1+2*3, 7%4, 2^10}'", '7 3 1024\n');
+  eq('awk gsub', "echo 'a.b.c' | awk '{gsub(/\\./,\"-\"); print}'", 'a-b-c\n');
+  ok(run("awk '{print $1'").startsWith('[E]awk: syntax error'), 'awk 構文エラーを報告する');
+  ok(run("awk 'BEGIN{system(\"id\")}'").includes('未対応'), 'awk system() は拒否される');
+  // sed
+  eq('sed s', "sed 's/true/false/' c.ini | sed -n 2p", 'debug=false\n');
+  eq('sed backref', "echo 'john smith' | sed -E 's/(\\w+) (\\w+)/\\2, \\1/'", 'smith, john\n');
+  eq('sed multi', "echo hi | sed 's/^/> /; s/$/ </'", '> hi <\n');
+  eq('sed BRE alt', "echo 'cat dog' | sed 's/cat\\|dog/X/g'", 'X X\n');
+  eq('sed range', "sed -n '2,4p' c.ini", 'debug=true\nhost=localhost\nport=8080\n');
+  eq('sed $d', "sed '$d' c.ini | tail -1", '# end\n');
+  eq('sed -e x2', "sed -e 's/true/1/' -e 's/localhost/127.0.0.1/' c.ini | sed -n '2,3p'", 'debug=1\nhost=127.0.0.1\n');
+  eq('sed nth', "echo aaa | sed 's/a/b/2'", 'aba\n');
+  eq('sed -i.bak', "sed -i.bak 's/8080/9090/' c.ini; grep port c.ini", 'port=9090\n');
+  // grep
+  eq('grep BRE |', "grep -i 'todo\\|internal' m.txt", 'TODO fix\nINTERNAL x\nTODO again\n');
+  eq('grep ERE', "grep -E 'TODO|beta' m.txt", 'TODO fix\nbeta 2\nTODO again\n');
+  eq('grep -A', 'grep -A1 TODO m.txt', 'TODO fix\nbeta 2\n--\nTODO again\n');
+  eq('grep -n -C', 'grep -n -C1 beta m.txt', '2-TODO fix\n3:beta 2\n4-INTERNAL x\n');
+  eq('grep posix', 'grep -c "[[:digit:]]" m.txt', '4\n');
+  // find
+  eq('find rel', 'cd d; find . -type f', './a.log\n./b.txt\n./c.conf\n');
+  eq('find -o', 'find . -name "*.log" -o -name "*.txt"', './a.log\n./b.txt\n');
+  eq('find !', 'find . -type f ! -name "*.log"', './b.txt\n./c.conf\n');
+  eq('find paren', 'find . -type f \\( -name "*.log" -o -name "*.conf" \\)', './a.log\n./c.conf\n');
+  eq('find -exec', 'find . -name "*.txt" -exec cat {} \\;', 'y\n');
+  ok(run('find . -bogus').startsWith('[E]find: unknown predicate'), 'find 不明述語はエラー');
+  // head/tail 旧式
+  eq('head -N', 'cd /home/t; head -3 m.txt', 'alpha 1\nTODO fix\nbeta 2\n');
+  eq('tail -N', 'tail -2 m.txt', 'delta 4\nTODO again\n');
+  ok(run('ls --bogus').includes("Try 'man ls'"), '不明オプションは GNU 形式のエラー');
+}
+
+
+
+// ---------- ユーザー・グループ管理の回帰テスト ----------
+function userAdminTests() {
+  const { shell: s } = buildEnvironment({ env: { user: 'admin', sudo: true, users: [{ name: 'alice' }], processes: [{ pid: 5000, user: 'alice', cmd: 'sleep 999' }] } });
+  const run = (l) => s.run(l).map(c => (c.fd === 2 ? '[E]' : '') + c.text).join('');
+  ok(run('useradd bob').includes('Permission denied'), 'useradd は root 権限が必要');
+  run('sudo useradd -m -s /usr/sbin/nologin svc');
+  ok(run('grep svc /etc/passwd') === 'svc:x:1002:1002::/home/svc:/usr/sbin/nologin\n', 'useradd が /etc/passwd を更新');
+  ok(/svc\s+svc/.test(run('ls -ld /home/svc')), 'useradd -m がホームを作成');
+  ok(run('sudo passwd -S svc') === 'svc L 2026-10-14 0 99999 7 -1\n', '新規アカウントはロック状態');
+  run('sudo groupadd rep; sudo usermod -aG rep alice; sudo gpasswd -a svc rep');
+  ok(run('grep rep /etc/group') === 'rep:x:1003:alice,svc\n', 'usermod -aG / gpasswd -a でグループに追加');
+  run('sudo usermod -G rep alice');
+  ok(run('id alice').includes('groups=1000(alice),1003(rep)'), 'usermod -G (-aなし) は補助グループを置き換える');
+  ok(run('sudo usermod -aG nosuch alice') === "[E]usermod: group 'nosuch' does not exist\n", '存在しないグループはエラー');
+  run('sudo usermod -L alice');
+  ok(run('sudo passwd -S alice').startsWith('alice L'), 'usermod -L でロック');
+  ok(run('sudo userdel alice').includes('currently used by process 5000'), '稼働中プロセスのあるユーザーは削除できない');
+  run('sudo kill 5000; sudo userdel -r alice');
+  ok(run('sudo grep alice /etc/passwd /etc/group /etc/shadow') === '', 'userdel -r で関連エントリを削除');
+  ok(run('sudo -u svc whoami') === 'svc\n', 'sudo -u で別ユーザーとして実行');
+  ok(run('sudo -u svc cat /etc/shadow').includes('Permission denied'), 'sudo -u で権限が一般ユーザーに落ちる');
+  ok(run('sudo groupdel svc').includes('primary group'), '主グループは削除できない');
+}
+
+// ---------- シェルスクリプト機能の回帰テスト ----------
+function scriptTests() {
+  const env = { user: 't', files: [
+    { path: '/home/t/a.txt', owner: 't', content: 'one two\nthree\n' },
+    { path: '/home/t/b.log', owner: 't', content: 'x\n' },
+    { path: '/home/t/run.sh', owner: 't', mode: 0o755, content: '#!/bin/bash\nfor f in *.txt; do\n  if [ -s "$f" ]; then\n    echo "found $f"\n  else\n    echo "empty $f"\n  fi\ndone\ncount=0\nwhile [ $count -lt 3 ]; do\n  count=$((count+1))\ndone\necho "count=$count"\nexit 3\n' },
+  ] };
+  const { shell: s } = buildEnvironment({ env });
+  const run = (l) => s.run(l).map(c => (c.fd === 2 ? '[E]' : '') + c.text).join('');
+  run('cd /home/t');
+  const eq = (name, cmd, want) => { const got = run(cmd); ok(got === want, `${name}: ${cmd} → ${JSON.stringify(got)} (期待 ${JSON.stringify(want)})`); };
+  eq('subst', 'echo "user=$(whoami) cwd=$(pwd)"', 'user=t cwd=/home/t\n');
+  eq('backtick', 'echo `hostname`', 'lab-01\n');
+  eq('arith', 'n=5; echo $((n*n+1)) $((1+2*(3+4)))', '26 15\n');
+  eq('arith div0', 'echo $((10/0))', '[E]bash: division by 0\n');
+  eq('assign no split', 'x=$(cat a.txt); echo "$x" | wc -l', '2\n');
+  eq('word split', 'v="a b"; echo $v | wc -w', '2\n');
+  eq('glob in subst', 'ls $(echo *.log)', 'b.log\n');
+  eq('for list', 'for f in a b c; do echo $f; done', 'a\nb\nc\n');
+  eq('for glob', 'for f in *.txt; do wc -l $f; done', '2 a.txt\n');
+  eq('if/else', 'if [ -f a.txt ]; then echo yes; else echo no; fi', 'yes\n');
+  eq('if/elif', 'if [ -d nope ]; then echo d; elif [ -f a.txt ]; then echo f; else echo none; fi', 'f\n');
+  eq('while', 'i=0; while [ $i -lt 3 ]; do echo i=$i; i=$((i+1)); done', 'i=0\ni=1\ni=2\n');
+  eq('break', 'for n in $(seq 1 5); do [ $n -eq 3 ] && break; echo $n; done', '1\n2\n');
+  eq('continue', 'for n in 1 2 3; do [ $n -eq 2 ] && continue; echo $n; done', '1\n3\n');
+  eq('test -a', '[ 5 -gt 3 -a 2 -lt 4 ] && echo both', 'both\n');
+  eq('[[ glob', '[[ abc == a* ]] && echo m', 'm\n');
+  eq('[[ regex', '[[ hello =~ ^h.l+o$ ]] && echo re', 're\n');
+  eq('script run', './run.sh; echo rc=$?', 'found a.txt\ncount=3\nrc=3\n');
+  eq('bash script', 'bash run.sh | tail -1', 'count=3\n');
+  eq('case unsupported', 'case x in x) echo y;; esac', "[E]bash: 'case' はこのシミュレーターでは未対応です\n");
+  ok(run('if true; then echo a').includes("'fi'"), '未完の if は構文エラーを報告');
+  ok(run('while true; do :; done').includes('上限'), '無限ループはステップ上限で止まる');
+}
+
+// ---------- セキュリティ: eval / Function を使っていないことの静的検査 ----------
+function securityStaticTests() {
+  const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap(e => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
+  for (const f of walk(path.join(baseDir, 'js')).filter(x => x.endsWith('.js'))) {
+    const src = fs.readFileSync(f, 'utf8').split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+    const rel = path.relative(baseDir, f);
+    ok(!/(^|[^.\w])eval\s*\(/.test(src), `${rel}: eval() を使っていない`);
+    ok(!/new\s+Function\s*\(/.test(src) && !/(^|[^.\w])Function\s*\(/.test(src), `${rel}: Function() を使っていない`);
+    ok(!/set(Timeout|Interval)\s*\(\s*['"`]/.test(src), `${rel}: 文字列の setTimeout/setInterval を使っていない`);
+    ok(!/\.innerHTML\s*=|insertAdjacentHTML|document\.write/.test(src), `${rel}: innerHTML 等の HTML 文字列挿入を使っていない`);
+  }
+}
+
+
+// ---------- バンドルしたコードがソース直実行と同じ結果を返すか ----------
+// (循環参照・巻き上げなど、バンドル特有の不具合の検出。本番(index.html)はバンドルを読むため重要)
+function bundledEngineTests() {
+  const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  let api;
+  try { api = vm.runInNewContext(bundle(baseDir, { entry: 'js/env.js', expose: true }).code, {}); }
+  catch (e) { ok(false, `バンドルの評価に失敗: ${e.message}`); return; }
+  const env = { user: 't', sudo: true, files: [
+    { path: '/home/t/log.txt', owner: 't', content: '10.0.0.1 GET /a 200\n10.0.0.2 GET /login 401\nTODO fix\n' },
+    { path: '/home/t/c.pcap', owner: 't', content: '10:15:01.000100 IP 10.0.0.5.51234 > 10.0.0.9.80: Flags [S], seq 1, win 1, length 0\n' },
+  ] };
+  const direct = buildEnvironment({ env }).shell, bundled = api.buildEnvironment({ env }).shell;
+  const cmds = [
+    "awk '/login/' log.txt", "awk -F: '$3==0' /etc/passwd", "awk '{c[$1]++} END{for(k in c) print k, c[k]}' log.txt",
+    "sed -n '2p' log.txt", "sed -E 's/([0-9]+)\\.([0-9]+)/\\2.\\1/' log.txt", "grep -c 'login\\|TODO' log.txt", 'grep -A1 login log.txt',
+    'find . -name "*.txt" -o -name "*.pcap"', 'for f in a b; do echo $f; done', 'echo $((2*21)) $(whoami)', '[[ abc == a* ]] && echo m',
+    'sha256sum log.txt', 'echo -n password | md5sum', 'tcpdump -nr c.pcap port 80', 'sudo useradd -m x; id x', 'echo 666c6167 | xxd -r -p', 'jq -n 1',
+  ];
+  for (const c of cmds) {
+    const a = direct.run(c, { record: false }).map(x => x.text).join('');
+    const b = bundled.run(c, { record: false }).map(x => x.text).join('');
+    ok(a === b, `バンドル版とソース版で結果が違う: ${c} → bundle=${JSON.stringify(b.slice(0, 60))} / src=${JSON.stringify(a.slice(0, 60))}`);
+  }
+}
+
 // ---------- バンドルが最新か検証（node build.mjs の実行忘れを検出） ----------
 function bundleTests() {
   const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -192,6 +351,11 @@ function bundleTests() {
 }
 
 cmdTests();
+engineTests();
+scriptTests();
+userAdminTests();
+securityStaticTests();
+bundledEngineTests();
 structureTests();
 missionTests();
 bundleTests();

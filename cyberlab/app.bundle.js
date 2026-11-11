@@ -20,6 +20,7 @@ const DEFAULT = {
   flags: [],      // 取得したフラグ文字列
   learned: [],    // 学習済みトピック
   settings: { fontSize: 'm' },
+  storySeen: false, // プロローグ既読
 };
 
 let cache = null;
@@ -54,6 +55,7 @@ function validate(obj) {
   }
   if (Array.isArray(obj.flags)) out.flags = [...new Set(obj.flags.filter(f => typeof f === 'string' && f.length < 200))].slice(0, 500);
   if (Array.isArray(obj.learned)) out.learned = [...new Set(obj.learned.filter(f => typeof f === 'string' && f.length < 200))].slice(0, 500);
+  out.storySeen = obj.storySeen === true;
   if (obj.settings && typeof obj.settings === 'object') {
     if (['s', 'm', 'l'].includes(obj.settings.fontSize)) out.settings.fontSize = obj.settings.fontSize;
   }
@@ -88,6 +90,8 @@ function addLearned(topics) {
   if (changed) save();
 }
 function incHint(id) { missionState(id).usedHints++; save(); }
+function storySeen() { return load().storySeen === true; }
+function markStorySeen() { load().storySeen = true; save(); }
 function getSettings() { return load().settings; }
 function setSetting(k, v) { load().settings[k] = v; save(); }
 
@@ -105,7 +109,7 @@ function importData(file, done) {
 }
 function resetAll() { cache = structuredCloneSafe(DEFAULT); save(); }
 
-Object.assign(exports, { load, save, missionState, markStarted, markTaskDone, markMissionDone, addFlag, addLearned, incHint, getSettings, setSetting, exportData, importData, resetAll });
+Object.assign(exports, { load, save, missionState, markStarted, markTaskDone, markMissionDone, addFlag, addLearned, incHint, storySeen, markStorySeen, getSettings, setSetting, exportData, importData, resetAll });
 
 };
 __mods["js/util.js"] = function (module, exports, __require) {
@@ -401,6 +405,16 @@ class VFS {
     return f;
   }
 
+  /** /etc/passwd と /etc/group を users/groups から再生成（アカウント操作後に呼ぶ） */
+  syncAccountFiles() {
+    let passwd = '';
+    for (const u of [...this.users].sort((a, b) => a.uid - b.uid)) passwd += `${u.name}:x:${u.uid}:${u.gid}:${u.gecos || ''}:${u.home}:${u.shell}\n`;
+    let group = '';
+    for (const g of [...this.groups].sort((a, b) => a.gid - b.gid)) group += `${g.name}:x:${g.gid}:${g.members.join(',')}\n`;
+    this.addFile('/etc/passwd', passwd, { mode: 0o644 });
+    this.addFile('/etc/group', group, { mode: 0o644 });
+  }
+
   // ---------- snapshot ----------
   serialize() {
     return { root: this.root, users: this.users, groups: this.groups, clock: this.clock };
@@ -481,11 +495,31 @@ const { FsError, ERRMSG } = __require("js/vfs.js");
 const MAX_LINE = 4000;
 const MAX_OUTPUT = 200000;
 const MAX_DEPTH = 8;
+const COMPOUND_RE = /(^|[;&|]\s*)(if|for|while|until|case)\s/;
+const MAX_SCRIPT_STEPS = 20000;
 
 class ShellSyntaxError extends Error {}
 
+
+// 対応する ')' の位置を返す（クォート・入れ子・エスケープを考慮）。start は '(' の次の位置。無ければ -1
+function findClosingParen(line, start) {
+  let depth = 1, i = start, inS = false, inD = false;
+  while (i < line.length) {
+    const c = line[i];
+    if (inS) { if (c === "'") inS = false; i++; continue; }
+    if (c === '\\') { i += 2; continue; }
+    if (inD) { if (c === '"') inD = false; i++; continue; }
+    if (c === "'") inS = true;
+    else if (c === '"') inD = true;
+    else if (c === '(') depth++;
+    else if (c === ')') { depth--; if (depth === 0) return i; }
+    i++;
+  }
+  return -1;
+}
+
 // ---------- 字句解析 ----------
-// 単語は segment の配列: {k:'lit', v, q} / {k:'var', name, q} / {k:'tilde'}
+// 単語は segment の配列: {k:'lit', v, q} / {k:'var', name, q} / {k:'cmd', src, q} / {k:'arith', src, q} / {k:'tilde'}
 function tokenize(line) {
   const toks = [];
   let i = 0;
@@ -498,8 +532,20 @@ function tokenize(line) {
     let m;
     if ((m = rest.match(/^\{([A-Za-z_][A-Za-z0-9_]*|[0-9?#@*])\}/))) { push({ k: 'var', name: m[1], q }); i += m[0].length + 1; return; }
     if ((m = rest.match(/^([A-Za-z_][A-Za-z0-9_]*|[0-9?#@*$])/))) { push({ k: 'var', name: m[1], q }); i += m[0].length + 1; return; }
-    if (rest.startsWith('(')) throw new ShellSyntaxError('コマンド置換 $(...) はこのシミュレーターでは未対応です');
+    if (rest.startsWith('(')) {
+      const end = findClosingParen(line, i + 2);
+      if (end < 0) throw new ShellSyntaxError("unexpected EOF while looking for matching `)'");
+      if (line[i + 2] === '(' && line[end - 1] === ')') push({ k: 'arith', src: line.slice(i + 3, end - 1), q });
+      else push({ k: 'cmd', src: line.slice(i + 2, end), q });
+      i = end + 1; return;
+    }
     push({ k: 'lit', v: '$', q }); i++;
+  };
+  const readBacktick = (q) => {
+    const end = line.indexOf('`', i + 1);
+    if (end < 0) throw new ShellSyntaxError("unexpected EOF while looking for matching ``'");
+    push({ k: 'cmd', src: line.slice(i + 1, end).replace(/\\`/g, '`'), q });
+    i = end + 1;
   };
 
   while (i < line.length) {
@@ -527,7 +573,7 @@ function tokenize(line) {
         if (d === '"') { closed = true; i++; break; }
         if (d === '\\' && i + 1 < line.length && '"\\$`'.includes(line[i + 1])) { buf += line[i + 1]; i += 2; continue; }
         if (d === '$') { if (buf) { push({ k: 'lit', v: buf, q: true }); buf = ''; } readVar(true); continue; }
-        if (d === '`') throw new ShellSyntaxError('コマンド置換 `...` はこのシミュレーターでは未対応です');
+        if (d === '`') { if (buf) { push({ k: 'lit', v: buf, q: true }); buf = ''; } readBacktick(true); continue; }
         buf += d; i++;
       }
       if (!closed) throw new ShellSyntaxError('unexpected EOF while looking for matching `"\'');
@@ -535,7 +581,7 @@ function tokenize(line) {
       continue;
     }
     if (c === '$') { readVar(false); continue; }
-    if (c === '`') throw new ShellSyntaxError('コマンド置換 `...` はこのシミュレーターでは未対応です');
+    if (c === '`') { readBacktick(false); continue; }
     // 演算子
     const three = line.slice(i, i + 3);
     const two = line.slice(i, i + 2);
@@ -638,6 +684,9 @@ class Shell {
     this.positional = [];
     this.depth = 0;
     this.cmdLog = []; // 実行したコマンド名の記録（復習画面用）
+    this.subDepth = 0;      // コマンド置換の入れ子の深さ
+    this.loopDepth = 0;     // 実行中のループの深さ（break/continue の検証用）
+    this.pendingErr = [];   // コマンド置換内で出た stderr（親コマンドの出力へ合流）
     this.env = Object.assign({
       HOME: user.home, USER: user.name, LOGNAME: user.name, SHELL: '/bin/bash',
       PATH: '/usr/local/bin:/usr/bin:/bin', PWD: cwd, LANG: 'C.UTF-8', TERM: 'xterm-256color',
@@ -662,26 +711,92 @@ class Shell {
     return this.env[name] ?? '';
   }
 
-  /** 単語を展開して文字列配列にする（グロブ展開を含む） */
-  expandWord(word) {
-    let text = '';
-    let pattern = '';
-    let hasGlob = false;
+  /** 単語を展開して文字列配列にする（変数/コマンド置換/算術 → 単語分割 → グロブ） */
+  expandWord(word, { noSplit = false, noGlob = false } = {}) {
+    const fields = [];
+    let cur = { text: '', pat: '', glob: false, keep: false };
+    const endField = () => { fields.push(cur); cur = { text: '', pat: '', glob: false, keep: false }; };
+    const addQuoted = (v) => { cur.text += v; cur.pat += quoteAll(v); cur.keep = true; };
     for (const s of word) {
-      if (s.k === 'tilde') { text += this.env.HOME || this.user.home; pattern += quoteAll(this.env.HOME || this.user.home); continue; }
-      const v = s.k === 'var' ? this.getVar(s.name) : s.v;
-      text += v;
-      if (s.q || s.k === 'var') pattern += quoteAll(v);
-      else {
-        pattern += v;
-        if (/[*?[]/.test(v)) hasGlob = true;
+      if (s.k === 'tilde') { const h = this.env.HOME || this.user.home; cur.text += h; cur.pat += quoteAll(h); continue; }
+      if (s.k === 'lit') {
+        if (s.q) addQuoted(s.v);
+        else { cur.text += s.v; cur.pat += s.v; if (/[*?[]/.test(s.v)) cur.glob = true; }
+        continue;
       }
+      const v = s.k === 'var' ? this.getVar(s.name) : s.k === 'cmd' ? this.captureRun(s.src) : this.evalArith(s.src);
+      if (s.q || noSplit) { addQuoted(v); continue; }
+      if (v === '') continue;
+      // 未クォートの展開結果は空白で単語分割され、グロブの対象にもなる
+      const toks = v.split(/[ \t\n]+/).filter(Boolean);
+      if (!toks.length) { if (cur.text !== '' || cur.keep) endField(); continue; }
+      if (/^[ \t\n]/.test(v) && (cur.text !== '' || cur.keep)) endField();
+      toks.forEach((t, k) => { if (k > 0) endField(); cur.text += t; cur.pat += t; if (/[*?[]/.test(t)) cur.glob = true; });
+      if (/[ \t\n]$/.test(v)) endField();
     }
-    if (hasGlob) {
-      const matches = this.glob(pattern);
-      if (matches.length) return matches;
+    if (cur.text !== '' || cur.keep) fields.push(cur);
+    const out = [];
+    for (const f of fields) {
+      if (f.glob && !noGlob) { const m = this.glob(f.pat); if (m.length) { out.push(...m); continue; } }
+      out.push(f.text);
     }
-    return [text];
+    return out;
+  }
+
+  /** コマンド置換 $(...) / `...`: 同じ安全なパーサーでサブコマンドを実行し stdout を返す */
+  captureRun(src) {
+    if (this.subDepth >= 4) throw new ShellSyntaxError('コマンド置換の入れ子が深すぎます');
+    this.subDepth++;
+    const saved = this.lastCode;
+    try {
+      const chunks = this.run(src, { record: false });
+      for (const c of chunks) if (c.fd === 2) this.pendingErr.push(c);
+      return chunks.filter(c => c.fd === 1).map(c => c.text).join('').replace(/\n+$/, '');
+    } finally { this.subDepth--; this.lastCode = saved; }
+  }
+
+  /** 算術展開 $((...)): + - * / % ** と括弧・比較。変数は名前でも $名前 でも参照可。eval は使わない */
+  evalArith(src) {
+    const s = src.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*|[0-9?#])\}?/g, (m, n) => this.getVar(n) || '0');
+    let i = 0;
+    const ws = () => { while (s[i] === ' ' || s[i] === '\t') i++; };
+    const fail = (m) => { throw new ShellSyntaxError(m); };
+    const primary = () => {
+      ws();
+      if (s[i] === '(') { i++; const v = cmp(); ws(); if (s[i] !== ')') fail('arithmetic: ) が必要です'); i++; return v; }
+      if (s[i] === '-') { i++; return -primary(); }
+      if (s[i] === '+') { i++; return primary(); }
+      if (s[i] === '!') { i++; return primary() ? 0 : 1; }
+      const m = s.slice(i).match(/^(0[xX][0-9a-fA-F]+|\d+|[A-Za-z_][A-Za-z0-9_]*)/);
+      if (!m) fail(`arithmetic: 構文エラー: '${s.slice(i)}'`);
+      i += m[0].length;
+      if (/^[A-Za-z_]/.test(m[0])) return parseInt(this.getVar(m[0]) || '0', 10) || 0;
+      return Number(m[0]);
+    };
+    const pow = () => { let l = primary(); ws(); if (s.startsWith('**', i)) { i += 2; l = l ** pow(); } return l; };
+    const mul = () => {
+      let l = pow();
+      for (;;) {
+        ws(); const c = s[i];
+        if (c === '*' && s[i + 1] !== '*') { i++; l *= pow(); }
+        else if (c === '/') { i++; const r = pow(); if (r === 0) fail('division by 0'); l = Math.trunc(l / r); }
+        else if (c === '%') { i++; const r = pow(); if (r === 0) fail('division by 0'); l %= r; }
+        else return l;
+      }
+    };
+    const add = () => { let l = mul(); for (;;) { ws(); if (s[i] === '+') { i++; l += mul(); } else if (s[i] === '-') { i++; l -= mul(); } else return l; } };
+    const cmp = () => {
+      let l = add();
+      for (;;) {
+        ws(); const m = s.slice(i).match(/^(<=|>=|==|!=|<|>)/);
+        if (!m) return l;
+        i += m[0].length; const r = add();
+        l = (m[0] === '<=' ? l <= r : m[0] === '>=' ? l >= r : m[0] === '==' ? l === r : m[0] === '!=' ? l !== r : m[0] === '<' ? l < r : l > r) ? 1 : 0;
+      }
+    };
+    const v = cmp(); ws();
+    if (i < s.length) fail(`arithmetic: 構文エラー: '${s.slice(i)}'`);
+    return String(Math.trunc(v));
   }
 
   glob(pattern) {
@@ -715,7 +830,7 @@ class Shell {
   }
 
   /** 1行を実行して出力チャンク [{fd, text}] を返す */
-  run(line, { record = true } = {}) {
+  run(line, { record = true, noRoute = false } = {}) {
     const chunks = [];
     if (line.length > MAX_LINE) {
       chunks.push({ fd: 2, text: 'bash: 入力が長すぎます\n' });
@@ -724,6 +839,12 @@ class Shell {
     if (record && line.trim()) {
       this.history.push(line);
       if (this.history.length > 500) this.history.shift();
+    }
+    // if / for / while / until を含む行は、複合コマンド対応の実行器で処理する
+    if (!noRoute && COMPOUND_RE.test(line)) {
+      const ctx = { sh: this, tty: true, stdin: '', out: (t) => chunks.push({ fd: 1, text: t }), err: (t) => chunks.push({ fd: 2, text: t }) };
+      this.lastCode = this.runScript(line, [], ctx, 'bash', { interactive: true });
+      return chunks;
     }
     let list;
     try {
@@ -736,10 +857,12 @@ class Shell {
       }
       throw e;
     }
+    let loopSig = null;
     for (const item of list) {
       if (item.connector === '&&' && this.lastCode !== 0) continue;
       if (item.connector === '||' && this.lastCode === 0) continue;
-      this.lastCode = this.runPipeline(item.pipeline, chunks);
+      try { this.lastCode = this.runPipeline(item.pipeline, chunks); }
+      catch (e) { if (e instanceof LoopSignal) { loopSig = e; break; } throw e; }
       if (this.exitRequested) break;
     }
     // 出力サイズ上限
@@ -752,6 +875,7 @@ class Shell {
         break;
       }
     }
+    if (loopSig) chunks.loopSignal = loopSig;
     return chunks;
   }
 
@@ -775,11 +899,19 @@ class Shell {
     const ordered = []; // [{fd, text}]
     let argv = [];
     try {
-      for (const w of cmd.words) argv.push(...this.expandWord(w));
+      let assignPhase = true;
+      for (const w of cmd.words) {
+        const first = w[0];
+        const isAssign = assignPhase && first && first.k === 'lit' && !first.q && /^[A-Za-z_][A-Za-z0-9_]*=/.test(first.v);
+        if (!isAssign) assignPhase = false;
+        const inDbl = argv[0] === '[['; // [[ ]] の中は単語分割もグロブもしない
+        argv.push(...this.expandWord(w, { noSplit: isAssign || inDbl, noGlob: inDbl }));
+      }
     } catch (e) {
       errChunks.push({ fd: 2, text: `bash: ${e.message}\n` });
       return { out: '', code: 1 };
     }
+    if (this.pendingErr.length) { errChunks.push(...this.pendingErr); this.pendingErr = []; }
 
     // リダイレクト解決
     let outTarget = null, outAppend = false, errTarget = null, errAppend = false, errToOut = false;
@@ -812,6 +944,7 @@ class Shell {
     let code;
     const ctx = {
       sh: this,
+      tty: !!toTerminal && !outTarget, // 標準出力が端末か（ls の整形などに影響）
       stdin,
       out: text => { ordered.push({ fd: 1, text }); },
       err: text => { ordered.push({ fd: 2, text }); },
@@ -882,7 +1015,9 @@ class Shell {
       const r = fn(argv.slice(1), ctx);
       return typeof r === 'number' ? r : 0;
     } catch (e) {
+      if (e instanceof LoopSignal) throw e;
       if (e instanceof FsError) { ctx.err(`${name}: ${e.path}: ${ERRMSG[e.code] || e.code}\n`); return 1; }
+      if (e && e.name === 'OptError') { ctx.err(`${name}: ${e.message}\nTry 'man ${name}' for more information.\n`); return 2; }
       ctx.err(`${name}: 内部エラー: ${e.message}\n`);
       return 1;
     }
@@ -907,32 +1042,129 @@ class Shell {
     return this.runScript(node.content, args, ctx, path);
   }
 
-  runScript(content, args, ctx, name = 'script') {
+  /**
+   * スクリプト/複合コマンドの実行器。
+   * 対応: if/elif/else/fi, for VAR in WORDS; do ... done, while/until, break/continue,
+   *       exit, 変数代入, $(...) / $((...)), test / [ ] / [[ ]]
+   * 非対応(明示エラー): case, 関数定義, { } グループ, here-doc, read/リダイレクト付きループ
+   */
+  runScript(content, args, ctx, name = 'script', { interactive = false } = {}) {
     if (this.depth >= MAX_DEPTH) { ctx.err(`bash: ${name}: 再帰が深すぎます\n`); return 1; }
-    const savedPos = this.positional;
-    const savedCwd = this.cwd;
-    this.positional = args;
-    this.depth++;
+    const savedPos = this.positional, savedCwd = this.cwd, savedExit = this.exitRequested;
+    this.positional = args; this.depth++; this.exitRequested = false;
     let code = 0;
     try {
-      for (const raw of content.split('\n')) {
-        const line = raw.trim();
-        if (!line || line.startsWith('#')) continue;
-        if (/^(if|then|else|elif|fi|for|while|do|done|case|esac|function)\b/.test(line)) {
-          ctx.err(`${name}: 制御構文 (${line.split(/\s/)[0]}) はこのシミュレーターでは未対応です。行をスキップします\n`);
-          continue;
-        }
-        if (/^exit\b/.test(line)) { code = parseInt(line.split(/\s+/)[1] || '0', 10) || 0; break; }
-        const chunks = this.run(line, { record: false });
-        for (const c of chunks) (c.fd === 2 ? ctx.err : ctx.out)(c.text);
+      const stmts = splitScript(content);
+      code = this.execStmts(stmts, 0, stmts.length, ctx, name, { steps: 0, loops: 0 });
+    } catch (e) {
+      if (e instanceof ScriptError || e instanceof ShellSyntaxError) { ctx.err(`${name}: ${e.message}\n`); code = 2; }
+      else if (e instanceof LoopSignal) { ctx.err(`${name}: ${e.kind}: ループの外では使えません\n`); code = 1; }
+      else throw e;
+    } finally {
+      this.positional = savedPos; this.depth--; this.exitRequested = savedExit;
+      if (!interactive) { this.cwd = savedCwd; this.env.PWD = savedCwd; } // スクリプトはサブシェルで動く
+    }
+    return code;
+  }
+
+  runStmt(text, ctx) {
+    const chunks = this.run(text, { record: false, noRoute: true });
+    for (const c of chunks) (c.fd === 2 ? ctx.err : ctx.out)(c.text);
+    if (chunks.loopSignal) throw chunks.loopSignal;
+    return this.lastCode;
+  }
+
+  execStmts(stmts, from, to, ctx, name, st) {
+    let code = this.lastCode;
+    let i = from;
+    while (i < to) {
+      if (this.exitRequested) break;
+      if (++st.steps > MAX_SCRIPT_STEPS) throw new ScriptError('実行ステップ数の上限を超えました（無限ループの可能性）');
+      const s = stmts[i];
+      const kw = s.split(/\s/, 1)[0];
+      if (kw === 'if') { const end = blockEnd(stmts, i, 'fi'); code = this.execIf(stmts, i, end, ctx, name, st); i = end + 1; continue; }
+      if (kw === 'for') { const end = blockEnd(stmts, i, 'done'); code = this.execFor(stmts, i, end, ctx, name, st); i = end + 1; continue; }
+      if (kw === 'while' || kw === 'until') { const end = blockEnd(stmts, i, 'done'); code = this.execWhile(stmts, i, end, ctx, name, st); i = end + 1; continue; }
+      if (kw === 'break' || kw === 'continue') throw new LoopSignal(kw);
+      if (['then', 'else', 'elif', 'fi', 'do', 'done'].includes(kw)) throw new ScriptError(`構文エラー: 予期しない '${kw}' の近く`);
+      if (['case', 'esac', 'function', '{', '}', 'select'].includes(kw)) throw new ScriptError(`'${kw}' はこのシミュレーターでは未対応です`);
+      if (/^[A-Za-z_][A-Za-z0-9_]*\(\)/.test(s)) throw new ScriptError('関数定義はこのシミュレーターでは未対応です');
+      code = this.runStmt(s, ctx);
+      i++;
+    }
+    return code;
+  }
+
+  execIf(stmts, i, end, ctx, name, st) {
+    // 分岐を収集: [{cond, from, to}]（else は cond=null）
+    const branches = [];
+    let j = i;
+    while (j < end) {
+      const kw = stmts[j].split(/\s/, 1)[0];
+      const cond = kw === 'else' ? null : stmts[j].slice(kw.length).trim();
+      if (kw !== 'else') { if (stmts[j + 1] !== 'then') throw new ScriptError("構文エラー: 'then' が必要です"); }
+      const bodyFrom = kw === 'else' ? j + 1 : j + 2;
+      let k = bodyFrom, depth = 0;
+      for (; k < end; k++) {
+        const w = stmts[k].split(/\s/, 1)[0];
+        if (w === 'if') depth++;
+        else if (w === 'fi') depth--;
+        else if (depth === 0 && (w === 'elif' || w === 'else')) break;
+      }
+      branches.push({ cond, from: bodyFrom, to: k });
+      j = k;
+    }
+    for (const b of branches) {
+      if (b.cond === null || this.runStmt(b.cond, ctx) === 0) return this.execStmts(stmts, b.from, b.to, ctx, name, st);
+    }
+    return 0;
+  }
+
+  loopBody(stmts, from, to, ctx, name, st) {
+    try { this.execStmts(stmts, from, to, ctx, name, st); }
+    catch (e) { if (e instanceof LoopSignal) return e.kind; throw e; }
+    return null;
+  }
+
+  execFor(stmts, i, end, ctx, name, st) {
+    const m = stmts[i].match(/^for\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+in(?:\s+(.*))?)?$/s);
+    if (!m) throw new ScriptError('構文エラー: for VAR in WORDS の形式が必要です');
+    if (stmts[i + 1] !== 'do') throw new ScriptError("構文エラー: 'do' が必要です");
+    const items = [];
+    if (m[2] === undefined && !/\sin\b/.test(stmts[i])) items.push(...this.positional);
+    else for (const t of tokenize(m[2] || '')) { if (t.word) items.push(...this.expandWord(t.word)); }
+    let code = 0;
+    this.loopDepth++;
+    try {
+      for (const item of items) {
+        if (++st.loops > MAX_SCRIPT_STEPS) throw new ScriptError('ループ回数の上限を超えました');
+        this.env[m[1]] = item;
+        const sig = this.loopBody(stmts, i + 2, end, ctx, name, st);
+        if (sig === 'break') break;
+        if (this.exitRequested) break;
         code = this.lastCode;
       }
-    } finally {
-      this.positional = savedPos;
-      this.cwd = savedCwd; // スクリプトはサブシェルで動く
-      this.env.PWD = savedCwd;
-      this.depth--;
-    }
+    } finally { this.loopDepth--; }
+    return code;
+  }
+
+  execWhile(stmts, i, end, ctx, name, st) {
+    const kw = stmts[i].split(/\s/, 1)[0];
+    const cond = stmts[i].slice(kw.length).trim();
+    if (stmts[i + 1] !== 'do') throw new ScriptError("構文エラー: 'do' が必要です");
+    let code = 0;
+    this.loopDepth++;
+    try {
+      for (;;) {
+        if (++st.loops > MAX_SCRIPT_STEPS) throw new ScriptError('ループ回数の上限を超えました（無限ループの可能性）');
+        const c = this.runStmt(cond, ctx);
+        if (kw === 'while' ? c !== 0 : c === 0) break;
+        const sig = this.loopBody(stmts, i + 2, end, ctx, name, st);
+        if (sig === 'break') break;
+        if (this.exitRequested) break;
+        code = this.lastCode;
+      }
+    } finally { this.loopDepth--; }
     return code;
   }
 
@@ -967,7 +1199,68 @@ class Shell {
 function quoteAll(s) { return s.replace(/[\s\S]/g, ch => (/[*?[\]]/.test(ch) ? '\u0000' + ch : ch)); }
 function fsMsg(e) { return e instanceof FsError ? (ERRMSG[e.code] || e.code) : String(e.message || e); }
 
-Object.assign(exports, { ShellSyntaxError, tokenize, parse, escapeRe, Shell, fsMsg });
+class ScriptError extends Error {}
+class LoopSignal extends Error { constructor(kind) { super(kind); this.kind = kind; } }
+
+// 対応する閉じキーワード(fi/done)の位置を探す
+function blockEnd(stmts, i, close) {
+  const opens = close === 'fi' ? ['if'] : ['for', 'while', 'until'];
+  let depth = 0;
+  for (let j = i; j < stmts.length; j++) {
+    const w = stmts[j].split(/\s/, 1)[0];
+    if (opens.includes(w)) depth++;
+    else if (w === close) { depth--; if (depth === 0) return j; }
+  }
+  throw new ScriptError(`構文エラー: 対応する '${close}' がありません`);
+}
+
+/**
+ * スクリプト本文を「文」の配列に分割する。
+ * 改行と ; で分割（クォート・$( )・バッククォート内は除く）、# コメントを除去し、
+ * then / do / else / fi / done は単独の文として切り出す。
+ */
+function splitScript(text) {
+  const stmts = [];
+  let buf = '', i = 0, inS = false, inD = false, paren = 0, btick = false;
+  const pushStmt = (t) => {
+    t = t.trim();
+    while (t) {
+      let m = t.match(/^(then|do|else)(?:\s+([\s\S]*))?$/);
+      if (!m) m = t.match(/^(fi|done)(?:\s+([\s\S]*))?$/);
+      if (!m) break;
+      stmts.push(m[1]); t = (m[2] || '').trim();
+    }
+    if (t) stmts.push(t);
+  };
+  const boundary = () => { pushStmt(buf); buf = ''; };
+  while (i < text.length) {
+    const c = text[i], prev = text[i - 1];
+    if (inS) { buf += c; if (c === "'") inS = false; i++; continue; }
+    if (c === '\\') {
+      if (text[i + 1] === '\n') { i += 2; continue; }
+      buf += c + (text[i + 1] ?? ''); i += 2; continue;
+    }
+    if (inD) { buf += c; if (c === '"') inD = false; i++; continue; }
+    if (c === "'") { inS = true; buf += c; i++; continue; }
+    if (c === '"') { inD = true; buf += c; i++; continue; }
+    if (c === '`') { btick = !btick; buf += c; i++; continue; }
+    if (c === '(' && prev === '$') paren++;
+    else if (c === '(' && paren > 0) paren++;
+    else if (c === ')' && paren > 0) paren--;
+    const top = paren === 0 && !btick;
+    if (c === '#' && top && (i === 0 || /[\s;]/.test(prev))) { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (top && c === ';') { boundary(); i++; continue; }
+    if (top && c === '\n') {
+      if (/(&&|\|\||\|)\s*$/.test(buf)) { buf += ' '; i++; continue; } // 行末の && || | は継続
+      boundary(); i++; continue;
+    }
+    buf += c; i++;
+  }
+  boundary();
+  return stmts;
+}
+
+Object.assign(exports, { ShellSyntaxError, tokenize, parse, escapeRe, Shell, fsMsg, LoopSignal, splitScript });
 
 };
 __mods["js/manpages.js"] = function (module, exports, __require) {
@@ -1009,6 +1302,1025 @@ const MANPAGES = {
 Object.assign(exports, { MANPAGES });
 
 };
+__mods["js/hash.js"] = function (module, exports, __require) {
+// ============================================================
+// 純JSのハッシュ実装（MD5 / SHA-1 / SHA-256）。外部依存なし。
+// 教材として実機と同じ値を返すために実装（暗号用途ではなく学習用）。
+// 入力は JS 文字列を UTF-8 バイト列として扱う。
+// ============================================================
+
+function utf8Bytes(str) {
+  const out = [];
+  for (const ch of str) {
+    const c = ch.codePointAt(0);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return out;
+}
+const hex = (words, le) => words.map(w => {
+  let s = '';
+  for (let i = 0; i < 4; i++) { const b = le ? (w >>> (8 * i)) & 255 : (w >>> (24 - 8 * i)) & 255; s += b.toString(16).padStart(2, '0'); }
+  return s;
+}).join('');
+const rotl = (x, n) => (x << n) | (x >>> (32 - n));
+const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+
+// パディング: 0x80, 0x00..., 長さ(ビット) を 8 バイトで末尾に（be: ビッグエンディアン）
+function pad(bytes, be) {
+  const b = bytes.slice();
+  const bitLen = bytes.length * 8;
+  b.push(0x80);
+  while (b.length % 64 !== 56) b.push(0);
+  const hi = Math.floor(bitLen / 0x100000000), lo = bitLen >>> 0;
+  const lenBytes = be
+    ? [hi >>> 24, hi >>> 16, hi >>> 8, hi, lo >>> 24, lo >>> 16, lo >>> 8, lo]
+    : [lo, lo >>> 8, lo >>> 16, lo >>> 24, hi, hi >>> 8, hi >>> 16, hi >>> 24];
+  for (const x of lenBytes) b.push(x & 255);
+  return b;
+}
+
+// ---------- MD5 ----------
+const MD5_S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+const MD5_K = Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0);
+function md5(str) {
+  const b = pad(utf8Bytes(str), false);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  for (let off = 0; off < b.length; off += 64) {
+    const M = [];
+    for (let i = 0; i < 16; i++) M.push((b[off + i * 4]) | (b[off + i * 4 + 1] << 8) | (b[off + i * 4 + 2] << 16) | (b[off + i * 4 + 3] << 24));
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+      else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+      F = (F + A + MD5_K[i] + M[g]) >>> 0;
+      A = D; D = C; C = B;
+      B = (B + rotl(F, MD5_S[i])) >>> 0;
+    }
+    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+  }
+  return hex([a0, b0, c0, d0], true);
+}
+
+// ---------- SHA-1 ----------
+function sha1(str) {
+  const b = pad(utf8Bytes(str), true);
+  let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+  for (let off = 0; off < b.length; off += 64) {
+    const w = [];
+    for (let i = 0; i < 16; i++) w.push(((b[off + i * 4] << 24) | (b[off + i * 4 + 1] << 16) | (b[off + i * 4 + 2] << 8) | b[off + i * 4 + 3]) >>> 0);
+    for (let i = 16; i < 80; i++) w.push(rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1) >>> 0);
+    let a = h0, bb = h1, c = h2, d = h3, e = h4;
+    for (let i = 0; i < 80; i++) {
+      let f, k;
+      if (i < 20) { f = (bb & c) | (~bb & d); k = 0x5a827999; }
+      else if (i < 40) { f = bb ^ c ^ d; k = 0x6ed9eba1; }
+      else if (i < 60) { f = (bb & c) | (bb & d) | (c & d); k = 0x8f1bbcdc; }
+      else { f = bb ^ c ^ d; k = 0xca62c1d6; }
+      const t = (rotl(a, 5) + f + e + k + w[i]) >>> 0;
+      e = d; d = c; c = rotl(bb, 30) >>> 0; bb = a; a = t;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + bb) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+  }
+  return hex([h0, h1, h2, h3, h4], false);
+}
+
+// ---------- SHA-256 ----------
+const SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+function sha256(str) {
+  const b = pad(utf8Bytes(str), true);
+  const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  for (let off = 0; off < b.length; off += 64) {
+    const w = [];
+    for (let i = 0; i < 16; i++) w.push(((b[off + i * 4] << 24) | (b[off + i * 4 + 1] << 16) | (b[off + i * 4 + 2] << 8) | b[off + i * 4 + 3]) >>> 0);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w.push((w[i - 16] + s0 + w[i - 7] + s1) >>> 0);
+    }
+    let [a, bb, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & bb) ^ (a & c) ^ (bb & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = bb; bb = a; a = (t1 + t2) >>> 0;
+    }
+    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + bb) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+  }
+  return hex(H, false);
+}
+
+const HASHERS = { md5, sha1, sha256 };
+
+Object.assign(exports, { md5, sha1, sha256, HASHERS });
+
+};
+__mods["js/regex.js"] = function (module, exports, __require) {
+// 依存のない葉モジュール（循環参照を避けるため commands.js から分離）
+// POSIX 正規表現(BRE/ERE) → JavaScript RegExp ソース変換。
+// BRE(既定): \| \( \) \{ \} \+ \? が特殊、素の | ( ) { } + ? はリテラル。ERE(-E): 逆。
+const POSIX_CLASS = { alpha: 'A-Za-z', digit: '0-9', alnum: 'A-Za-z0-9', upper: 'A-Z', lower: 'a-z', space: ' \\t\\n\\r\\f\\v', blank: ' \\t', punct: '!-\\/:-@\\[-`{-~', xdigit: '0-9A-Fa-f' };
+function posixToJs(pat, ere) {
+  let out = ''; let i = 0; let inBr = false;
+  const SPECIAL = '|(){}+?';
+  while (i < pat.length) {
+    const c = pat[i];
+    if (inBr) {
+      if (c === ']') { inBr = false; out += ']'; i++; continue; }
+      if (c === '[' && pat[i + 1] === ':') {
+        const end = pat.indexOf(':]', i + 2);
+        if (end > 0) { out += POSIX_CLASS[pat.slice(i + 2, end)] ?? ''; i = end + 2; continue; }
+      }
+      out += c === '\\' ? '\\\\' : c; i++; continue;
+    }
+    if (c === '[') {
+      inBr = true; out += '['; i++;
+      if (pat[i] === '^') { out += '^'; i++; }
+      if (pat[i] === ']') { out += '\\]'; i++; }
+      continue;
+    }
+    if (c === '\\') {
+      const n = pat[i + 1]; i += 2;
+      if (n === undefined) { out += '\\\\'; break; }
+      if (SPECIAL.includes(n)) { out += ere ? '\\' + n : n; continue; }
+      if (n === '<' || n === '>') { out += '\\b'; continue; }
+      out += '\\' + n; continue;
+    }
+    if (!ere && SPECIAL.includes(c)) { out += '\\' + c; i++; continue; }
+    out += c; i++;
+  }
+  return out;
+}
+
+
+Object.assign(exports, { posixToJs });
+
+};
+__mods["js/awk.js"] = function (module, exports, __require) {
+// ============================================================
+// 安全な AWK インタプリタ（eval / Function 不使用）。
+// 対応: BEGIN/END, パターン/範囲パターン, 条件式, 連想配列, for/while/if,
+//       print/printf, 正規表現, 主要な組み込み関数・変数。
+// 非対応(明示エラー): getline, system, パイプ/ファイルへの出力, ユーザー定義関数
+// ============================================================
+const { posixToJs } = __require("js/regex.js");
+
+class AwkError extends Error {}
+
+// ---------- 字句解析 ----------
+const KEYWORDS = new Set(['BEGIN', 'END', 'if', 'else', 'while', 'for', 'in', 'do', 'break', 'continue', 'next', 'exit', 'delete', 'print', 'printf', 'getline', 'function', 'return']);
+const BUILTIN_FUNCS = new Set(['length', 'substr', 'index', 'split', 'sub', 'gsub', 'match', 'sprintf', 'tolower', 'toupper', 'int', 'sqrt', 'exp', 'log', 'sin', 'cos', 'atan2', 'rand', 'srand', 'system']);
+const OPS = ['**=', '&&', '||', '==', '!=', '<=', '>=', '++', '--', '+=', '-=', '*=', '/=', '%=', '^=', '!~', '>>', '**'];
+
+function lex(src) {
+  const toks = [];
+  let i = 0;
+  const last = () => toks[toks.length - 1];
+  const divAllowed = () => {
+    const t = last();
+    if (!t) return false;
+    if (t.t === 'num' || t.t === 'str' || t.t === 'name' || t.t === 'regex' || t.t === 'func') return true;
+    if (t.t === 'op') return t.v === ')' || t.v === ']' || t.v === '++' || t.v === '--';
+    return false;
+  };
+  while (i < src.length) {
+    const c = src[i];
+    if (c === ' ' || c === '\t' || c === '\r') { i++; continue; }
+    if (c === '\\' && src[i + 1] === '\n') { i += 2; continue; }
+    if (c === '#') { while (i < src.length && src[i] !== '\n') i++; continue; }
+    if (c === '\n') {
+      // 継続可能な位置の改行は無視
+      const t = last();
+      if (!(t && t.t === 'op' && ['{', '&&', '||', ',', ';'].includes(t.v)) && !(t && t.t === 'kw' && ['else', 'do'].includes(t.v))) toks.push({ t: 'nl' });
+      i++; continue;
+    }
+    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(src[i + 1] || ''))) {
+      const m = src.slice(i).match(/^(0[xX][0-9a-fA-F]+|(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)/);
+      toks.push({ t: 'num', v: Number(m[0]) }); i += m[0].length; continue;
+    }
+    if (c === '"') {
+      let j = i + 1, out = '';
+      while (j < src.length && src[j] !== '"') {
+        if (src[j] === '\\' && j + 1 < src.length) {
+          const n = src[j + 1];
+          out += n === 'n' ? '\n' : n === 't' ? '\t' : n === 'r' ? '\r' : n === '\\' ? '\\' : n === '"' ? '"' : n === '/' ? '/' : '\\' + n;
+          j += 2;
+        } else { out += src[j]; j++; }
+      }
+      if (j >= src.length) throw new AwkError('syntax error: 文字列が閉じられていません');
+      toks.push({ t: 'str', v: out }); i = j + 1; continue;
+    }
+    if (c === '/' && !divAllowed()) {
+      let j = i + 1, out = '', inBr = false;
+      while (j < src.length && (src[j] !== '/' || inBr)) {
+        if (src[j] === '\n') throw new AwkError('syntax error: 正規表現が閉じられていません');
+        if (src[j] === '\\' && j + 1 < src.length) { out += src[j] + src[j + 1]; j += 2; continue; }
+        if (src[j] === '[') inBr = true; else if (src[j] === ']') inBr = false;
+        out += src[j]; j++;
+      }
+      if (j >= src.length) throw new AwkError('syntax error: 正規表現が閉じられていません');
+      toks.push({ t: 'regex', v: out }); i = j + 1; continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i; while (j < src.length && /[A-Za-z0-9_]/.test(src[j])) j++;
+      const w = src.slice(i, j); i = j;
+      if (KEYWORDS.has(w)) toks.push({ t: 'kw', v: w });
+      else if (BUILTIN_FUNCS.has(w)) toks.push({ t: 'func', v: w });
+      else toks.push({ t: 'name', v: w });
+      continue;
+    }
+    let matched = null;
+    for (const op of OPS) if (src.startsWith(op, i)) { matched = op; break; }
+    if (!matched && '+-*/%^<>=!~?:,;(){}[]$'.includes(c)) matched = c;
+    if (!matched) throw new AwkError(`syntax error: 未対応の文字 '${c}'（パイプ | や & は未対応です）`);
+    const len = matched.length;
+    if (matched === '**') matched = '^';
+    if (matched === '**=') matched = '^=';
+    toks.push({ t: 'op', v: matched }); i += len;
+  }
+  return toks;
+}
+
+// ---------- 構文解析 ----------
+function parseProgram(src) {
+  const toks = lex(src);
+  let pos = 0;
+  const peek = (o = 0) => toks[pos + o];
+  const isOp = (v, o = 0) => { const t = toks[pos + o]; return t && t.t === 'op' && t.v === v; };
+  const isKw = (v, o = 0) => { const t = toks[pos + o]; return t && t.t === 'kw' && t.v === v; };
+  const fail = (m) => { throw new AwkError(`syntax error: ${m}`); };
+  const expectOp = (v) => { if (!isOp(v)) fail(`'${v}' が必要です`); pos++; };
+  const skipTerms = () => { while (peek() && (peek().t === 'nl' || isOp(';'))) pos++; };
+  const skipNl = () => { while (peek() && peek().t === 'nl') pos++; };
+
+  // ----- 式 -----
+  let noGt = 0; // print 引数内では > を比較演算子にしない
+  let noIn = 0; // for(... in ...) 判定用
+  function parseExpr() { return parseTernary(); }
+  function parseTernary() {
+    const cond = parseOr();
+    if (isOp('?')) {
+      pos++; skipNl(); const a = parseTernary(); skipNl(); expectOp(':'); skipNl(); const b = parseTernary();
+      return { k: 'cond', c: cond, a, b };
+    }
+    if (peek() && peek().t === 'op' && ['=', '+=', '-=', '*=', '/=', '%=', '^='].includes(peek().v)) {
+      if (!['var', 'field', 'index'].includes(cond.k)) fail('代入の左辺が不正です');
+      const op = peek().v; pos++; skipNl();
+      const rhs = parseTernary();
+      return { k: 'assign', op, l: cond, r: rhs };
+    }
+    return cond;
+  }
+  function parseOr() { let l = parseAnd(); while (isOp('||')) { pos++; skipNl(); l = { k: 'or', l, r: parseAnd() }; } return l; }
+  function parseAnd() { let l = parseIn(); while (isOp('&&')) { pos++; skipNl(); l = { k: 'and', l, r: parseIn() }; } return l; }
+  function parseIn() {
+    let l = parseMatch();
+    while (!noIn && isKw('in')) { pos++; const t = peek(); if (!t || t.t !== 'name') fail('in の右辺は配列名です'); pos++; l = { k: 'in', key: l, arr: t.v }; }
+    return l;
+  }
+  function parseMatch() {
+    let l = parseRel();
+    while (isOp('~') || isOp('!~')) { const neg = isOp('!~'); pos++; l = { k: 'match', neg, l, r: parseRel() }; }
+    return l;
+  }
+  function parseRel() {
+    const l = parseConcat();
+    const t = peek();
+    if (t && t.t === 'op' && ['<', '<=', '==', '!=', '>=', '>'].includes(t.v) && !(t.v === '>' && noGt)) {
+      pos++; const r = parseConcat(); return { k: 'rel', op: t.v, l, r };
+    }
+    return l;
+  }
+  function startsOperand() {
+    const t = peek();
+    if (!t) return false;
+    if (t.t === 'num' || t.t === 'str' || t.t === 'name' || t.t === 'func' || t.t === 'regex') return true;
+    if (t.t === 'op') return ['$', '(', '!', '-', '+', '++', '--'].includes(t.v) && !['-', '+'].includes(t.v);
+    return false;
+  }
+  function parseConcat() {
+    let l = parseAdd();
+    while (startsOperand() && !isKw('in')) { const r = parseAdd(); l = { k: 'concat', l, r }; }
+    return l;
+  }
+  function parseAdd() {
+    let l = parseMul();
+    while (isOp('+') || isOp('-')) { const op = peek().v; pos++; l = { k: 'bin', op, l, r: parseMul() }; }
+    return l;
+  }
+  function parseMul() {
+    let l = parseUnary();
+    while (isOp('*') || isOp('/') || isOp('%')) { const op = peek().v; pos++; l = { k: 'bin', op, l, r: parseUnary() }; }
+    return l;
+  }
+  function parseUnary() {
+    if (isOp('!')) { pos++; return { k: 'not', e: parseUnary() }; }
+    if (isOp('-')) { pos++; return { k: 'neg', e: parseUnary() }; }
+    if (isOp('+')) { pos++; return { k: 'pos', e: parseUnary() }; }
+    return parsePow();
+  }
+  function parsePow() {
+    const base = parsePostfix();
+    if (isOp('^')) { pos++; const exp = parseUnaryForPow(); return { k: 'bin', op: '^', l: base, r: exp }; }
+    return base;
+  }
+  function parseUnaryForPow() { if (isOp('-')) { pos++; return { k: 'neg', e: parseUnaryForPow() }; } const b = parsePostfix(); if (isOp('^')) { pos++; return { k: 'bin', op: '^', l: b, r: parseUnaryForPow() }; } return b; }
+  function parsePostfix() {
+    if (isOp('++') || isOp('--')) { const op = peek().v; pos++; const target = parsePrimary(); if (!['var', 'field', 'index'].includes(target.k)) fail('++/-- の対象が不正です'); return { k: 'incdec', op, pre: true, t: target }; }
+    const e = parsePrimary();
+    if ((isOp('++') || isOp('--')) && ['var', 'field', 'index'].includes(e.k)) { const op = peek().v; pos++; return { k: 'incdec', op, pre: false, t: e }; }
+    return e;
+  }
+  function parsePrimary() {
+    const t = peek();
+    if (!t) fail('式が途中で終わっています');
+    if (t.t === 'num') { pos++; return { k: 'num', v: t.v }; }
+    if (t.t === 'str') { pos++; return { k: 'str', v: t.v }; }
+    if (t.t === 'regex') { pos++; return { k: 'regex', v: t.v }; }
+    if (t.t === 'op' && t.v === '$') { pos++; const e = parseFieldIndex(); return { k: 'field', e }; }
+    if (t.t === 'op' && t.v === '(') {
+      pos++; const saveGt = noGt, saveIn = noIn; noGt = 0; noIn = 0;
+      const e = parseExpr(); noGt = saveGt; noIn = saveIn;
+      if (isOp(',')) { // (i,j) in arr 用の多次元は未対応
+        fail('カンマ区切りの添字は未対応です');
+      }
+      expectOp(')'); return { k: 'group', e };
+    }
+    if (t.t === 'func') {
+      pos++;
+      if (t.v === 'system') throw new AwkError('system() はこのシミュレーターでは未対応です（安全のため）');
+      let args = [];
+      if (isOp('(')) {
+        pos++; const saveGt = noGt, saveIn = noIn; noGt = 0; noIn = 0;
+        if (!isOp(')')) { args.push(parseExpr()); while (isOp(',')) { pos++; skipNl(); args.push(parseExpr()); } }
+        noGt = saveGt; noIn = saveIn; expectOp(')');
+      } else if (t.v !== 'length') fail(`${t.v} には括弧が必要です`);
+      return { k: 'call', name: t.v, args };
+    }
+    if (t.t === 'kw' && t.v === 'getline') throw new AwkError('getline はこのシミュレーターでは未対応です');
+    if (t.t === 'name') {
+      pos++;
+      if (isOp('[')) { pos++; const idx = parseExpr(); expectOp(']'); return { k: 'index', name: t.v, e: idx }; }
+      return { k: 'var', name: t.v };
+    }
+    fail(`予期しないトークン '${t.v ?? t.t}'`);
+  }
+  function parseFieldIndex() {
+    // $NF, $i, $(expr), $i++ は ($i)++ ではなく $(i++) になるが簡略化: 前置増減 or 一次式のみ
+    if (isOp('++') || isOp('--')) return parsePostfix();
+    if (isOp('-')) { pos++; return { k: 'neg', e: parseFieldIndex() }; }
+    return parsePrimary();
+  }
+
+  // ----- 文 -----
+  function parseSimpleOrBlock() {
+    skipNl();
+    return parseStmt();
+  }
+  function endStmt() {
+    // 文の終端: ; 改行 } または EOF
+    if (isOp(';') || (peek() && peek().t === 'nl')) { pos++; return; }
+    if (!peek() || isOp('}')) return;
+    fail(`文の終端が必要ですが '${peek().v ?? peek().t}' がありました`);
+  }
+  function parseBlock() {
+    expectOp('{');
+    const body = [];
+    skipTerms();
+    while (!isOp('}')) {
+      if (!peek()) fail("'}' が必要です");
+      body.push(parseStmt());
+      skipTerms();
+    }
+    pos++;
+    return { k: 'block', body };
+  }
+  function parsePrintArgs() {
+    const saveGt = noGt; noGt = 1;
+    const args = [];
+    // print (a, b) 形式
+    if (isOp('(')) {
+      const save = pos;
+      try {
+        pos++; noGt = 0;
+        const list = [parseExpr()];
+        while (isOp(',')) { pos++; list.push(parseExpr()); }
+        expectOp(')');
+        if (!peek() || isOp(';') || isOp('}') || peek().t === 'nl' || isOp('>')) { noGt = saveGt; return list; }
+      } catch (e) { /* 通常解析へ */ }
+      pos = save; noGt = 1;
+    }
+    if (peek() && !isOp(';') && !isOp('}') && peek().t !== 'nl' && !isOp('>')) {
+      args.push(parseExpr());
+      while (isOp(',')) { pos++; skipNl(); args.push(parseExpr()); }
+    }
+    noGt = saveGt;
+    return args;
+  }
+  function parseStmt() {
+    const t = peek();
+    if (!t) fail('文が途中で終わっています');
+    if (isOp('{')) return parseBlock();
+    if (t.t === 'kw') {
+      if (t.v === 'if') {
+        pos++; expectOp('('); const c = parseExpr(); expectOp(')');
+        const then = parseSimpleOrBlock();
+        // else の探索（; や改行を挟んでもよい）
+        const save = pos; skipTerms();
+        let els = null;
+        if (isKw('else')) { pos++; els = parseSimpleOrBlock(); } else pos = save;
+        return { k: 'if', c, then, els };
+      }
+      if (t.v === 'while') { pos++; expectOp('('); const c = parseExpr(); expectOp(')'); return { k: 'while', c, body: parseSimpleOrBlock() }; }
+      if (t.v === 'do') { pos++; const body = parseSimpleOrBlock(); skipTerms(); if (!isKw('while')) fail("do に対応する while が必要です"); pos++; expectOp('('); const c = parseExpr(); expectOp(')'); return { k: 'do', c, body }; }
+      if (t.v === 'for') {
+        pos++; expectOp('(');
+        if (peek() && peek().t === 'name' && isKw('in', 1) && peek(2) && peek(2).t === 'name' && isOp(')', 3)) {
+          const v = peek().v, arr = peek(2).v; pos += 4;
+          return { k: 'forin', v, arr, body: parseSimpleOrBlock() };
+        }
+        const init = isOp(';') ? null : parseStmtExprOnly(); expectOp(';');
+        const c = isOp(';') ? null : parseExpr(); expectOp(';');
+        const inc = isOp(')') ? null : parseStmtExprOnly(); expectOp(')');
+        return { k: 'for', init, c, inc, body: parseSimpleOrBlock() };
+      }
+      if (t.v === 'break') { pos++; endStmt(); return { k: 'break' }; }
+      if (t.v === 'continue') { pos++; endStmt(); return { k: 'continue' }; }
+      if (t.v === 'next') { pos++; endStmt(); return { k: 'next' }; }
+      if (t.v === 'exit') { pos++; let e = null; if (peek() && !isOp(';') && !isOp('}') && peek().t !== 'nl') e = parseExpr(); endStmt(); return { k: 'exit', e }; }
+      if (t.v === 'delete') {
+        pos++; const n = peek(); if (!n || n.t !== 'name') fail('delete の対象は配列です'); pos++;
+        let e = null; if (isOp('[')) { pos++; e = parseExpr(); expectOp(']'); }
+        endStmt(); return { k: 'delete', name: n.v, e };
+      }
+      if (t.v === 'print' || t.v === 'printf') {
+        pos++; const args = parsePrintArgs();
+        if (isOp('>') || isOp('>>')) throw new AwkError('print のファイル出力リダイレクトは未対応です（シェルの > を使ってください）');
+        endStmt(); return { k: t.v, args };
+      }
+      if (t.v === 'function' || t.v === 'return') throw new AwkError('ユーザー定義関数は未対応です');
+    }
+    const e = parseExpr(); endStmt(); return { k: 'expr', e };
+  }
+  function parseStmtExprOnly() { return { k: 'expr', e: parseExpr() }; }
+
+  // ----- プログラム全体 -----
+  const items = [];
+  skipTerms();
+  while (peek()) {
+    const it = { begin: false, end: false, pat: null, pat2: null, action: null };
+    if (isKw('BEGIN')) { pos++; it.begin = true; skipNl(); it.action = parseBlock(); }
+    else if (isKw('END')) { pos++; it.end = true; skipNl(); it.action = parseBlock(); }
+    else {
+      if (!isOp('{')) {
+        it.pat = parseExpr();
+        if (isOp(',')) { pos++; skipNl(); it.pat2 = parseExpr(); }
+      }
+      if (isOp('{')) it.action = parseBlock();
+    }
+    items.push(it);
+    skipTerms();
+  }
+  return items;
+}
+
+
+// ---------- 値の変換 ----------
+const NUM_RE = /^\s*[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?\s*$/;
+const looksNumeric = (v) => typeof v === 'number' || (typeof v === 'string' && NUM_RE.test(v));
+function toNum(v) {
+  if (typeof v === 'number') return v;
+  if (v === undefined || v === '') return 0;
+  const m = String(v).match(/^\s*[-+]?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)/);
+  return m ? Number(m[0]) : 0;
+}
+function numToStr(n) {
+  if (Number.isInteger(n) && Math.abs(n) < 1e16) return String(n);
+  if (!isFinite(n)) return Number.isNaN(n) ? 'nan' : (n > 0 ? 'inf' : '-inf');
+  return String(parseFloat(n.toPrecision(6)));
+}
+const toStr = (v) => (typeof v === 'number' ? numToStr(v) : v === undefined ? '' : String(v));
+function toBool(v) {
+  if (typeof v === 'number') return v !== 0;
+  if (v === undefined) return false;
+  return NUM_RE.test(v) ? Number(v) !== 0 : v !== '';
+}
+
+// ---------- printf ----------
+function fmtOne(flags, width, prec, conv, arg) {
+  let s;
+  const n0 = toNum(arg);
+  const signOf = (n) => (n < 0 ? '-' : flags.includes('+') ? '+' : flags.includes(' ') ? ' ' : '');
+  switch (conv) {
+    case 'd': case 'i': { const n = Number.isFinite(n0) ? Math.trunc(n0) : 0; let b = String(Math.abs(n)); if (prec != null) b = b.padStart(prec, '0'); s = signOf(n) + b; break; }
+    case 'u': { const n = Math.trunc(n0); s = String(n < 0 ? n >>> 0 : n); break; }
+    case 'o': s = (flags.includes('#') ? '0' : '') + Math.trunc(n0).toString(8); break;
+    case 'x': s = (flags.includes('#') ? '0x' : '') + Math.trunc(n0).toString(16); break;
+    case 'X': s = (flags.includes('#') ? '0X' : '') + Math.trunc(n0).toString(16).toUpperCase(); break;
+    case 'e': case 'E': { const e = Math.abs(n0).toExponential(prec ?? 6).replace(/e([+-])(\d)$/, 'e$10$2'); s = signOf(n0) + (conv === 'E' ? e.toUpperCase() : e); break; }
+    case 'f': case 'F': s = signOf(n0) + Math.abs(n0).toFixed(prec ?? 6); break;
+    case 'g': case 'G': {
+      let p = prec ?? 6; if (p === 0) p = 1;
+      const a = Math.abs(n0);
+      if (a === 0) s = '0';
+      else {
+        const exp = Math.floor(Math.log10(a));
+        if (exp < -4 || exp >= p) {
+          s = a.toExponential(p - 1);
+          if (!flags.includes('#')) s = s.replace(/\.?0+e/, 'e');
+          s = s.replace(/e([+-])(\d)$/, 'e$10$2');
+        } else {
+          s = a.toFixed(Math.max(0, p - 1 - exp));
+          if (!flags.includes('#') && s.includes('.')) s = s.replace(/\.?0+$/, '');
+        }
+      }
+      s = signOf(n0) + (conv === 'G' ? s.toUpperCase() : s); break;
+    }
+    case 'c': s = typeof arg === 'number' ? String.fromCharCode(arg) : (toStr(arg)[0] ?? ''); break;
+    case 's': s = toStr(arg); if (prec != null) s = s.slice(0, prec); break;
+    default: s = '';
+  }
+  if (width != null && s.length < width) {
+    if (flags.includes('-')) s = s.padEnd(width);
+    else if (flags.includes('0') && 'diouxXeEfFgG'.includes(conv) && prec == null) { const sign = /^[+\- ]/.test(s) ? s[0] : ''; s = sign + s.slice(sign.length).padStart(width - sign.length, '0'); }
+    else s = s.padStart(width);
+  }
+  return s;
+}
+function sprintf(fmt, args) {
+  let ai = 0;
+  return fmt.replace(/%([-+ #0]*)(\*|\d+)?(?:\.(\*|\d+))?([diouxXeEfFgGcs%])/g, (m, flags, w, pr, conv) => {
+    if (conv === '%') return '%';
+    let width = w === '*' ? toNum(args[ai++]) : (w != null ? Number(w) : null);
+    let prec = pr === '*' ? toNum(args[ai++]) : (pr != null ? Number(pr) : null);
+    if (width != null && width < 0) { flags += '-'; width = -width; }
+    return fmtOne(flags, width, prec, conv, args[ai++]);
+  });
+}
+
+// ---------- 実行 ----------
+class NextSignal {}
+class BreakSignal {}
+class ContinueSignal {}
+class ExitSignal { constructor(code) { this.code = code; } }
+const STRING_FUNCS = new Set(['substr', 'tolower', 'toupper', 'sprintf']);
+const MAX_STEPS = 3_000_000;
+
+class Interp {
+  constructor(items, { out, FS, vars }) {
+    this.items = items; this.out = out; this.steps = 0;
+    this.vars = Object.create(null); this.arrays = Object.create(null);
+    Object.assign(this.vars, { FS: ' ', OFS: ' ', ORS: '\n', NR: 0, FNR: 0, NF: 0, FILENAME: '', SUBSEP: '\x1c', RSTART: 0, RLENGTH: -1 });
+    if (FS != null) this.vars.FS = FS;
+    Object.assign(this.vars, vars || {});
+    this.record = ''; this.fields = []; this.regexCache = new Map(); this.range = new Map(); this.seed = 1;
+  }
+  tick() { if (++this.steps > MAX_STEPS) throw new AwkError('実行ステップ数の上限を超えました（無限ループの可能性）'); }
+  regex(src, flags = '') {
+    const key = flags + '/' + src;
+    let re = this.regexCache.get(key);
+    if (!re) { try { re = new RegExp(posixToJs(src, true), flags); } catch (e) { throw new AwkError(`無効な正規表現: ${src}`); } this.regexCache.set(key, re); }
+    re.lastIndex = 0; return re;
+  }
+  arr(name) { return this.arrays[name] || (this.arrays[name] = new Map()); }
+
+  // --- レコードとフィールド ---
+  splitStr(str, fs) {
+    if (fs === ' ') { const t = str.replace(/^[ \t\n]+|[ \t\n]+$/g, ''); return t === '' ? [] : t.split(/[ \t\n]+/); }
+    if (str === '') return [];
+    if (fs.length === 1) return str.split(fs);
+    return str.split(this.regex(fs));
+  }
+  setRecord(str) { this.record = str; this.fields = this.splitStr(str, toStr(this.vars.FS)); this.vars.NF = this.fields.length; }
+  getField(i) {
+    i = Math.trunc(toNum(i));
+    if (i < 0) throw new AwkError(`負のフィールド番号 $${i} は使えません`);
+    return i === 0 ? this.record : (this.fields[i - 1] ?? '');
+  }
+  setField(i, v) {
+    i = Math.trunc(toNum(i));
+    if (i < 0) throw new AwkError(`負のフィールド番号 $${i} は使えません`);
+    if (i === 0) { this.setRecord(toStr(v)); return; }
+    while (this.fields.length < i) this.fields.push('');
+    this.fields[i - 1] = toStr(v); this.vars.NF = this.fields.length;
+    this.record = this.fields.join(toStr(this.vars.OFS));
+  }
+  setVar(name, v) {
+    if (name === 'NF') {
+      const n = Math.max(0, Math.trunc(toNum(v)));
+      this.fields.length = Math.min(this.fields.length, n); while (this.fields.length < n) this.fields.push('');
+      this.vars.NF = n; this.record = this.fields.join(toStr(this.vars.OFS)); return;
+    }
+    this.vars[name] = v;
+  }
+
+  // --- 式の評価 ---
+  isStrNode(n) { while (n.k === 'group') n = n.e; return n.k === 'str' || n.k === 'concat' || (n.k === 'call' && STRING_FUNCS.has(n.name)); }
+  compare(op, a, b, forceStr) {
+    if (a === undefined) a = (typeof b === 'number' || looksNumeric(b)) ? 0 : '';
+    if (b === undefined) b = (typeof a === 'number' || looksNumeric(a)) ? 0 : '';
+    let c;
+    if (!forceStr && looksNumeric(a) && looksNumeric(b)) { const x = toNum(a), y = toNum(b); c = x < y ? -1 : x > y ? 1 : 0; }
+    else { const x = toStr(a), y = toStr(b); c = x < y ? -1 : x > y ? 1 : 0; }
+    switch (op) { case '<': return c < 0; case '<=': return c <= 0; case '==': return c === 0; case '!=': return c !== 0; case '>=': return c >= 0; default: return c > 0; }
+  }
+  lval(node) {
+    if (node.k === 'var') return { get: () => this.vars[node.name], set: (v) => this.setVar(node.name, v) };
+    if (node.k === 'field') { const i = this.ev(node.e); return { get: () => this.getField(i), set: (v) => this.setField(i, v) }; }
+    const key = toStr(this.ev(node.e)); const a = this.arr(node.name);
+    return { get: () => a.get(key), set: (v) => a.set(key, v) };
+  }
+  ev(n) {
+    this.tick();
+    switch (n.k) {
+      case 'num': return n.v;
+      case 'str': return n.v;
+      case 'regex': return this.regex(n.v).test(this.record) ? 1 : 0;
+      case 'group': return this.ev(n.e);
+      case 'var': return this.vars[n.name];
+      case 'field': return this.getField(this.ev(n.e));
+      case 'index': { const a = this.arr(n.name), key = toStr(this.ev(n.e)); if (!a.has(key)) a.set(key, undefined); return a.get(key); }
+      case 'assign': {
+        const lv = this.lval(n.l);
+        let v;
+        if (n.op === '=') v = this.ev(n.r);
+        else { const x = toNum(lv.get()), y = toNum(this.ev(n.r)); v = n.op === '+=' ? x + y : n.op === '-=' ? x - y : n.op === '*=' ? x * y : n.op === '/=' ? this.div(x, y) : n.op === '%=' ? this.mod(x, y) : x ** y; }
+        lv.set(v); return v;
+      }
+      case 'cond': return toBool(this.ev(n.c)) ? this.ev(n.a) : this.ev(n.b);
+      case 'or': return toBool(this.ev(n.l)) || toBool(this.ev(n.r)) ? 1 : 0;
+      case 'and': return toBool(this.ev(n.l)) && toBool(this.ev(n.r)) ? 1 : 0;
+      case 'not': return toBool(this.ev(n.e)) ? 0 : 1;
+      case 'neg': return -toNum(this.ev(n.e));
+      case 'pos': return toNum(this.ev(n.e));
+      case 'bin': {
+        const x = toNum(this.ev(n.l)), y = toNum(this.ev(n.r));
+        switch (n.op) { case '+': return x + y; case '-': return x - y; case '*': return x * y; case '/': return this.div(x, y); case '%': return this.mod(x, y); default: return x ** y; }
+      }
+      case 'rel': return this.compare(n.op, this.ev(n.l), this.ev(n.r), this.isStrNode(n.l) || this.isStrNode(n.r)) ? 1 : 0;
+      case 'match': {
+        const s = toStr(this.ev(n.l));
+        const re = n.r.k === 'regex' ? this.regex(n.r.v) : this.regex(toStr(this.ev(n.r)));
+        return re.test(s) !== n.neg ? 1 : 0;
+      }
+      case 'concat': return toStr(this.ev(n.l)) + toStr(this.ev(n.r));
+      case 'in': return this.arr(n.arr).has(toStr(this.ev(n.key))) ? 1 : 0;
+      case 'incdec': {
+        const lv = this.lval(n.t); const old = toNum(lv.get()); const nv = n.op === '++' ? old + 1 : old - 1;
+        lv.set(nv); return n.pre ? nv : old;
+      }
+      case 'call': return this.call(n);
+      default: throw new AwkError(`内部エラー: 未知の式 ${n.k}`);
+    }
+  }
+  div(x, y) { if (y === 0) throw new AwkError('division by zero'); return x / y; }
+  mod(x, y) { if (y === 0) throw new AwkError('division by zero in %'); return x % y; }
+
+  call(n) {
+    const a = n.args;
+    const sarg = (i) => toStr(this.ev(a[i]));
+    const need = (min, max = min) => { if (a.length < min || a.length > max) throw new AwkError(`${n.name}: 引数の数が不正です`); };
+    switch (n.name) {
+      case 'length': {
+        if (a.length === 0) return this.record.length;
+        if (a[0].k === 'var' && this.arrays[a[0].name]) return this.arrays[a[0].name].size;
+        return sarg(0).length;
+      }
+      case 'substr': {
+        need(2, 3); const s = sarg(0); const m = Math.round(toNum(this.ev(a[1])));
+        const len = a.length === 3 ? Math.round(toNum(this.ev(a[2]))) : Infinity;
+        const start = Math.max(1, m); const end = Math.min(s.length + 1, m + len);
+        return end <= start ? '' : s.slice(start - 1, end - 1);
+      }
+      case 'index': need(2); return sarg(0).indexOf(sarg(1)) + 1;
+      case 'tolower': need(1); return sarg(0).toLowerCase();
+      case 'toupper': need(1); return sarg(0).toUpperCase();
+      case 'sprintf': { if (!a.length) throw new AwkError('sprintf: フォーマットがありません'); return sprintf(sarg(0), a.slice(1).map(x => this.ev(x))); }
+      case 'int': need(1); return Math.trunc(toNum(this.ev(a[0])));
+      case 'sqrt': need(1); return Math.sqrt(toNum(this.ev(a[0])));
+      case 'exp': need(1); return Math.exp(toNum(this.ev(a[0])));
+      case 'log': need(1); return Math.log(toNum(this.ev(a[0])));
+      case 'sin': need(1); return Math.sin(toNum(this.ev(a[0])));
+      case 'cos': need(1); return Math.cos(toNum(this.ev(a[0])));
+      case 'atan2': need(2); return Math.atan2(toNum(this.ev(a[0])), toNum(this.ev(a[1])));
+      case 'rand': this.seed = (this.seed * 1103515245 + 12345) & 0x7fffffff; return this.seed / 0x80000000;
+      case 'srand': { const old = this.seed; this.seed = a.length ? Math.trunc(toNum(this.ev(a[0]))) : 0; return old; }
+      case 'split': {
+        need(2, 3);
+        if (a[1].k !== 'var') throw new AwkError('split の第2引数は配列名です');
+        const s = sarg(0); const arr = this.arr(a[1].name); arr.clear();
+        let parts;
+        if (a.length === 3 && a[2].k === 'regex') parts = s === '' ? [] : s.split(this.regex(a[2].v));
+        else parts = this.splitStr(s, a.length === 3 ? sarg(2) : toStr(this.vars.FS));
+        parts.forEach((p, i) => arr.set(String(i + 1), p));
+        return parts.length;
+      }
+      case 'match': {
+        need(2); const s = sarg(0);
+        const re = a[1].k === 'regex' ? this.regex(a[1].v) : this.regex(sarg(1));
+        const m = re.exec(s);
+        this.vars.RSTART = m ? m.index + 1 : 0; this.vars.RLENGTH = m ? m[0].length : -1;
+        return this.vars.RSTART;
+      }
+      case 'sub': case 'gsub': {
+        need(2, 3);
+        const src = a[0].k === 'regex' ? a[0].v : sarg(0);
+        const repl = sarg(1);
+        const target = a.length === 3 ? a[2] : { k: 'field', e: { k: 'num', v: 0 } };
+        if (!['var', 'field', 'index'].includes(target.k)) throw new AwkError(`${n.name}: 第3引数が代入可能ではありません`);
+        const lv = this.lval(target);
+        const str = toStr(lv.get());
+        const re = this.regex(src, n.name === 'gsub' ? 'g' : '');
+        let count = 0;
+        const out = str.replace(re, (m) => { count++; return repl.replace(/\\&|&/g, (x) => (x === '&' ? m : '&')); });
+        if (count) lv.set(out);
+        return count;
+      }
+      default: throw new AwkError(`未対応の関数: ${n.name}`);
+    }
+  }
+
+  // --- 文の実行 ---
+  emit(text) { this.out(text); }
+  exec(st) {
+    this.tick();
+    switch (st.k) {
+      case 'block': for (const s of st.body) this.exec(s); return;
+      case 'expr': this.ev(st.e); return;
+      case 'print': {
+        const vals = st.args.length ? st.args.map(e => toStr(this.ev(e))) : [this.record];
+        this.emit(vals.join(toStr(this.vars.OFS)) + toStr(this.vars.ORS)); return;
+      }
+      case 'printf': {
+        if (!st.args.length) throw new AwkError('printf: フォーマットがありません');
+        const vals = st.args.map(e => this.ev(e));
+        this.emit(sprintf(toStr(vals[0]), vals.slice(1))); return;
+      }
+      case 'if': if (toBool(this.ev(st.c))) this.exec(st.then); else if (st.els) this.exec(st.els); return;
+      case 'while': this.loop(() => toBool(this.ev(st.c)), st.body); return;
+      case 'do': { let first = true; this.loop(() => { if (first) { first = false; return true; } return toBool(this.ev(st.c)); }, st.body); return; }
+      case 'for': {
+        if (st.init) this.exec(st.init);
+        this.loop(() => (st.c ? toBool(this.ev(st.c)) : true), st.body, st.inc ? () => this.exec(st.inc) : null); return;
+      }
+      case 'forin': {
+        for (const key of [...this.arr(st.arr).keys()]) {
+          this.setVar(st.v, key);
+          try { this.exec(st.body); } catch (e) { if (e instanceof BreakSignal) break; if (e instanceof ContinueSignal) continue; throw e; }
+        }
+        return;
+      }
+      case 'delete': if (st.e) this.arr(st.name).delete(toStr(this.ev(st.e))); else this.arr(st.name).clear(); return;
+      case 'break': throw new BreakSignal();
+      case 'continue': throw new ContinueSignal();
+      case 'next': throw new NextSignal();
+      case 'exit': throw new ExitSignal(st.e ? Math.trunc(toNum(this.ev(st.e))) : 0);
+      default: throw new AwkError(`内部エラー: 未知の文 ${st.k}`);
+    }
+  }
+  loop(cond, body, step) {
+    while (cond()) {
+      this.tick();
+      try { this.exec(body); } catch (e) { if (e instanceof BreakSignal) break; if (!(e instanceof ContinueSignal)) throw e; }
+      if (step) step();
+    }
+  }
+
+  runMain(mains) {
+    for (const it of mains) {
+      if (it.pat2) {
+        let active = this.range.get(it);
+        if (!active) { if (!toBool(this.ev(it.pat))) continue; active = true; }
+        if (toBool(this.ev(it.pat2))) active = false;
+        this.range.set(it, active);
+      } else if (it.pat && !toBool(this.ev(it.pat))) continue;
+      if (it.action) this.exec(it.action); else this.emit(this.record + toStr(this.vars.ORS));
+    }
+  }
+  run(inputs) {
+    const begins = this.items.filter(i => i.begin), ends = this.items.filter(i => i.end);
+    const mains = this.items.filter(i => !i.begin && !i.end);
+    let code = 0, exited = false;
+    try {
+      for (const b of begins) this.exec(b.action);
+      if (mains.length || ends.length) {
+        for (const inp of inputs) {
+          this.vars.FILENAME = inp.name; this.vars.FNR = 0;
+          const lines = inp.text.split('\n'); if (lines[lines.length - 1] === '') lines.pop();
+          for (const line of lines) {
+            this.vars.NR = toNum(this.vars.NR) + 1; this.vars.FNR = toNum(this.vars.FNR) + 1;
+            this.setRecord(line);
+            try { this.runMain(mains); } catch (e) { if (e instanceof NextSignal) continue; throw e; }
+          }
+        }
+      }
+    } catch (e) { if (e instanceof ExitSignal) { code = e.code; exited = true; } else throw e; }
+    try { for (const en of ends) this.exec(en.action); }
+    catch (e) { if (e instanceof ExitSignal) code = e.code; else throw e; }
+    return code;
+  }
+}
+
+// 実行エントリ。inputs: [{ name, text }]。out(text) に出力を渡す。戻り値は終了コード。
+function runAwk({ program, inputs, vars, FS, out }) {
+  const items = parseProgram(program);
+  const it = new Interp(items, { out, FS, vars });
+  return it.run(inputs);
+}
+
+
+
+Object.assign(exports, { AwkError, sprintf, runAwk, parseProgram });
+
+};
+__mods["js/sed.js"] = function (module, exports, __require) {
+// ============================================================
+// 安全な sed エンジン（eval 不使用）。
+// 対応: s///[g p i N], d, p, q, y///, a/i/c テキスト, =、
+//       アドレス N / $ / /re/ / N,M / N,$ / /re/,/re/ / N,+K / 否定 !
+//       複数コマンド(; または改行、-e 複数)、BRE/ERE、後方参照 \1..\9 と &
+// 非対応(明示エラー): { } ブロック, ホールドスペース(h/g/x), n/N/D/P, w/r ファイル操作
+// ============================================================
+const { posixToJs } = __require("js/regex.js");
+
+class SedError extends Error {}
+
+function readDelimited(src, i, delim, what) {
+  // delim までを読む。\delim は delim 1文字に、それ以外の \x は保持
+  let out = '';
+  while (i < src.length && src[i] !== delim) {
+    if (src[i] === '\\' && i + 1 < src.length) {
+      if (src[i + 1] === delim) { out += delim; i += 2; continue; }
+      out += src[i] + src[i + 1]; i += 2; continue;
+    }
+    out += src[i]; i++;
+  }
+  if (i >= src.length) throw new SedError(`${what} が閉じられていません`);
+  return { text: out, next: i + 1 };
+}
+
+function parseSed(script, ere) {
+  const cmds = [];
+  let i = 0;
+  const ws = () => { while (i < script.length && (script[i] === ' ' || script[i] === '\t')) i++; };
+  const readAddr = () => {
+    const c = script[i];
+    if (c >= '0' && c <= '9') { let j = i; while (/[0-9]/.test(script[j] || '')) j++; const n = Number(script.slice(i, j)); i = j; return { t: 'num', n }; }
+    if (c === '$') { i++; return { t: 'last' }; }
+    if (c === '/') {
+      const r = readDelimited(script, i + 1, '/', 'アドレスの正規表現'); i = r.next;
+      let flag = ''; if (script[i] === 'I') { flag = 'i'; i++; }
+      return { t: 're', re: new RegExp(posixToJs(r.text, ere), flag) };
+    }
+    return null;
+  };
+  while (i < script.length) {
+    while (i < script.length && /[\s;]/.test(script[i])) i++;
+    if (i >= script.length) break;
+    const cmd = { a1: null, a2: null, neg: false, c: '' };
+    cmd.a1 = readAddr();
+    if (cmd.a1 && script[i] === ',') {
+      i++;
+      if (script[i] === '+') { i++; let j = i; while (/[0-9]/.test(script[j] || '')) j++; cmd.a2 = { t: 'rel', n: Number(script.slice(i, j)) }; i = j; }
+      else { cmd.a2 = readAddr(); if (!cmd.a2) throw new SedError('アドレス範囲の終端が不正です'); }
+    }
+    ws();
+    while (script[i] === '!') { cmd.neg = true; i++; ws(); }
+    const c = script[i++];
+    if (c === undefined) throw new SedError('コマンドが不足しています');
+    cmd.c = c;
+    if (c === 's') {
+      const delim = script[i++];
+      if (!delim || delim === '\n' || delim === '\\') throw new SedError("s コマンドの区切り文字が不正です");
+      const p = readDelimited(script, i, delim, 's の検索パターン'); i = p.next;
+      const r = readDelimited(script, i, delim, 's の置換文字列'); i = r.next;
+      let flags = '';
+      while (i < script.length && !/[;\n}]/.test(script[i])) { if (script[i] !== ' ') flags += script[i]; i++; }
+      cmd.g = flags.includes('g'); cmd.p = flags.includes('p'); const nm = flags.match(/\d+/); cmd.nth = nm ? Number(nm[0]) : 1;
+      const bad = flags.replace(/[gpiI\d]/g, '');
+      if (bad) throw new SedError(`s コマンドの未対応フラグ: ${bad}`);
+      try { cmd.re = new RegExp(posixToJs(p.text, ere), 'g' + (/[iI]/.test(flags) ? 'i' : '')); } catch (e) { throw new SedError(`無効な正規表現: ${p.text}`); }
+      cmd.repl = parseRepl(r.text);
+    } else if (c === 'y') {
+      const delim = script[i++];
+      const a = readDelimited(script, i, delim, 'y のソース'); i = a.next;
+      const b = readDelimited(script, i, delim, 'y の置換先'); i = b.next;
+      const un = (t) => t.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\\\/g, '\\');
+      cmd.src = [...un(a.text)]; cmd.dst = [...un(b.text)];
+      if (cmd.src.length !== cmd.dst.length) throw new SedError('y: 文字列の長さが一致しません');
+    } else if (c === 'a' || c === 'i' || c === 'c') {
+      ws();
+      if (script[i] === '\\') { i++; if (script[i] === '\n') i++; }
+      let j = i; while (j < script.length && script[j] !== '\n') j++;
+      cmd.text = script.slice(i, j); i = j;
+    } else if (c === 'd' || c === 'p' || c === 'q' || c === '=') {
+      if (c === 'q') { while (/[0-9 ]/.test(script[i] || '')) i++; }
+    } else if (c === '{' || c === '}') {
+      throw new SedError('{ } によるコマンドのグループ化はこのシミュレーターでは未対応です');
+    } else if ('hHgGxnNDPwWrR'.includes(c)) {
+      throw new SedError(`コマンド '${c}' はこのシミュレーターでは未対応です`);
+    } else throw new SedError(`未知のコマンド: '${c}'`);
+    cmds.push(cmd);
+  }
+  return cmds;
+}
+
+// 置換文字列 → [{lit}|{grp}]
+function parseRepl(s) {
+  const parts = []; let lit = '';
+  const flush = () => { if (lit) { parts.push({ lit }); lit = ''; } };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < s.length) {
+      const n = s[++i];
+      if (/[0-9]/.test(n)) { flush(); parts.push({ grp: Number(n) }); }
+      else if (n === 'n') lit += '\n'; else if (n === 't') lit += '\t'; else lit += n;
+    } else if (c === '&') { flush(); parts.push({ grp: 0 }); }
+    else lit += c;
+  }
+  flush(); return parts;
+}
+const expand = (parts, m) => parts.map(p => (p.lit !== undefined ? p.lit : (m[p.grp] ?? ''))).join('');
+
+// 1ストリーム(行配列)を処理して出力行配列を返す
+function runSedLines(cmds, lines, { quiet = false } = {}) {
+  const out = [];
+  const state = cmds.map(() => ({ active: false, endLine: null }));
+  const total = lines.length;
+  let quit = false;
+  for (let idx = 0; idx < total && !quit; idx++) {
+    const ln = idx + 1; const isLast = ln === total;
+    let ps = lines[idx]; let deleted = false; const appendQ = [];
+    const test = (a) => (a.t === 'num' ? ln === a.n : a.t === 'last' ? isLast : a.re.test(ps));
+    for (let ci = 0; ci < cmds.length && !deleted && !quit; ci++) {
+      const c = cmds[ci], st = state[ci];
+      let m;
+      if (!c.a1) m = true;
+      else if (!c.a2) m = test(c.a1);
+      else if (!st.active) {
+        m = test(c.a1);
+        if (m) {
+          if (c.a2.t === 'num') st.active = c.a2.n > ln;
+          else if (c.a2.t === 'rel') { st.endLine = ln + c.a2.n; st.active = c.a2.n > 0; }
+          else if (c.a2.t === 'last') st.active = !isLast;
+          else st.active = true; // 正規表現は次行以降で終端判定
+        }
+      } else {
+        m = true;
+        if (c.a2.t === 'num') { if (ln >= c.a2.n) st.active = false; }
+        else if (c.a2.t === 'rel') { if (ln >= st.endLine) st.active = false; }
+        else if (c.a2.t === 'last') { if (isLast) st.active = false; }
+        else if (c.a2.re.test(ps)) st.active = false;
+      }
+      if (c.neg) m = !m;
+      if (!m) continue;
+      switch (c.c) {
+        case 's': {
+          let count = 0, replaced = false;
+          const re = c.re; re.lastIndex = 0;
+          const res = ps.replace(re, (...a) => {
+            count++;
+            const mm = a.slice(0, a.findIndex((x) => typeof x === 'number'));
+            if (count < c.nth || (!c.g && count > c.nth)) return mm[0];
+            replaced = true; return expand(c.repl, mm);
+          });
+          if (replaced) { ps = res; if (c.p) out.push(ps); }
+          break;
+        }
+        case 'd': deleted = true; break;
+        case 'p': out.push(ps); break;
+        case 'q': quit = true; break;
+        case 'y': { const map = new Map(c.src.map((ch, k) => [ch, c.dst[k]])); ps = [...ps].map(ch => (map.has(ch) ? map.get(ch) : ch)).join(''); break; }
+        case 'a': appendQ.push(c.text); break;
+        case 'i': out.push(c.text); break;
+        case 'c': { if (!c.a2 || !st.active) out.push(c.text); deleted = true; break; }
+        case '=': out.push(String(ln)); break;
+        default: break;
+      }
+    }
+    if (!deleted && !quiet) out.push(ps);
+    for (const t of appendQ) out.push(t);
+  }
+  return out;
+}
+
+Object.assign(exports, { SedError, parseSed, runSedLines });
+
+};
 __mods["js/commands.js"] = function (module, exports, __require) {
 // ============================================================
 // コマンド実装。すべて仮想FS上の操作のみ。
@@ -1016,12 +2328,19 @@ __mods["js/commands.js"] = function (module, exports, __require) {
 // ctx: { sh, stdin, out(text), err(text) }
 // ============================================================
 const { FsError, ERRMSG, modeString, lsDate, isoDate, nodeSize } = __require("js/vfs.js");
-const { escapeRe } = __require("js/shell.js");
+const { escapeRe, LoopSignal } = __require("js/shell.js");
 const { MANPAGES } = __require("js/manpages.js");
+const { HASHERS } = __require("js/hash.js");
+const { runAwk, AwkError, sprintf: awkSprintf } = __require("js/awk.js");
+const { posixToJs } = __require("js/regex.js");
+const { parseSed, runSedLines, SedError } = __require("js/sed.js");
 
 function fsMsg(e) { return e instanceof FsError ? (ERRMSG[e.code] || e.code) : String(e && e.message || e); }
 
 // オプション解析: spec 例 { l:'bool', n:'val', '--color':'optval' }
+class OptError extends Error { constructor(msg) { super(msg); this.name = 'OptError'; } }
+
+
 function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
   const opts = {};
   const operands = [];
@@ -1035,7 +2354,7 @@ function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
       if (spec[key] === 'val' || spec[key] === 'optval') {
         opts[key] = eq >= 0 ? a.slice(eq + 1) : (spec[key] === 'val' ? args[++i] : true);
       } else if (spec[key] === 'bool') opts[key] = true;
-      else return { error: `unrecognized option '${a}'` };
+      else throw new OptError(`unrecognized option '${a}'`);
       continue;
     }
     if (a.length > 1 && a[0] === '-' && a !== '-') {
@@ -1048,7 +2367,7 @@ function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
           if (val) opts[f] = val;
           else opts[f] = args[++i];
           j = a.length; break;
-        } else return { error: `invalid option -- '${f}'` };
+        } else throw new OptError(`invalid option -- '${f}'`);
       }
       continue;
     }
@@ -1130,7 +2449,7 @@ function makeCommands(getCmds) {
       if (opts.l) {
         ctx.out(`total ${names.length}\n`);
         for (const n of names) ctx.out(fmtEntry(n, getNode(n), n) + '\n');
-      } else if (opts['1'] || opts.l) {
+      } else if (opts['1'] || !ctx.tty) {
         for (const n of names) ctx.out(fmtEntry(n, getNode(n), n) + '\n');
       } else {
         ctx.out(names.map(n => {
@@ -1147,7 +2466,7 @@ function makeCommands(getCmds) {
     };
     if (filesToShow.length) {
       if (opts.l) for (const f of filesToShow) ctx.out(fmtEntry(f.name, f.node, f.name) + '\n');
-      else ctx.out(filesToShow.map(f => f.name).join('  ') + '\n');
+      else ctx.out(filesToShow.map(f => f.name).join(ctx.tty && !opts['1'] ? '  ' : '\n') + '\n');
     }
     dirsToList.forEach((d, i) => {
       if (filesToShow.length && i === 0) ctx.out('\n');
@@ -1201,6 +2520,8 @@ function makeCommands(getCmds) {
   C.head = (args, ctx) => headtail(args, ctx, 'head');
   C.tail = (args, ctx) => headtail(args, ctx, 'tail');
   function headtail(args, ctx, name) {
+    // 旧式の数値オプション (head -3 / tail -5) を -n N に正規化
+    args = args.flatMap(a => (/^-\d+$/.test(a) ? ['-n', a.slice(1)] : [a]));
     const { opts, operands } = parseOpts(args, { n: 'val', c: 'val', f: 'bool', q: 'bool' });
     let n = 10;
     if (opts.n != null) { n = parseInt(opts.n, 10); if (isNaN(n)) { ctx.err(`${name}: invalid number\n`); return 1; } }
@@ -1224,14 +2545,14 @@ function makeCommands(getCmds) {
   }
 
   C.grep = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { i: 'bool', v: 'bool', n: 'bool', c: 'bool', r: 'bool', R: 'bool', E: 'bool', o: 'bool', l: 'bool', w: 'bool', H: 'bool', h: 'bool', F: 'bool', q: 'bool', a: 'bool' }, { stopAtNonOption: true });
+    const { opts, operands } = parseOpts(args, { i: 'bool', v: 'bool', n: 'bool', c: 'bool', r: 'bool', R: 'bool', E: 'bool', o: 'bool', l: 'bool', w: 'bool', H: 'bool', h: 'bool', F: 'bool', q: 'bool', a: 'bool', s: 'bool', e: 'val', A: 'val', B: 'val', C: 'val', m: 'val' });
     let pattern = opts.e;
     const ops = [...operands];
     if (pattern == null) pattern = ops.shift();
     if (pattern == null) { ctx.err('grep: 検索パターンがありません\n'); return 2; }
     let re;
     try {
-      let pat = opts.F ? escapeRe(pattern) : pattern;
+      let pat = opts.F ? escapeRe(pattern) : posixToJs(pattern, !!opts.E);
       if (opts.w) pat = `\\b(?:${pat})\\b`;
       re = new RegExp(pat, opts.i ? 'gi' : 'g');
     } catch (e) { ctx.err(`grep: 無効な正規表現: ${e.message}\n`); return 2; }
@@ -1239,27 +2560,37 @@ function makeCommands(getCmds) {
     let matched = false;
     let code = 1;
     const vfs = ctx.sh.vfs;
+    const ctxA = parseInt(opts.A ?? opts.C ?? 0, 10) || 0;
+    const ctxB = parseInt(opts.B ?? opts.C ?? 0, 10) || 0;
+    const maxCount = opts.m != null ? parseInt(opts.m, 10) : Infinity;
     const searchText = (data, label) => {
-      let count = 0;
       const lines = data.split('\n');
       if (lines[lines.length - 1] === '') lines.pop();
-      lines.forEach((ln, i) => {
-        re.lastIndex = 0;
-        const hit = re.test(ln);
-        if (hit !== !!opts.v) {
-          matched = true; code = 0; count++;
-          if (opts.q || opts.l || opts.c) return;
-          const prefix = (label && (opts.H || recursive || opts.H)) ? label + ':' : '';
-          if (opts.o && !opts.v) {
-            re.lastIndex = 0; let m;
-            while ((m = re.exec(ln))) { ctx.out(prefix + (opts.n ? (i + 1) + ':' : '') + m[0] + '\n'); if (m.index === re.lastIndex) re.lastIndex++; }
-          } else {
-            ctx.out(prefix + (opts.n ? (i + 1) + ':' : '') + ln + '\n');
-          }
-        }
-      });
+      const isHit = lines.map(ln => { re.lastIndex = 0; return re.test(ln) !== !!opts.v; });
+      // -m: 最初の N 件のみ
+      let seen = 0;
+      for (let k = 0; k < isHit.length; k++) if (isHit[k]) { seen++; if (seen > maxCount) isHit[k] = false; }
+      const count = isHit.filter(Boolean).length;
+      if (count) { matched = true; code = 0; }
+      const prefixName = (label && (opts.H || recursive)) ? label : '';
       if (opts.c && !opts.q) ctx.out((label ? label + ':' : '') + count + '\n');
       if (opts.l && count && !opts.q) ctx.out(label + '\n');
+      if (opts.q || opts.l || opts.c) return count;
+      // 出力する行（マッチ＋前後の文脈）
+      const show = new Array(lines.length).fill(false);
+      isHit.forEach((h, k) => { if (!h) return; for (let d = -ctxB; d <= ctxA; d++) if (lines[k + d] !== undefined) show[k + d] = true; });
+      let lastShown = -2;
+      lines.forEach((ln, k) => {
+        if (!show[k]) return;
+        if ((ctxA || ctxB) && lastShown >= 0 && k > lastShown + 1) ctx.out('--\n');
+        lastShown = k;
+        const sep = isHit[k] ? ':' : '-';
+        const pre = (prefixName ? prefixName + sep : '') + (opts.n ? (k + 1) + sep : '');
+        if (opts.o && !opts.v && isHit[k]) {
+          re.lastIndex = 0; let m;
+          while ((m = re.exec(ln))) { ctx.out(pre + m[0] + '\n'); if (m.index === re.lastIndex) re.lastIndex++; }
+        } else ctx.out(pre + ln + '\n');
+      });
       return count;
     };
     if (!ops.length || ops[0] === '-') { searchText(ctx.stdin, opts.H ? '(standard input)' : ''); return opts.q ? (matched ? 0 : 1) : code; }
@@ -1284,44 +2615,91 @@ function makeCommands(getCmds) {
     let i = 0;
     for (; i < args.length; i++) { if (args[i].startsWith('-') || args[i] === '!' || args[i] === '(') break; paths.push(args[i]); }
     if (!paths.length) paths.push('.');
-    const tests = args.slice(i);
+    const toks = args.slice(i);
     const vfs = ctx.sh.vfs, user = ctx.sh.user;
     let code = 0;
-    // 述語を関数に変換
-    const preds = [];
-    const actions = [];
-    for (let k = 0; k < tests.length; k++) {
-      const t = tests[k];
-      const val = () => tests[++k];
-      if (t === '-name') { const pat = globRe(val()); preds.push((p, n, name) => pat.test(name)); }
-      else if (t === '-iname') { const pat = globRe(val(), true); preds.push((p, n, name) => pat.test(name)); }
-      else if (t === '-type') { const ty = val(); preds.push((p, n) => (ty === 'f' ? n.type === 'f' : ty === 'd' ? n.type === 'd' : ty === 'l' ? n.type === 'l' : true)); }
-      else if (t === '-maxdepth') { ctx._maxdepth = parseInt(val(), 10); }
-      else if (t === '-mindepth') { ctx._mindepth = parseInt(val(), 10); }
-      else if (t === '-perm') { const spec = val(); preds.push((p, n) => permMatch(n.mode, spec)); }
-      else if (t === '-user') { const u = val(); const uu = vfs.userByName(u); preds.push((p, n) => n.uid === (uu ? uu.uid : parseInt(u, 10))); }
-      else if (t === '-group') { const g = val(); const gg = vfs.groupByName(g); preds.push((p, n) => n.gid === (gg ? gg.gid : parseInt(g, 10))); }
-      else if (t === '-size') { const spec = val(); preds.push((p, n) => sizeMatch(nodeSize(n), spec)); }
-      else if (t === '-empty') { preds.push((p, n) => n.type === 'f' ? n.content === '' : Object.keys(n.children).length === 0); }
-      else if (t === '-print') { /* default */ }
-      else if (t === '-type') { }
-      else if (t === '-o' || t === '-a' || t === '!' || t === '(' || t === ')') { /* 簡易: AND のみ対応 */ }
-      else { ctx.err(`find: 未対応の述語 '${t}' は無視します\n`); }
+    let maxd = Infinity, mind = 0;
+    let hasAction = false;
+    const pendingDelete = [];
+    // ---- 式パーサ: or > and > not > primary ----
+    let pos = 0;
+    const peek = () => toks[pos];
+    const need = (name) => { if (pos >= toks.length) throw new OptError(`missing argument to \`${name}'`); return toks[pos++]; };
+    function parseOr() {
+      let left = parseAnd();
+      while (peek() === '-o' || peek() === '-or') { pos++; const right = parseAnd(); const l = left; left = (e) => l(e) || right(e); }
+      return left;
     }
-    const maxd = ctx._maxdepth ?? Infinity;
-    const mind = ctx._mindepth ?? 0;
-    delete ctx._maxdepth; delete ctx._mindepth;
+    function parseAnd() {
+      let left = parseNot();
+      while (pos < toks.length && peek() !== '-o' && peek() !== '-or' && peek() !== ')') {
+        if (peek() === '-a' || peek() === '-and') pos++;
+        const right = parseNot(); const l = left; left = (e) => l(e) && right(e);
+      }
+      return left;
+    }
+    function parseNot() {
+      if (peek() === '!' || peek() === '-not') { pos++; const inner = parseNot(); return (e) => !inner(e); }
+      return parsePrimary();
+    }
+    function parsePrimary() {
+      const t = toks[pos++];
+      if (t === undefined) throw new OptError('invalid expression');
+      if (t === '(') { const inner = parseOr(); if (toks[pos++] !== ')') throw new OptError('unmatched ( in expression'); return inner; }
+      switch (t) {
+        case '-name': { const re = globRe(need(t)); return (e) => re.test(e.name); }
+        case '-iname': { const re = globRe(need(t), true); return (e) => re.test(e.name); }
+        case '-path': { const re = globRe(need(t)); return (e) => re.test(e.path); }
+        case '-type': { const ty = need(t); return (e) => (ty === 'f' ? e.node.type === 'f' : ty === 'd' ? e.node.type === 'd' : ty === 'l' ? e.node.type === 'l' : false); }
+        case '-perm': { const spec = need(t); return (e) => permMatch(e.node.mode, spec); }
+        case '-user': { const u = need(t); const uu = vfs.userByName(u); return (e) => e.node.uid === (uu ? uu.uid : parseInt(u, 10)); }
+        case '-group': { const g = need(t); const gg = vfs.groupByName(g); return (e) => e.node.gid === (gg ? gg.gid : parseInt(g, 10)); }
+        case '-size': { const spec = need(t); return (e) => sizeMatch(nodeSize(e.node), spec); }
+        case '-empty': return (e) => (e.node.type === 'f' ? e.node.content === '' : Object.keys(e.node.children).length === 0);
+        case '-mtime': case '-mmin': {
+          const spec = need(t); const unit = t === '-mtime' ? 86400000 : 60000;
+          const n = parseInt(spec.replace(/^[+-]/, ''), 10);
+          return (e) => { const age = Math.floor((vfs.clock - e.node.mtime) / unit); return spec[0] === '+' ? age > n : spec[0] === '-' ? age < n : age === n; };
+        }
+        case '-newer': { const ref = need(t); let rn; try { rn = lookup(ctx, ref); } catch (er) { throw new OptError(`'${ref}': ${fsMsg(er)}`); } return (e) => e.node.mtime > rn.mtime; }
+        case '-maxdepth': maxd = parseInt(need(t), 10); return () => true;
+        case '-mindepth': mind = parseInt(need(t), 10); return () => true;
+        case '-print': hasAction = true; return (e) => { ctx.out(e.shown + '\n'); return true; };
+        case '-delete': hasAction = true; return (e) => { pendingDelete.push(e.abs); return true; };
+        case '-exec': case '-execdir': {
+          hasAction = true;
+          const cmd = [];
+          while (pos < toks.length && toks[pos] !== ';' && toks[pos] !== '+') cmd.push(toks[pos++]);
+          if (pos >= toks.length) throw new OptError("missing argument to `-exec'");
+          pos++; // ; or +
+          if (!cmd.length) throw new OptError("missing argument to `-exec'");
+          return (e) => ctx.sh.exec(cmd.map(a => a.split('{}').join(e.shown)), ctx) === 0;
+        }
+        default: throw new OptError(`unknown predicate \`${t}'`);
+      }
+    }
+    const expr = toks.length ? parseOr() : () => true;
+    if (pos < toks.length) throw new OptError(`paths must precede expression: \`${toks[pos]}'`);
+    const run = hasAction ? expr : (e) => { if (!expr(e)) return false; ctx.out(e.shown + '\n'); return true; };
     for (const start of paths) {
       let node;
       try { node = lookup(ctx, start); } catch (e) { ctx.err(`find: '${start}': ${fsMsg(e)}\n`); code = 1; continue; }
-      vfs.walk(resolve(ctx, start), node, user,
+      const startAbs = resolve(ctx, start);
+      const trimmedStart = start.length > 1 ? start.replace(/\/+$/, '') : start;
+      vfs.walk(startAbs, node, user,
         (path, nd, depth) => {
           if (depth < mind || depth > maxd) return;
+          const rest = path.slice(startAbs.length === 1 ? 0 : startAbs.length);
+          const shown = depth === 0 ? start : (trimmedStart === '/' ? '/' + rest.replace(/^\//, '') : trimmedStart + rest);
           const name = path === '/' ? '/' : path.split('/').pop();
-          if (preds.every(fn => fn(path, nd, name))) ctx.out(path + '\n');
+          run({ path: shown, abs: path, shown, node: nd, name: depth === 0 && start.endsWith('.') ? start : name });
         },
         path => { ctx.err(`find: '${path}': Permission denied\n`); code = 1; },
         0, maxd);
+    }
+    for (const abs of pendingDelete.reverse()) {
+      try { const nd = vfs.lookup(abs, '/', null); if (nd.type === 'd') vfs.rmdir(abs, '/', user); else vfs.remove(abs, '/', user); }
+      catch (e) { ctx.err(`find: cannot delete '${abs}': ${fsMsg(e)}\n`); code = 1; }
     }
     return code;
   };
@@ -1534,17 +2912,25 @@ function makeCommands(getCmds) {
   C.su = (args, ctx) => { ctx.err('su: このシミュレーターではユーザー切り替えは sudo で再現しています\n'); return 1; };
 
   C.sudo = (args, ctx) => {
-    if (!args.length) { ctx.err('usage: sudo command\n'); return 1; }
+    if (!args.length) { ctx.err('usage: sudo [-u user] command\n'); return 1; }
     if (args[0] === '-l') { ctx.out(ctx.sh.sudoAllowed ? `User ${ctx.sh.user.name} may run the following commands:\n    (ALL : ALL) ALL\n` : `${ctx.sh.user.name} is not allowed to run sudo on ${ctx.sh.hostname}.\n`); return 0; }
+    let target = 'root', i = 0;
+    while (i < args.length && args[i].startsWith('-')) {
+      if (args[i] === '-u') { target = args[i + 1]; i += 2; }
+      else if (args[i] === '--') { i++; break; }
+      else { ctx.err(`sudo: invalid option -- '${args[i].replace(/^-+/, '')}'\n`); return 1; }
+    }
+    const cmd = args.slice(i);
+    if (!cmd.length) { ctx.err('usage: sudo [-u user] command\n'); return 1; }
     if (!ctx.sh.sudoAllowed) { ctx.err(`${ctx.sh.user.name} is not in the sudoers file. This incident will be reported.\n`); return 1; }
+    const asUser = ctx.sh.vfs.userByName(target) || (target === 'root' ? { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash' } : null);
+    if (!asUser) { ctx.err(`sudo: unknown user ${target}\n`); return 1; }
     const savedUser = ctx.sh.user;
-    const root = ctx.sh.vfs.userByName('root') || { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash' };
-    ctx.sh.user = root;
-    try { return ctx.sh.exec(args, ctx); }
+    ctx.sh.user = asUser;
+    try { return ctx.sh.exec(cmd, ctx); }
     finally { ctx.sh.user = savedUser; }
   };
 
-  C.passwd = (args, ctx) => { ctx.out('パスワード変更はこのシミュレーターでは省略されています。\n'); return 0; };
 
   // ---------------- プロセス・サービス ----------------
   C.ps = (args, ctx) => {
@@ -1646,9 +3032,16 @@ function makeCommands(getCmds) {
     return 0;
   };
   C.printf = (args, ctx) => {
-    const fmt = args[0] || '';
-    let ai = 1;
-    const out = fmt.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/%[sd]/g, () => args[ai++] ?? '');
+    if (!args.length) { ctx.err('printf: usage: printf format [arguments]\n'); return 2; }
+    // フォーマット中のバックスラッシュエスケープ: \n \t \r \\ \" \a \b \f \v \e \NNN(8進) \xHH
+    const SIMPLE = { n: '\n', t: '\t', r: '\r', '\\': '\\', '"': '"', a: '\x07', b: '\b', f: '\f', v: '\v', e: '\x1b' };
+    const fmt = args[0].replace(/\\(?:([0-7]{1,3})|x([0-9a-fA-F]{1,2})|([\s\S]))/g, (m, o, h, c) => (o != null ? String.fromCharCode(parseInt(o, 8)) : h != null ? String.fromCharCode(parseInt(h, 16)) : (SIMPLE[c] ?? '\\' + c)));
+    const rest = args.slice(1);
+    const nconv = (fmt.match(/%[-+ #0]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[diouxXeEfFgGcs%]/g) || []).filter(m => m !== '%%').length;
+    // 引数が余ればフォーマットを繰り返し適用する（bash の printf と同じ）
+    let out = '';
+    if (!nconv) out = awkSprintf(fmt, []);
+    else { let idx = 0; do { out += awkSprintf(fmt, rest.slice(idx, idx + nconv)); idx += nconv; } while (idx < rest.length); }
     ctx.out(out);
     return 0;
   };
@@ -1774,91 +3167,101 @@ function makeCommands(getCmds) {
   };
 
   C.sed = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { n: 'bool', i: 'bool', e: 'val', E: 'bool', r: 'bool' });
-    let script = opts.e;
-    const ops = [...operands];
-    if (script == null) script = ops.shift();
-    let data = ops.length ? safeRead(ctx, ops[0], 'sed') : ctx.stdin;
-    if (data == null) return 1;
-    const lines = data.split('\n');
-    const had = lines[lines.length - 1] === '';
-    if (had) lines.pop();
-    // 対応: s/old/new/flags, Np, Nd, /re/d, /re/p
-    const m = script.match(/^s(.)(.*?)\1(.*?)\1([gip0-9]*)$/);
-    let outLines = [];
-    try {
-      if (m) {
-        const [, , pat, rep, flags] = m;
-        const re = new RegExp(pat, flags.includes('g') ? (flags.includes('i') ? 'gi' : 'g') : (flags.includes('i') ? 'i' : ''));
-        const repl = rep.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-        for (const l of lines) {
-          const r = l.replace(re, repl.replace(/&/g, '$$&'));
-          if (flags.includes('p')) { if (!opts.n) outLines.push(l); outLines.push(r); }
-          else outLines.push(r);
+    // オプション: -n -E -r -i[SUFFIX] -e script (複数可) -f file / --expression=
+    let quiet = false, ere = false, inPlace = false, suffix = '';
+    const scripts = []; const operands = [];
+    for (let k = 0; k < args.length; k++) {
+      const a = args[k];
+      if (a === '--') { operands.push(...args.slice(k + 1)); break; }
+      if (a === '-e' || a === '--expression') { const v = args[++k]; if (v == null) { ctx.err('sed: -e にはスクリプトが必要です\n'); return 1; } scripts.push(v); }
+      else if (a.startsWith('--expression=')) scripts.push(a.slice(13));
+      else if (a === '-f') { const f = args[++k]; const t = f == null ? null : safeRead(ctx, f, 'sed'); if (t == null) return 1; scripts.push(t.replace(/\n$/, '')); }
+      else if (a === '--quiet' || a === '--silent') quiet = true;
+      else if (a === '--regexp-extended') ere = true;
+      else if (a.startsWith('--in-place')) { inPlace = true; suffix = a.includes('=') ? a.split('=')[1] : ''; }
+      else if (a.length > 1 && a[0] === '-' && a[1] !== '-') {
+        for (let j = 1; j < a.length; j++) {
+          const f = a[j];
+          if (f === 'n') quiet = true;
+          else if (f === 'E' || f === 'r') ere = true;
+          else if (f === 'i') { inPlace = true; suffix = a.slice(j + 1); break; }
+          else if (f === 's') { /* 各ファイル個別: 既定で近似 */ }
+          else if (f === 'e') { const v = a.slice(j + 1) || args[++k]; if (v == null) { ctx.err('sed: -e にはスクリプトが必要です\n'); return 1; } scripts.push(v); break; }
+          else throw new OptError(`invalid option -- '${f}'`);
         }
-        if (flags.includes('p') && opts.n) outLines = lines.map(l => l.replace(re, repl)).filter((_, i) => re.test(lines[i]));
-      } else if (/^\d+d$/.test(script)) {
-        const n = parseInt(script, 10); outLines = lines.filter((_, i) => i + 1 !== n);
-      } else if (/d$/.test(script) && script.startsWith('/')) {
-        const re = new RegExp(script.slice(1, script.lastIndexOf('/')));
-        outLines = lines.filter(l => !re.test(l));
-      } else if (/^\d+p$/.test(script) && opts.n) {
-        const n = parseInt(script, 10); if (lines[n - 1] != null) outLines = [lines[n - 1]];
-      } else { ctx.err(`sed: このシミュレーターでは一部のスクリプトのみ対応しています (${script})\n`); return 1; }
-    } catch (e) { ctx.err(`sed: -e 式 #1 の解釈に失敗: ${e.message}\n`); return 1; }
-    const result = outLines.map(l => l + '\n').join('');
-    if (opts.i && ops.length) { try { ctx.sh.vfs.writeFile(ops[0], ctx.sh.cwd, ctx.sh.user, result); } catch (e) { ctx.err(`sed: ${fsMsg(e)}\n`); return 1; } }
-    else ctx.out(result);
-    return 0;
+      }
+      else operands.push(a);
+    }
+    if (!scripts.length) { if (!operands.length) { ctx.err("usage: sed [-n] [-E] [-i[SUFFIX]] script [file ...]\n"); return 1; } scripts.push(operands.shift()); }
+    let cmds;
+    try { cmds = parseSed(scripts.join('\n'), ere); }
+    catch (e) { if (e instanceof SedError) { ctx.err(`sed: -e 式 #1: ${e.message}\n`); return 1; } throw e; }
+    const toLines = (text) => { const l = text.split('\n'); if (l[l.length - 1] === '') l.pop(); return l; };
+    try {
+      if (inPlace) {
+        if (!operands.length) { ctx.err('sed: -i にはファイルが必要です\n'); return 1; }
+        let code = 0;
+        for (const f of operands) {
+          const text = safeRead(ctx, f, 'sed'); if (text == null) { code = 1; continue; }
+          const out = runSedLines(cmds, toLines(text), { quiet });
+          try {
+            if (suffix) ctx.sh.vfs.writeFile(suffix.includes('*') ? suffix.replace('*', f) : f + suffix, ctx.sh.cwd, ctx.sh.user, text);
+            ctx.sh.vfs.writeFile(f, ctx.sh.cwd, ctx.sh.user, out.length ? out.join('\n') + '\n' : '');
+          } catch (e) { ctx.err(`sed: ${f}: ${fsMsg(e)}\n`); code = 1; }
+        }
+        return code;
+      }
+      let lines = [];
+      if (!operands.length) lines = toLines(ctx.stdin);
+      else for (const f of operands) { const t = f === '-' ? ctx.stdin : safeRead(ctx, f, 'sed'); if (t == null) return 1; lines.push(...toLines(t)); }
+      const out = runSedLines(cmds, lines, { quiet });
+      if (out.length) ctx.out(out.join('\n') + '\n');
+      return 0;
+    } catch (e) { if (e instanceof SedError) { ctx.err(`sed: ${e.message}\n`); return 1; } throw e; }
   };
 
   C.awk = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { F: 'val' });
-    const prog = operands.shift();
-    let data = operands.length ? safeRead(ctx, operands[0], 'awk') : ctx.stdin;
-    if (data == null) return 1;
-    const FS = opts.F || /\s+/;
-    const lines = data.split('\n');
-    if (lines[lines.length - 1] === '') lines.pop();
-    // 対応: '{print $N}', '{print $N, $M}', '/re/{print...}', 'NR==N', '{print}'
-    const bodyMatch = prog.match(/^\s*(?:\/([^/]*)\/)?\s*(?:\{(.*)\})?\s*$/);
-    let reFilter = null, body = 'print';
-    if (bodyMatch) { if (bodyMatch[1]) reFilter = new RegExp(bodyMatch[1]); if (bodyMatch[2] != null) body = bodyMatch[2].trim(); }
-    const condMatch = prog.match(/^\s*(NR|NF)\s*(==|>|<|>=|<=)\s*(\d+)\s*(?:\{(.*)\})?\s*$/);
-    lines.forEach((line, idx) => {
-      const trimmed = opts.F ? line : line.trim();
-      const fields = opts.F ? line.split(FS) : (line.trim() === '' ? [] : line.trim().split(FS));
-      const NR = idx + 1, NF = fields.length;
-      let pass = true;
-      if (reFilter) pass = reFilter.test(line);
-      if (condMatch) {
-        const lhs = condMatch[1] === 'NR' ? NR : NF;
-        const rhs = parseInt(condMatch[3], 10);
-        const op = condMatch[2];
-        pass = op === '==' ? lhs === rhs : op === '>' ? lhs > rhs : op === '<' ? lhs < rhs : op === '>=' ? lhs >= rhs : lhs <= rhs;
-        if (condMatch[4] != null) body = condMatch[4].trim();
-        else body = 'print';
+    // 手動でオプションを解析（-F fs / -v var=val(複数可) / -f progfile / --）
+    let FS = null; const vars = {}; let progFile = null; let i = 0;
+    const unesc = (v) => v.replace(/\\t/g, '\t').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+    for (; i < args.length; i++) {
+      const a = args[i];
+      if (a === '--') { i++; break; }
+      if (a.startsWith('-F')) { const v = a.length > 2 ? a.slice(2) : args[++i]; if (v == null) { ctx.err('awk: -F には区切り文字が必要です\n'); return 2; } FS = v === 't' ? '\t' : unesc(v); }
+      else if (a.startsWith('-v')) {
+        const v = a.length > 2 ? a.slice(2) : args[++i];
+        const m = (v || '').match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s);
+        if (!m) { ctx.err('awk: -v には var=value の形式が必要です\n'); return 2; }
+        vars[m[1]] = unesc(m[2]);
       }
-      if (!pass) return;
-      const printMatch = body.match(/^print\s*(.*)$/);
-      if (printMatch != null) {
-        const arg = printMatch[1].trim();
-        if (!arg) { ctx.out(line + '\n'); return; }
-        const parts = arg.split(',').map(tok => {
-          tok = tok.trim();
-          if (tok === '$0') return line;
-          if (tok === '$NF') return fields[NF - 1] ?? '';
-          if (tok === '$(NF-1)') return fields[NF - 2] ?? '';
-          const fm = tok.match(/^\$(\d+)$/);
-          if (fm) return fields[parseInt(fm[1], 10) - 1] ?? '';
-          if (tok === 'NR') return String(NR);
-          if (tok === 'NF') return String(NF);
-          return tok.replace(/^"|"$/g, '');
-        });
-        ctx.out(parts.join(' ') + '\n');
+      else if (a === '-f') { progFile = args[++i]; if (progFile == null) { ctx.err('awk: -f にはファイル名が必要です\n'); return 2; } }
+      else if (a.startsWith('-') && a.length > 1) { ctx.err(`awk: 未対応のオプション ${a}\n`); return 2; }
+      else break;
+    }
+    let program;
+    if (progFile != null) {
+      program = safeRead(ctx, progFile, 'awk'); if (program == null) return 2;
+    } else {
+      program = args[i++];
+      if (program == null) { ctx.err('usage: awk [-F fs] [-v var=value] \'prog\' [file ...]\n'); return 2; }
+    }
+    const files = args.slice(i);
+    const inputs = [];
+    if (!files.length) inputs.push({ name: '', text: ctx.stdin });
+    else {
+      for (const f of files) {
+        if (f === '-') { inputs.push({ name: '-', text: ctx.stdin }); continue; }
+        const text = safeRead(ctx, f, 'awk');
+        if (text == null) return 2;
+        inputs.push({ name: f, text });
       }
-    });
-    return 0;
+    }
+    try {
+      return runAwk({ program, inputs, vars, FS, out: (t) => ctx.out(t) });
+    } catch (e) {
+      if (e instanceof AwkError) { ctx.err(`awk: ${e.message}\n`); return 2; }
+      throw e;
+    }
   };
 
   C.tee = (args, ctx) => {
@@ -1983,14 +3386,41 @@ function makeCommands(getCmds) {
   C.sha256sum = (args, ctx) => hashCmd(args, ctx, 'sha256');
   C.sha1sum = (args, ctx) => hashCmd(args, ctx, 'sha1');
   function hashCmd(args, ctx, algo) {
+    const name = algo + 'sum';
+    const { opts, operands } = parseOpts(args, { c: 'bool', b: 'bool', t: 'bool', q: 'bool', w: 'bool', s: 'bool', '--check': 'bool', '--quiet': 'bool', '--status': 'bool', '--warn': 'bool' });
+    const hashFn = HASHERS[algo];
+    // -c: 「ハッシュ  ファイル名」の一覧と照合（改ざん検知）
+    const quiet = opts.q || opts['--quiet'], status = opts.s || opts['--status'];
+    if (opts.c || opts['--check']) {
+      const lists = operands.length ? operands : ['-'];
+      let failed = 0, missing = 0, total = 0, code = 0;
+      for (const lf of lists) {
+        const text = lf === '-' ? ctx.stdin : safeRead(ctx, lf, name);
+        if (text == null) { code = 1; continue; }
+        for (const raw of text.split('\n')) {
+          const line = raw.trim(); if (!line) continue;
+          const m = line.match(/^([0-9a-fA-F]+)\s+\*?(.+)$/);
+          if (!m) { if (!opts.w) continue; ctx.err(`${name}: ${lf}: 書式が不正な行があります\n`); continue; }
+          total++;
+          let data;
+          try { data = ctx.sh.vfs.readFile(m[2], ctx.sh.cwd, ctx.sh.user); }
+          catch (e) { missing++; ctx.out(`${m[2]}: FAILED open or read\n`); continue; }
+          const okHash = hashFn(data).toLowerCase() === m[1].toLowerCase();
+          if (!okHash) failed++;
+          if (!(quiet && okHash) && !status) ctx.out(`${m[2]}: ${okHash ? 'OK' : 'FAILED'}\n`);
+        }
+      }
+      if (failed) ctx.err(`${name}: WARNING: ${failed} computed checksum${failed > 1 ? 's' : ''} did NOT match\n`);
+      if (missing) ctx.err(`${name}: WARNING: ${missing} listed file${missing > 1 ? 's' : ''} could not be read\n`);
+      return (failed || missing || code) ? 1 : 0;
+    }
     let code = 0;
-    const srcs = args.filter(a => !a.startsWith('-'));
-    const list = srcs.length ? srcs : ['-'];
+    const list = operands.length ? operands : ['-'];
     for (const p of list) {
       let data;
       if (p === '-') data = ctx.stdin;
-      else { data = safeRead(ctx, p, algo + 'sum'); if (data == null) { code = 1; continue; } }
-      ctx.out(`${simpleHash(data, algo)}  ${p}\n`);
+      else { data = safeRead(ctx, p, name); if (data == null) { code = 1; continue; } }
+      ctx.out(`${hashFn(data)}  ${p}\n`);
     }
     return code;
   }
@@ -2089,6 +3519,147 @@ function makeCommands(getCmds) {
     return 0;
   };
 
+  // ---------- test / [ ] / [[ ]] ----------
+  function evalTest(args, ctx, dbl) {
+    let pos = 0;
+    const sh = ctx.sh, vfs = sh.vfs;
+    const node = (p) => { try { return vfs.lookup(p, sh.cwd, null, { allowMissing: true }); } catch { return null; } };
+    const UNARY = new Set(['-e', '-f', '-d', '-r', '-w', '-x', '-s', '-z', '-n', '-L', '-h']);
+    const BIN = new Set(['=', '==', '!=', '-eq', '-ne', '-lt', '-le', '-gt', '-ge', '=~', '<', '>']);
+    const num = (x) => { if (!/^-?\d+$/.test(String(x).trim())) throw new Error(`${x}: integer expression expected`); return parseInt(x, 10); };
+    const unary = (op, a) => {
+      if (op === '-z') return a === '';
+      if (op === '-n') return a !== '';
+      const n = node(a);
+      if (!n) return false;
+      switch (op) {
+        case '-e': return true;
+        case '-f': return n.type === 'f';
+        case '-d': return n.type === 'd';
+        case '-s': return n.type === 'd' || (n.content || '').length > 0;
+        case '-r': return vfs.can(n, sh.user, 4);
+        case '-w': return vfs.can(n, sh.user, 2);
+        case '-x': return vfs.can(n, sh.user, 1);
+        default: return false; // -L/-h: シンボリックリンクは未対応
+      }
+    };
+    const binary = (l, op, r) => {
+      switch (op) {
+        case '=': case '==': return dbl ? globMatchStr(r, l) : l === r;
+        case '!=': return dbl ? !globMatchStr(r, l) : l !== r;
+        case '-eq': return num(l) === num(r);
+        case '-ne': return num(l) !== num(r);
+        case '-lt': return num(l) < num(r);
+        case '-le': return num(l) <= num(r);
+        case '-gt': return num(l) > num(r);
+        case '-ge': return num(l) >= num(r);
+        case '=~': try { return new RegExp(posixToJs(r, true)).test(l); } catch { throw new Error(`無効な正規表現: ${r}`); }
+        case '<': return l < r;
+        default: return l > r;
+      }
+    };
+    const parseOr = () => { let l = parseAnd(); while (args[pos] === '-o' || args[pos] === '||') { pos++; const r = parseAnd(); l = l || r; } return l; };
+    const parseAnd = () => { let l = parseNot(); while (args[pos] === '-a' || args[pos] === '&&') { pos++; const r = parseNot(); l = l && r; } return l; };
+    const parseNot = () => { if (args[pos] === '!') { pos++; return !parseNot(); } return primary(); };
+    const primary = () => {
+      if (args[pos] === '(') { pos++; const v = parseOr(); if (args[pos] !== ')') throw new Error("missing ')'"); pos++; return v; }
+      const rem = args.length - pos;
+      if (rem >= 3 && BIN.has(args[pos + 1])) { const l = args[pos], op = args[pos + 1], r = args[pos + 2]; pos += 3; return binary(l, op, r); }
+      if (rem >= 2 && UNARY.has(args[pos])) { const op = args[pos], a = args[pos + 1]; pos += 2; return unary(op, a); }
+      if (rem >= 1) return args[pos++] !== '';
+      throw new Error('argument expected');
+    };
+    if (!args.length) return false;
+    const v = parseOr();
+    if (pos < args.length) throw new Error(`too many arguments`);
+    return v;
+  }
+  function globMatchStr(pat, str) { return globRe(pat).test(str); }
+  C.test = (args, ctx) => { try { return evalTest(args, ctx, false) ? 0 : 1; } catch (e) { ctx.err(`test: ${e.message}\n`); return 2; } };
+  C['['] = (args, ctx) => {
+    if (args[args.length - 1] !== ']') { ctx.err("[: missing `]'\n"); return 2; }
+    try { return evalTest(args.slice(0, -1), ctx, false) ? 0 : 1; } catch (e) { ctx.err(`[: ${e.message}\n`); return 2; }
+  };
+  C['[['] = (args, ctx) => {
+    if (args[args.length - 1] !== ']]') { ctx.err("[[: missing `]]'\n"); return 2; }
+    try { return evalTest(args.slice(0, -1), ctx, true) ? 0 : 1; } catch (e) { ctx.err(`[[: ${e.message}\n`); return 2; }
+  };
+  C[':'] = () => 0;
+  C['break'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("break: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('break'); };
+  C['continue'] = (args, ctx) => { if (!ctx.sh.loopDepth) { ctx.err("continue: only meaningful in a `for', `while', or `until' loop\n"); return 0; } throw new LoopSignal('continue'); };
+
+  C.strings = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { n: 'val', a: 'bool' });
+    const min = opts.n != null ? parseInt(opts.n, 10) : 4;
+    if (!(min > 0)) { ctx.err('strings: invalid minimum string length\n'); return 1; }
+    const srcs = operands.length ? operands : ['-'];
+    let code = 0;
+    for (const p of srcs) {
+      const data = p === '-' ? ctx.stdin : safeRead(ctx, p, 'strings');
+      if (data == null) { code = 1; continue; }
+      for (const m of data.split(/[^\x20-\x7e\t]+/)) if (m.length >= min) ctx.out(m + '\n');
+    }
+    return code;
+  };
+
+  C.xxd = (args, ctx) => {
+    const { opts, operands } = parseOpts(args, { r: 'bool', p: 'bool', l: 'val', c: 'val' });
+    const src = operands[0];
+    const data = src && src !== '-' ? safeRead(ctx, src, 'xxd') : ctx.stdin;
+    if (data == null) return 1;
+    // -r -p: プレーン16進(空白・改行は無視) → バイト列に戻す
+    if (opts.r) {
+      const hexstr = data.replace(/[^0-9a-fA-F]/g, '');
+      if (hexstr.length % 2) { ctx.err('xxd: 16進数の桁数が奇数です\n'); return 1; }
+      const bytes = hexstr.match(/../g) || [];
+      let out = '';
+      for (const b of bytes) out += String.fromCharCode(parseInt(b, 16));
+      try { out = decodeURIComponent(escape(out)); } catch { /* バイナリのまま */ }
+      ctx.out(out);
+      return 0;
+    }
+    const bytes = [];
+    for (const ch of data) { const c = ch.codePointAt(0); if (c < 0x80) bytes.push(c); else for (const b of unescape(encodeURIComponent(ch))) bytes.push(b.charCodeAt(0)); }
+    if (opts.p) { ctx.out((bytes.map(b => b.toString(16).padStart(2, '0')).join('').match(/.{1,60}/g) || []).join('\n') + '\n'); return 0; }
+    const w = opts.c ? parseInt(opts.c, 10) : 16;
+    for (let off = 0; off < bytes.length; off += w) {
+      const chunk = bytes.slice(off, off + w);
+      const hex = [];
+      for (let i = 0; i < w; i += 2) hex.push((chunk[i] !== undefined ? chunk[i].toString(16).padStart(2, '0') : '  ') + (chunk[i + 1] !== undefined ? chunk[i + 1].toString(16).padStart(2, '0') : '  '));
+      ctx.out(`${off.toString(16).padStart(8, '0')}: ${hex.join(' ')}  ${chunk.map(b => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.')).join('')}\n`);
+    }
+    return 0;
+  };
+
+  C.bash = (args, ctx) => {
+    // bash script.sh [args...] / bash -c 'command'。同じ安全なパーサーで解釈する（実シェルは使わない）
+    let i = 0; let cmdStr = null;
+    for (; i < args.length; i++) {
+      const a = args[i];
+      if (a === '-c') { cmdStr = args[i + 1]; i += 2; break; }
+      if (a === '--') { i++; break; }
+      if (a.startsWith('-') && a !== '-') continue; // -e -x -u などは無視
+      break;
+    }
+    const sh = ctx.sh;
+    if (sh.depth >= 8) { ctx.err('bash: 入れ子が深すぎます\n'); return 1; }
+    if (cmdStr != null) {
+      sh.depth++;
+      try {
+        const chunks = sh.run(cmdStr, { record: false });
+        for (const c of chunks) (c.fd === 2 ? ctx.err : ctx.out)(c.text);
+        return sh.lastCode;
+      } finally { sh.depth--; }
+    }
+    const file = args[i];
+    if (!file) { ctx.err('bash: 対話シェルはこのシミュレーターでは未対応です（bash スクリプト名 か bash -c \'コマンド\' を指定）\n'); return 1; }
+    let content;
+    try { content = sh.vfs.readFile(file, sh.cwd, sh.user); }
+    catch (e) { ctx.err(`bash: ${file}: ${fsMsg(e)}\n`); return 127; }
+    return sh.runScript(content, args.slice(i + 1), ctx, file);
+  };
+  C.sh = C.bash;
+
   C.crontab = (args, ctx) => {
     if (args.includes('-l')) {
       try { ctx.out(ctx.sh.vfs.readFile(`/var/spool/cron/crontabs/${ctx.sh.user.name}`, '/', ctx.sh.user)); return 0; }
@@ -2100,6 +3671,7 @@ function makeCommands(getCmds) {
 
   return C;
 }
+
 
 // ---------- jq (簡易版) ----------
 // 対応: . / .key / .a.b / .[] / .key[] / .key[0] / .["k"] / | / keys / length
@@ -2243,22 +3815,6 @@ function computeMode(cur, spec) {
   return mode;
 }
 
-// 教育用の軽量ハッシュ（暗号用途ではない。固定の16進表現を得るため）
-function simpleHash(str, algo) {
-  const len = algo === 'md5' ? 32 : algo === 'sha1' ? 40 : 64;
-  let h = new Array(len / 2).fill(0);
-  let acc = algo === 'md5' ? 0x67 : algo === 'sha1' ? 0x1a : 0x6a;
-  for (let i = 0; i < str.length; i++) {
-    const c = str.charCodeAt(i);
-    for (let j = 0; j < h.length; j++) {
-      acc = (acc * 31 + c + j * 7 + i) & 0xff;
-      h[j] = (h[j] + acc + ((c << (j % 5)) & 0xff)) & 0xff;
-    }
-  }
-  // 追加撹拌
-  for (let round = 0; round < 3; round++) for (let j = 0; j < h.length; j++) h[j] = (h[j] * 131 + h[(j + 1) % h.length] + round) & 0xff;
-  return h.map(b => b.toString(16).padStart(2, '0')).join('');
-}
 function b64encode(str) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   const bytes = []; for (const ch of str) { const c = ch.codePointAt(0); if (c < 0x80) bytes.push(c); else if (c < 0x800) { bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f)); } else { bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); } }
@@ -2286,7 +3842,7 @@ function b64decode(str) {
 }
 
 
-Object.assign(exports, { makeCommands, simpleHash, b64encode });
+Object.assign(exports, { makeCommands, OptError, b64encode });
 
 };
 __mods["js/netcommands.js"] = function (module, exports, __require) {
@@ -2594,6 +4150,368 @@ function prefixToMask(prefix) {
 Object.assign(exports, { makeNetCommands });
 
 };
+__mods["js/useradmin.js"] = function (module, exports, __require) {
+// ============================================================
+// ユーザー・グループ管理コマンド（仮想の /etc/passwd /etc/group /etc/shadow を更新）
+// すべて仮想FS上の操作。root 権限（sudo）が必要。
+// ============================================================
+
+const NAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+// getopt 風: 結合フラグ(-aG)・値付き(-s /bin/sh, -s/bin/sh, -G g1,g2)に対応
+function parseArgs(args, valueFlags, boolFlags) {
+  const opts = {}; const operands = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.length > 1 && a[0] === '-' && a !== '--') {
+      for (let j = 1; j < a.length; j++) {
+        const f = a[j];
+        if (boolFlags.includes(f)) opts[f] = true;
+        else if (valueFlags.includes(f)) { opts[f] = a.length > j + 1 ? a.slice(j + 1) : args[++i]; break; }
+        else return { error: `invalid option -- '${f}'` };
+      }
+    } else operands.push(a);
+  }
+  return { opts, operands };
+}
+
+function shadowLines(vfs) {
+  const n = vfs.lookup('/etc/shadow', '/', null, { allowMissing: true });
+  return n ? n.content.split('\n').filter(Boolean) : [];
+}
+function writeShadow(vfs, lines) {
+  const n = vfs.lookup('/etc/shadow', '/', null, { allowMissing: true });
+  const text = lines.length ? lines.join('\n') + '\n' : '';
+  if (n) n.content = text; else vfs.addFile('/etc/shadow', text, { mode: 0o640, owner: 'root', group: 'root' });
+}
+function isLocked(vfs, name) {
+  const l = shadowLines(vfs).find(x => x.split(':')[0] === name);
+  return !!l && (l.split(':')[1] || '').startsWith('!');
+}
+function setLock(vfs, name, lock) {
+  const lines = shadowLines(vfs);
+  let found = false;
+  const out = lines.map(l => {
+    const f = l.split(':');
+    if (f[0] !== name) return l;
+    found = true;
+    const h = f[1] || '';
+    f[1] = lock ? (h.startsWith('!') ? h : '!' + h) : h.replace(/^!+/, '');
+    return f.join(':');
+  });
+  if (!found) out.push(`${name}:${lock ? '!' : '*'}:19700:0:99999:7:::`);
+  writeShadow(vfs, out);
+}
+
+function makeUserAdminCommands() {
+  const U = {};
+  const root = (ctx, cmd) => { if (ctx.sh.user.uid !== 0) { ctx.err(`${cmd}: Permission denied.\n${cmd}: cannot lock /etc/passwd; try again later.\n`); return false; } return true; };
+  const findGroup = (vfs, spec) => vfs.groupByName(spec) || (/^\d+$/.test(spec) ? vfs.groupById(parseInt(spec, 10)) : null);
+  const nextId = (used, start) => { let n = start; while (used.has(n)) n++; return n; };
+
+  U.useradd = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, ['s', 'g', 'G', 'u', 'd', 'c', 'k'], ['m', 'M', 'r', 'N', 'U']);
+    if (error) { ctx.err(`useradd: ${error}\n`); return 2; }
+    if (!root(ctx, 'useradd')) return 1;
+    const name = operands[0];
+    if (!name) { ctx.err('Usage: useradd [options] LOGIN\n'); return 2; }
+    if (!NAME_RE.test(name)) { ctx.err(`useradd: invalid user name '${name}'\n`); return 3; }
+    if (vfs.userByName(name)) { ctx.err(`useradd: user '${name}' already exists\n`); return 9; }
+    const usedUids = new Set(vfs.users.map(u => u.uid));
+    let uid;
+    if (opts.u != null) {
+      uid = parseInt(opts.u, 10);
+      if (!Number.isInteger(uid) || uid < 0) { ctx.err(`useradd: invalid user ID '${opts.u}'\n`); return 3; }
+      if (usedUids.has(uid)) { ctx.err(`useradd: UID ${uid} is not unique\n`); return 4; }
+    } else uid = nextId(usedUids, Math.max(1000, ...vfs.users.filter(u => u.uid < 60000).map(u => u.uid + 1)));
+    let gid;
+    if (opts.g != null) {
+      const g = findGroup(vfs, opts.g);
+      if (!g) { ctx.err(`useradd: group '${opts.g}' does not exist\n`); return 6; }
+      gid = g.gid;
+    } else {
+      if (vfs.groupByName(name)) { ctx.err(`useradd: group ${name} exists - if you want to add this user to that group, use -g.\n`); return 9; }
+      const usedGids = new Set(vfs.groups.map(g => g.gid));
+      gid = usedGids.has(uid) ? nextId(usedGids, 1000) : uid;
+      vfs.groups.push({ name, gid, members: [] });
+    }
+    const extra = [];
+    if (opts.G) for (const gn of opts.G.split(',').filter(Boolean)) {
+      const g = vfs.groupByName(gn);
+      if (!g) { ctx.err(`useradd: group '${gn}' does not exist\n`); return 6; }
+      extra.push(g);
+    }
+    const home = opts.d || (opts.r ? `/var/lib/${name}` : `/home/${name}`);
+    vfs.users.push({ name, uid, gid, home, shell: opts.s || '/bin/sh', gecos: opts.c || '' });
+    for (const g of extra) if (!g.members.includes(name)) g.members.push(name);
+    vfs.syncAccountFiles();
+    setLock(vfs, name, true); // パスワード未設定＝ロック状態で作られる
+    if (opts.m && !opts.M) {
+      vfs.addDir(home, { mode: 0o755, owner: name, group: vfs.gname(gid) });
+      vfs.addFile(`${home}/.bashrc`, '# ~/.bashrc\n', { owner: name, group: vfs.gname(gid), mode: 0o644 });
+      vfs.addFile(`${home}/.profile`, '# ~/.profile\n', { owner: name, group: vfs.gname(gid), mode: 0o644 });
+    }
+    return 0;
+  };
+
+  U.usermod = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, ['s', 'g', 'G', 'd', 'c', 'l'], ['a', 'L', 'U']);
+    if (error) { ctx.err(`usermod: ${error}\n`); return 2; }
+    if (!root(ctx, 'usermod')) return 1;
+    const name = operands[0];
+    if (!name) { ctx.err('Usage: usermod [options] LOGIN\n'); return 2; }
+    const u = vfs.userByName(name);
+    if (!u) { ctx.err(`usermod: user '${name}' does not exist\n`); return 6; }
+    if (opts.a && opts.G == null) { ctx.err('usermod: option -a は -G と一緒に指定してください\n'); return 2; }
+    if (opts.G != null) {
+      const wanted = opts.G.split(',').filter(Boolean);
+      for (const gn of wanted) if (!vfs.groupByName(gn)) { ctx.err(`usermod: group '${gn}' does not exist\n`); return 6; }
+      if (!opts.a) for (const g of vfs.groups) g.members = g.members.filter(m => m !== name); // -a なしは置き換え
+      for (const gn of wanted) { const g = vfs.groupByName(gn); if (!g.members.includes(name)) g.members.push(name); }
+    }
+    if (opts.g != null) { const g = findGroup(vfs, opts.g); if (!g) { ctx.err(`usermod: group '${opts.g}' does not exist\n`); return 6; } u.gid = g.gid; }
+    if (opts.s != null) u.shell = opts.s;
+    if (opts.d != null) u.home = opts.d;
+    if (opts.c != null) u.gecos = opts.c;
+    if (opts.l != null) {
+      if (!NAME_RE.test(opts.l)) { ctx.err(`usermod: invalid user name '${opts.l}'\n`); return 3; }
+      for (const g of vfs.groups) g.members = g.members.map(m => (m === name ? opts.l : m));
+      writeShadow(vfs, shadowLines(vfs).map(l => (l.split(':')[0] === name ? [opts.l, ...l.split(':').slice(1)].join(':') : l)));
+      u.name = opts.l;
+    }
+    if (opts.L) setLock(vfs, u.name, true);
+    if (opts.U) setLock(vfs, u.name, false);
+    vfs.syncAccountFiles();
+    return 0;
+  };
+
+  U.userdel = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, [], ['r', 'f']);
+    if (error) { ctx.err(`userdel: ${error}\n`); return 2; }
+    if (!root(ctx, 'userdel')) return 1;
+    const name = operands[0];
+    if (!name) { ctx.err('Usage: userdel [options] LOGIN\n'); return 2; }
+    const u = vfs.userByName(name);
+    if (!u) { ctx.err(`userdel: user '${name}' does not exist\n`); return 6; }
+    const proc = ctx.sh.processes.find(p => p.user === name);
+    if (proc && !opts.f) { ctx.err(`userdel: user ${name} is currently used by process ${proc.pid}\n`); return 8; }
+    vfs.users = vfs.users.filter(x => x.name !== name);
+    for (const g of vfs.groups) g.members = g.members.filter(m => m !== name);
+    const pg = vfs.groupByName(name);
+    if (pg && pg.gid === u.gid && !vfs.users.some(x => x.gid === pg.gid) && !pg.members.length) vfs.groups = vfs.groups.filter(g => g !== pg);
+    writeShadow(vfs, shadowLines(vfs).filter(l => l.split(':')[0] !== name));
+    vfs.syncAccountFiles();
+    if (opts.r) { try { vfs.remove(u.home, '/', null, { recursive: true }); } catch { /* ホームが無い場合は無視 */ } }
+    return 0;
+  };
+
+  U.groupadd = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, ['g'], ['r']);
+    if (error) { ctx.err(`groupadd: ${error}\n`); return 2; }
+    if (!root(ctx, 'groupadd')) return 1;
+    const name = operands[0];
+    if (!name) { ctx.err('Usage: groupadd [options] GROUP\n'); return 2; }
+    if (!NAME_RE.test(name)) { ctx.err(`groupadd: '${name}' is not a valid group name\n`); return 3; }
+    if (vfs.groupByName(name)) { ctx.err(`groupadd: group '${name}' already exists\n`); return 9; }
+    const used = new Set(vfs.groups.map(g => g.gid));
+    let gid;
+    if (opts.g != null) { gid = parseInt(opts.g, 10); if (!Number.isInteger(gid) || gid < 0) { ctx.err(`groupadd: invalid group ID '${opts.g}'\n`); return 3; } if (used.has(gid)) { ctx.err(`groupadd: GID '${gid}' already exists\n`); return 4; } }
+    else gid = nextId(used, Math.max(1000, ...vfs.groups.filter(g => g.gid < 60000).map(g => g.gid + 1)));
+    vfs.groups.push({ name, gid, members: [] });
+    vfs.syncAccountFiles();
+    return 0;
+  };
+
+  U.groupdel = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    if (!root(ctx, 'groupdel')) return 1;
+    const name = args.find(a => !a.startsWith('-'));
+    if (!name) { ctx.err('Usage: groupdel GROUP\n'); return 2; }
+    const g = vfs.groupByName(name);
+    if (!g) { ctx.err(`groupdel: group '${name}' does not exist\n`); return 6; }
+    const prim = vfs.users.find(u => u.gid === g.gid);
+    if (prim) { ctx.err(`groupdel: cannot remove the primary group of user '${prim.name}'\n`); return 8; }
+    vfs.groups = vfs.groups.filter(x => x !== g);
+    vfs.syncAccountFiles();
+    return 0;
+  };
+
+  U.gpasswd = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const { opts, operands, error } = parseArgs(args, ['a', 'd'], []);
+    if (error) { ctx.err(`gpasswd: ${error}\n`); return 2; }
+    if (!root(ctx, 'gpasswd')) return 1;
+    const gname = operands[0];
+    const g = gname && vfs.groupByName(gname);
+    if (!g) { ctx.err(`gpasswd: group '${gname || ''}' does not exist\n`); return 3; }
+    if (opts.a != null) {
+      if (!vfs.userByName(opts.a)) { ctx.err(`gpasswd: user '${opts.a}' does not exist\n`); return 3; }
+      if (!g.members.includes(opts.a)) g.members.push(opts.a);
+      ctx.out(`Adding user ${opts.a} to group ${gname}\n`);
+    } else if (opts.d != null) {
+      if (!g.members.includes(opts.d)) { ctx.err(`gpasswd: user '${opts.d}' is not a member of '${gname}'\n`); return 3; }
+      g.members = g.members.filter(m => m !== opts.d);
+      ctx.out(`Removing user ${opts.d} from group ${gname}\n`);
+    } else { ctx.err('Usage: gpasswd (-a USER | -d USER) GROUP\n'); return 2; }
+    vfs.syncAccountFiles();
+    return 0;
+  };
+
+  U.passwd = (args, ctx) => {
+    const vfs = ctx.sh.vfs;
+    const flags = args.filter(a => a.startsWith('-'));
+    const target = args.find(a => !a.startsWith('-')) || ctx.sh.user.name;
+    const u = vfs.userByName(target);
+    if (!u) { ctx.err(`passwd: user '${target}' does not exist\n`); return 1; }
+    if (flags.includes('-S')) {
+      if (ctx.sh.user.uid !== 0 && target !== ctx.sh.user.name) { ctx.err(`passwd: You may not view or modify password information for ${target}.\n`); return 1; }
+      ctx.out(`${target} ${isLocked(vfs, target) ? 'L' : 'P'} 2026-10-14 0 99999 7 -1\n`); return 0;
+    }
+    if (ctx.sh.user.uid !== 0 && target !== ctx.sh.user.name) { ctx.err(`passwd: You may not view or modify password information for ${target}.\n`); return 1; }
+    if (flags.includes('-l') || flags.includes('-u')) {
+      if (ctx.sh.user.uid !== 0) { ctx.err('passwd: Permission denied.\n'); return 1; }
+      setLock(vfs, target, flags.includes('-l')); ctx.out('passwd: password expiry information changed.\n'); return 0;
+    }
+    ctx.err('(シミュレーター: パスワードの対話入力は省略され、変更は記録されません)\n');
+    ctx.out('passwd: password updated successfully\n');
+    return 0;
+  };
+
+  return U;
+}
+
+Object.assign(exports, { isLocked, makeUserAdminCommands });
+
+};
+__mods["js/tcpdump.js"] = function (module, exports, __require) {
+// ============================================================
+// tcpdump（キャプチャファイル読み取り版）。実際のパケット取得は行わない。
+// キャプチャファイルは tcpdump 出力形式のテキスト:
+//   HH:MM:SS.ffffff IP 送信元.ポート > 宛先.ポート: 詳細
+//   <TAB>ペイロード行（-A のときだけ表示）
+// フィルタは BPF の一部: host/src host/dst host/port/src port/dst port/tcp/udp/icmp/ip と and/or/not/( )
+// ============================================================
+
+const HEADER_RE = /^(\d{2}:\d{2}:\d{2}\.\d+) IP (\S+) > (\S+?): (.*)$/;
+const ADDR_RE = /^((?:\d+\.){3}\d+)(?:\.(\d+))?$/;
+
+function parsePackets(text) {
+  const pkts = [];
+  for (const line of text.split('\n')) {
+    if (line.startsWith('\t')) { if (pkts.length) pkts[pkts.length - 1].payload.push(line.slice(1)); continue; }
+    if (!line.trim()) continue;
+    const m = line.match(HEADER_RE);
+    if (!m) continue;
+    const s = m[2].match(ADDR_RE), d = m[3].match(ADDR_RE);
+    if (!s || !d) continue;
+    const det = m[4];
+    pkts.push({
+      raw: line, time: m[1], detail: det, payload: [],
+      src: { ip: s[1], port: s[2] ? Number(s[2]) : null }, dst: { ip: d[1], port: d[2] ? Number(d[2]) : null },
+      proto: det.startsWith('Flags [') ? 'tcp' : /^ICMP/.test(det) ? 'icmp' : 'udp',
+    });
+  }
+  return pkts;
+}
+
+// ---- フィルタ式 ----
+function compileFilter(expr) {
+  const toks = expr.match(/\(|\)|&&|\|\||!|[^\s()]+/g) || [];
+  let pos = 0;
+  const fail = (m) => { throw new Error(`syntax error in filter expression: ${m}`); };
+  const peek = () => toks[pos];
+  const num = (t) => { if (!/^\d+$/.test(t || '')) fail(`数値が必要です (${t ?? '末尾'})`); return Number(t); };
+  const parseOr = () => { let l = parseAnd(); while (peek() === 'or' || peek() === '||') { pos++; const r = parseAnd(); const a = l; l = (p) => a(p) || r(p); } return l; };
+  const parseAnd = () => {
+    let l = parseNot();
+    while (peek() === 'and' || peek() === '&&') { pos++; const r = parseNot(); const a = l; l = (p) => a(p) && r(p); }
+    return l;
+  };
+  const parseNot = () => { if (peek() === 'not' || peek() === '!') { pos++; const i = parseNot(); return (p) => !i(p); } return primary(); };
+  const primary = () => {
+    const t = toks[pos++];
+    if (t === undefined) fail('式が途中で終わっています');
+    if (t === '(') { const v = parseOr(); if (toks[pos++] !== ')') fail("')' が必要です"); return v; }
+    if (t === 'tcp' || t === 'udp' || t === 'icmp') return (p) => p.proto === t;
+    if (t === 'ip') return () => true;
+    let dir = null;
+    let k = t;
+    if (k === 'src' || k === 'dst') { dir = k; k = toks[pos++]; }
+    if (k === 'host') { const h = toks[pos++]; if (!h) fail('host の後にアドレスが必要です'); return (p) => (dir === 'src' ? p.src.ip === h : dir === 'dst' ? p.dst.ip === h : p.src.ip === h || p.dst.ip === h); }
+    if (k === 'port') { const n = num(toks[pos++]); return (p) => (dir === 'src' ? p.src.port === n : dir === 'dst' ? p.dst.port === n : p.src.port === n || p.dst.port === n); }
+    fail(`未対応の条件 '${t}'`);
+  };
+  const f = parseOr();
+  if (pos < toks.length) fail(`余分なトークン '${toks[pos]}'`);
+  return f;
+}
+
+function makeTcpdump() {
+  const T = {};
+  T.tcpdump = (args, ctx) => {
+    const sh = ctx.sh, vfs = sh.vfs;
+    let file = null, outFile = null, count = Infinity, ascii = false, noTime = false, iface = null;
+    const rest = [];
+    const BOOL = 'nvAqtXeSlpU', VAL = 'rwcis';
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a.length > 1 && a[0] === '-' && !/^-\d/.test(a)) {
+        // getopt 風: -nr FILE / -nAr / -c10 / -vv などの結合フラグ
+        for (let j = 1; j < a.length; j++) {
+          const f = a[j];
+          if (BOOL.includes(f)) { if (f === 'A') ascii = true; if (f === 't') noTime = true; continue; }
+          if (VAL.includes(f)) {
+            const v = a.length > j + 1 ? a.slice(j + 1) : args[++i];
+            if (v == null) { ctx.err(`tcpdump: option requires an argument -- '${f}'\n`); return 1; }
+            if (f === 'r') file = v; else if (f === 'w') outFile = v; else if (f === 'i') iface = v;
+            else if (f === 'c') { count = parseInt(v, 10); if (!(count > 0)) { ctx.err(`tcpdump: invalid packet count ${v}\n`); return 1; } }
+            break;
+          }
+          ctx.err(`tcpdump: invalid option -- '${f}'\nTry 'man tcpdump' for more information.\n`); return 1;
+        }
+      } else rest.push(a);
+    }
+    if (!file) {
+      if (sh.user.uid !== 0) { ctx.err(`tcpdump: ${iface || 'eth0'}: You don't have permission to perform this capture on that device\n(socket: Operation not permitted)\n`); return 1; }
+      ctx.err('tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\n');
+      ctx.err(`listening on ${iface || 'eth0'}, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n`);
+      ctx.err('(シミュレーター: 仮想NICには実トラフィックがありません。キャプチャファイルは -r で読んでください)\n');
+      ctx.out('0 packets captured\n');
+      return 0;
+    }
+    let text;
+    try { text = vfs.readFile(file, sh.cwd, sh.user); }
+    catch (e) { ctx.err(`tcpdump: ${file}: ${e.code === 'EACCES' ? 'Permission denied' : 'No such file or directory'}\n`); return 1; }
+    let pred;
+    try { pred = rest.length ? compileFilter(rest.join(' ')) : () => true; }
+    catch (e) { ctx.err(`tcpdump: ${e.message}\n`); return 1; }
+    ctx.err(`reading from file ${file}, link-type EN10MB (Ethernet), snapshot length 262144\n`);
+    let n = 0; const saved = [];
+    for (const p of parsePackets(text)) {
+      if (!pred(p)) continue;
+      if (n >= count) break;
+      n++;
+      if (outFile) { saved.push(p.raw, ...p.payload.map(l => '\t' + l)); continue; }
+      ctx.out((noTime ? p.raw.replace(/^\S+ /, '') : p.raw) + '\n');
+      if (ascii) for (const l of p.payload) ctx.out(l + '\n');
+    }
+    if (outFile) {
+      try { vfs.writeFile(outFile, sh.cwd, sh.user, saved.length ? saved.join('\n') + '\n' : ''); }
+      catch (e) { ctx.err(`tcpdump: ${outFile}: ${e.code === 'EACCES' ? 'Permission denied' : 'cannot write'}\n`); return 1; }
+      ctx.err(`${n} packets captured\n`);
+    }
+    return 0;
+  };
+  return T;
+}
+
+Object.assign(exports, { parsePackets, makeTcpdump });
+
+};
 __mods["js/env.js"] = function (module, exports, __require) {
 // ============================================================
 // ミッション環境ビルダー：ミッション定義(env)からVFS/シェルを構築する
@@ -2602,6 +4520,8 @@ const { VFS } = __require("js/vfs.js");
 const { Shell } = __require("js/shell.js");
 const { makeCommands } = __require("js/commands.js");
 const { makeNetCommands } = __require("js/netcommands.js");
+const { makeUserAdminCommands } = __require("js/useradmin.js");
+const { makeTcpdump } = __require("js/tcpdump.js");
 
 const DEFAULT_USERS = [
   { name: 'root', uid: 0, gid: 0, home: '/root', shell: '/bin/bash', gecos: 'root' },
@@ -2635,7 +4555,11 @@ function buildEnvironment(mission) {
     if (u.sudo) { const sudo = vfs.groupByName('sudo'); if (!sudo.members.includes(u.name)) sudo.members.push(u.name); }
     for (const g of (u.groups || [])) { let grp = vfs.groupByName(g); if (!grp) { grp = { name: g, gid: nextGid++, members: [] }; vfs.groups.push(grp); } if (!grp.members.includes(u.name)) grp.members.push(u.name); }
   }
-  for (const g of (e.groups || [])) { if (!vfs.groupByName(g.name)) vfs.groups.push({ name: g.name, gid: g.gid != null ? g.gid : nextGid++, members: g.members || [] }); }
+  for (const g of (e.groups || [])) {
+    const ex = vfs.groupByName(g.name);
+    if (!ex) vfs.groups.push({ name: g.name, gid: g.gid != null ? g.gid : nextGid++, members: [...(g.members || [])] });
+    else for (const mem of (g.members || [])) if (!ex.members.includes(mem)) ex.members.push(mem);
+  }
 
   // プレイヤーをファイル作成前に登録（owner 指定を効かせるため）
   const userName = e.user || 'analyst';
@@ -2684,15 +4608,22 @@ function buildEnvironment(mission) {
   }
   rebuildPasswd(vfs, e.shadow);
 
-  // --- プレイヤーのホーム（未作成なら） ---
+  // --- プレイヤーのホーム（未作成なら）＋既定のドットファイル ---
   if (!vfs.exists(`/home/${userName}`)) vfs.addDir(`/home/${userName}`, { owner: userName, group: userName });
+  for (const [name, content] of [
+    ['.bashrc', '# ~/.bashrc: executed by bash for non-login shells.\n# (シミュレーター用の簡易版)\nalias ll=\'ls -la\'\n'],
+    ['.profile', '# ~/.profile: executed by the command interpreter for login shells.\nif [ -d "$HOME/bin" ]; then PATH="$HOME/bin:$PATH"; fi\n'],
+  ]) {
+    const hp = `/home/${userName}/${name}`;
+    if (!vfs.exists(hp)) vfs.addFile(hp, content, { owner: userName, mode: 0o644 });
+  }
   rebuildPasswd(vfs);
   const player = vfs.userByName(userName);
   const cwd = e.cwd || player.home;
 
   const commandsRef = {};
   const commands = makeCommands(() => commandsRef);
-  Object.assign(commands, makeNetCommands());
+  Object.assign(commands, makeNetCommands(), makeUserAdminCommands(), makeTcpdump());
   Object.assign(commandsRef, commands);
 
   const net = buildNetwork(e.network, hostname);
@@ -2962,6 +4893,7 @@ __mods["js/checker.js"] = function (module, exports, __require) {
 // ミッション達成判定（宣言的）。実行履歴ではなく「結果の状態」で判定する。
 // ============================================================
 const { nodeSize } = __require("js/vfs.js");
+const { isLocked } = __require("js/useradmin.js");
 
 function norm(s) { return String(s == null ? '' : s).trim(); }
 
@@ -3042,6 +4974,28 @@ function evaluate(check, answer, runtime) {
       if (check.enabled != null && s.enabled !== check.enabled) return { ok: false, detail: `サービス ${check.name} の自動起動設定が目標と違います` };
       return { ok: true };
     }
+    case 'user': {
+      // { type:'user', name, exists?, shell?, locked?, home?, inGroup?, notInGroup?, primaryGroup? }
+      const u = vfs.userByName(check.name);
+      if (check.exists === false) return u ? { ok: false, detail: `ユーザー ${check.name} がまだ存在します` } : { ok: true };
+      if (!u) return { ok: false, detail: `ユーザー ${check.name} が存在しません` };
+      if (check.shell != null && u.shell !== check.shell) return { ok: false, detail: `${check.name} のログインシェルが ${u.shell} です（目標 ${check.shell}）` };
+      if (check.home != null && u.home !== check.home) return { ok: false, detail: `${check.name} のホームが ${u.home} です（目標 ${check.home}）` };
+      if (check.primaryGroup != null && vfs.gname(u.gid) !== check.primaryGroup) return { ok: false, detail: `${check.name} の主グループが ${vfs.gname(u.gid)} です` };
+      if (check.locked != null && isLocked(vfs, check.name) !== check.locked) return { ok: false, detail: `${check.name} のロック状態が目標と違います` };
+      const groupsOf = vfs.gidsOf(u).map(g => vfs.gname(g));
+      if (check.inGroup != null && !groupsOf.includes(check.inGroup)) return { ok: false, detail: `${check.name} が ${check.inGroup} グループに所属していません` };
+      if (check.notInGroup != null && groupsOf.includes(check.notInGroup)) return { ok: false, detail: `${check.name} がまだ ${check.notInGroup} グループに所属しています` };
+      return { ok: true };
+    }
+    case 'group': {
+      const g = vfs.groupByName(check.name);
+      if (check.exists === false) return g ? { ok: false, detail: `グループ ${check.name} がまだ存在します` } : { ok: true };
+      if (!g) return { ok: false, detail: `グループ ${check.name} が存在しません` };
+      if (check.member != null && !g.members.includes(check.member)) return { ok: false, detail: `${check.member} が ${check.name} のメンバーではありません` };
+      if (check.notMember != null && g.members.includes(check.notMember)) return { ok: false, detail: `${check.notMember} がまだ ${check.name} のメンバーです` };
+      return { ok: true };
+    }
     case 'env': {
       const v = shell.env[check.name];
       if (check.equals != null) return norm(v) === norm(check.equals) ? { ok: true } : { ok: false, detail: `環境変数 ${check.name} が目標と違います` };
@@ -3116,7 +5070,7 @@ const stage0 = {
           check: { type: 'answer', any: ['/home/analyst'] },
           answerHint: 'pwd の出力をそのまま入力',
           hints: ['いま自分がいる場所を表示するコマンドがある', 'print working directory の略', 'pwd と入力して実行し、表示されたパスを答える'],
-          explain: 'pwd はカレントディレクトリの絶対パスを表示する。ホームディレクトリは慣例的に /home/ユーザー名 に置かれる。',
+          explain: 'pwd (print working directory) はカレントディレクトリの絶対パスを表示する。ホームディレクトリは慣例的に /home/ユーザー名 に置かれ、ログイン直後はここが現在地になる。ファイル操作の前に pwd で現在地を確かめる習慣は、誤ったディレクトリで rm や mv をしてしまう事故を防ぐ。',
         },
         {
           q: 'このディレクトリには隠しファイルを含めていくつのエントリ（. と .. を除く通常/隠しファイル）がありますか。ls -a で確認して数を答えてください。',
@@ -3177,14 +5131,14 @@ const stage0 = {
           { path: '/opt/training/day2/lesson.txt', content: 'Day2: 権限の考え方。\n' },
         ],
       },
-      quick: ['cd /opt/training', 'ls', 'cd ..', 'cat readme.txt', 'cd day1', 'pwd'],
+      quick: ['cd /opt/training', 'ls', 'cat readme.txt', 'cd day1', 'pwd', 'cd ..'],
       tasks: [
         {
           q: '/opt/training に移動し、その場所の絶対パスを答えてください。',
           narration: '絶対パスを使えば、今どこにいても一発で目的地へ飛べる。cd /opt/training を実行しよう。',
           check: { type: 'answer', any: ['/opt/training'] },
           hints: ['cd に絶対パスを渡す', 'cd /opt/training', '移動後に pwd で確認してその値を答える'],
-          explain: 'cd に / で始まる絶対パスを渡すと、現在地に関係なくそこへ移動できる。',
+          explain: 'cd に / で始まる絶対パスを渡すと、現在地に関係なくそこへ移動できる。絶対パスは「どこから見ても同じ場所」を指すので、手順書やスクリプトでは相対パスより事故が少ない。移動後は pwd で現在地を確認できる。',
         },
         {
           q: 'day1 ディレクトリの中の lesson.txt に書かれている「合言葉」を答えてください。',
@@ -3359,7 +5313,7 @@ const stage1 = {
           narration: 'find は -type d でディレクトリだけに絞れる。構造の把握に役立つ。',
           check: { type: 'answer', any: ['/opt/app'] },
           hints: ['find /opt -type d を実行', '出力の中で conf と logs を子に持つもの', '/opt/app が conf/ と logs/ の親'],
-          explain: '-type d でディレクトリのみ、-type f でファイルのみに絞れる。構造調査では両方を使い分ける。',
+          explain: '-type d でディレクトリのみ、-type f でファイルのみに絞れる。構造調査ではまず -type d でどんな区画に分かれているかを掴み、次に -type f で個々のファイルを探す、という順で使い分けると全体像を素早く把握できる。',
         },
       ],
       review: {
@@ -3423,7 +5377,7 @@ INFO cache cleared
           narration: 'ログは書き手によって ERROR / error / Error と表記が揺れる。-i で大小を無視し、-c で件数だけ数えると速い。',
           check: { type: 'answer', any: ['3', '３'] },
           hints: ['大小無視は -i、件数は -c', 'grep -ic error error.log', 'ERROR 2行 + error 1行 = 3行'],
-          explain: 'grep -i で大文字小文字を無視、-c でマッチした行数を返す。表記揺れのあるログ調査では -i が必須。',
+          explain: 'grep -i で大文字小文字を無視、-c でマッチした行数を返す。ログは書き手によって ERROR / error / Error と表記が揺れるため、-i を付けないと「見えているのに数えられていない」行が出る。件数だけ欲しいときは -c が速い。',
         },
         {
           q: 'access.log で /login に対して認証失敗(401)を繰り返している攻撃元のIPアドレスを特定してください。',
@@ -3514,7 +5468,7 @@ INFO cache cleared
         {
           q: '401（認証失敗）だけに絞ってから攻撃元IPを集計します。401 を含む行のうち最多のIPのアクセス「回数」を答えてください。',
           narration: 'grep と cut とパイプを組み合わせる。まず grep 401 で失敗行だけにし、そこから同じ集計をかける。道具を足し引きするだけで分析の切り口を変えられるのがパイプの強み。',
-          check: { type: 'answer', any: ['5', '５'] },
+          check: { type: 'answer', any: ['4', '４'] },
           hints: ['grep 401 access.log | cut -d" " -f1 | sort | uniq -c', '203.0.113.9 の行だけが 401 を持つ', 'その件数(回数)を数字で答える'],
           explain: 'grep（絞り込み）→ cut（列抽出）→ sort|uniq -c（集計）と、単機能の道具を直列につないで分析した。同じ部品で「全アクセス」と「失敗のみ」など観点を切り替えられる。これがフィルタ指向の強力さ。',
         },
@@ -3863,7 +5817,7 @@ Oct 14 09:30:00 intra-07 sshd[3001]: Accepted publickey for analyst from 198.51.
           narration: '総当たり攻撃の規模をまず掴む。grep で失敗行を抽出し件数を数える。',
           check: { type: 'answer', any: ['6', '６'] },
           hints: ['grep -c "Failed password" /var/log/auth.log', 'クォートで囲むとスペースを含む語を1つのパターンにできる', '6回失敗している'],
-          explain: '短時間に6回の認証失敗が同一IPから発生。典型的なSSH総当たり。grep -c で件数を即座に把握できる。',
+          explain: '短時間（約10秒間）に6回の認証失敗が同一IPから発生しており、典型的なSSH総当たり攻撃の形をしている。正規ユーザーの打ち間違いなら、これほど短い間隔で複数のアカウント名(admin/root/backup)を試すことはない。grep -c で件数を即座に把握し、攻撃の規模を見積もる。',
         },
         {
           q: '総当たりの末に、ログインに「成功」してしまったアカウント名を答えてください。',
@@ -6458,6 +8412,125 @@ ERROR auth failed from 192.168.1.50
       review: { steps: ['ls -l で現状確認', 'sudo chown user で所有者変更', 'user:group で両方変更', '権限(chmod)と合わせて設計'], commands: [{ cmd: 'sudo chown webadmin /var/www/html/report.html', meaning: '所有者を変更' }, { cmd: 'sudo chown webadmin:webadmin ...', meaning: '所有者とグループを変更' }], why: '所有権設計はアクセス制御の半分。chmod(権限)とchown(所有)を組み合わせて初めて適切な制御になる。', practice: 'Webコンテンツの所有者をwww-dataに、共有ディレクトリをチームグループに、など日常運用。', related: ['chmod', 'ユーザー/グループ', '最小権限'] },
       learned: ['chown', 'chgrp', 'ownership', 'group-ownership'], solution: ['sudo chown webadmin /var/www/html/report.html', 'sudo chown webadmin:webadmin /var/www/html/report.html'],
     },
+
+    {
+      id: 'l2-07-useradd',
+      title: '最小権限のサービスアカウントを作る',
+      minutes: 12,
+      objectives: ['useradd / groupadd / usermod でアカウントとグループを作る', 'ログイン不可のサービスアカウントを設計する', 'グループ権限で共有ディレクトリを制御する'],
+      prereq: ['l2-05-users', 'l2-06-chown'],
+      briefing: '夜間バッチが /srv/reports にレポートを出力する。専用のサービスアカウントを作って動かしたい。「誰でもログインできる便利なアカウント」ではなく、必要な権限だけを持つアカウントにするのが設計の要点だ。',
+      concepts: [{
+        title: 'アカウントとグループの管理',
+        why: 'サービスを root や共用アカウントで動かすと、侵害されたとき被害が一気に広がる。専用アカウントに最小限の権限だけを与えれば、被害を局所化できる。',
+        problem: '対話ログインは不要で、特定のディレクトリにだけ書き込めるアカウントを作りたい。',
+        how: 'useradd -m -s /usr/sbin/nologin 名前 でログイン不可(nologin)のアカウントを作る。groupadd でグループを作り、usermod -aG グループ 名前 で所属を追加（-a を忘れると既存の所属が消える）。共有ディレクトリは chown :グループ と chmod 770 で、そのグループだけが読み書きできるようにする。',
+        example: '$ sudo useradd -m -s /usr/sbin/nologin svc_report\n$ sudo groupadd reporters\n$ sudo usermod -aG reporters svc_report',
+        relation: 'サービスアカウントとグループを作り、共有ディレクトリをそのグループ専用にする。',
+      }],
+      env: {
+        hostname: 'batch-01', user: 'analyst', sudo: true,
+        users: [{ name: 'alice' }],
+        dirs: [{ path: '/srv/reports', mode: 0o755, owner: 'root', group: 'root' }],
+        files: [],
+      },
+      quick: ['id alice', 'cat /etc/group', 'sudo useradd -m -s /usr/sbin/nologin svc_report', 'sudo groupadd reporters', 'sudo usermod -aG reporters svc_report', 'sudo chown :reporters /srv/reports', 'sudo chmod 770 /srv/reports', 'ls -ld /srv/reports', 'id svc_report'],
+      tasks: [
+        {
+          q: 'レポート出力用のサービスアカウント svc_report を作成してください。対話ログインはできないよう、ログインシェルを /usr/sbin/nologin にします。作成できたら done。',
+          narration: 'アカウント作成は root 権限が必要なので sudo を付ける。-s でログインシェルを指定。-m はホームディレクトリも作るオプション。',
+          check: { type: 'user', name: 'svc_report', shell: '/usr/sbin/nologin' },
+          noInput: true,
+          hints: ['useradd にはログインシェルを指定する -s オプションがある', 'sudo useradd -m -s /usr/sbin/nologin svc_report', 'tail -1 /etc/passwd で最後の列が /usr/sbin/nologin になっているか確認'],
+          explain: 'nologin をシェルにしたアカウントは、対話ログイン(SSH/コンソール)ができない「サービス専用」アカウントになる。侵害されても攻撃者はこのアカウントでシェルを得られず、悪用の余地が狭まる。useradd は新規アカウントをロック(パスワード未設定)状態で作るので、パスワード認証で入られる心配もない。',
+        },
+        {
+          q: 'reporters グループを新規作成し、svc_report と alice の両方をそのグループのメンバーにしてください。どちらも既存の所属グループは消さないこと。完了したら done。',
+          narration: 'groupadd でグループを作り、usermod -aG で所属を追加する。-a (append) を付けないと、そのユーザーの他の補助グループが消えてしまうので注意。',
+          check: { type: 'all', of: [{ type: 'group', name: 'reporters', member: 'svc_report' }, { type: 'group', name: 'reporters', member: 'alice' }] },
+          noInput: true,
+          hints: ['まず groupadd でグループを作る', 'sudo groupadd reporters / sudo usermod -aG reporters svc_report と alice の両方', 'grep reporters /etc/group で2人のメンバーが並ぶか確認'],
+          explain: 'usermod -aG の -a は「追加」。付け忘れて -G だけで実行すると、指定したグループ以外の補助グループが全部外れる事故になる(例: sudo グループから外れて管理者権限を失う)。gpasswd -a ユーザー グループ でも同様に追加できる。権限は個人ではなくグループ単位で付与すると、人の入れ替わりに強い設計になる。',
+        },
+        {
+          q: '/srv/reports を reporters グループ専用にしてください。グループを reporters にし、所有者とグループには読み書き実行を許可、その他には一切許可しない(770)設定にします。完了したら done。',
+          narration: '所有権(chown)と権限(chmod)の組み合わせ。グループに権限を与え、無関係なユーザー(その他)には何も与えない、が最小権限の形。',
+          check: { type: 'all', of: [{ type: 'state', path: '/srv/reports', group: 'reporters' }, { type: 'state', path: '/srv/reports', mode: '770' }] },
+          noInput: true,
+          hints: ['グループの変更は chown :グループ(または chgrp)、権限は chmod', 'sudo chown :reporters /srv/reports と sudo chmod 770 /srv/reports', 'ls -ld /srv/reports が drwxrwx--- ... root reporters になっていれば成功'],
+          explain: '770 (rwxrwx---) は所有者とグループだけがアクセスでき、その他は完全に遮断される。これで reporters に属するアカウントだけが /srv/reports を使える。実運用では、新しいメンバーが必要になったら usermod -aG するだけでよく、ディレクトリ側の設定は変えずに済む。アカウント(誰が)・グループ(どの役割)・権限(何ができる)を分けて設計するのが基本。',
+        },
+      ],
+      review: {
+        steps: ['useradd -s /usr/sbin/nologin でサービスアカウント作成', 'groupadd でグループ作成', 'usermod -aG で所属を追加（-a を忘れない）', 'chown :グループ + chmod 770 で共有ディレクトリを制御'],
+        commands: [{ cmd: 'sudo useradd -m -s /usr/sbin/nologin svc_report', meaning: 'ログイン不可のサービスアカウントを作成' }, { cmd: 'sudo usermod -aG reporters svc_report', meaning: 'グループに追加（既存の所属は維持）' }, { cmd: 'sudo chmod 770 /srv/reports', meaning: '所有者とグループのみに許可' }],
+        why: 'アカウント管理は最小権限の実装そのもの。役割ごとにアカウントとグループを分けておくと、侵害時の被害を局所化でき、監査もしやすい。',
+        practice: 'バッチ・Webアプリ・バックアップなど、サービスごとの専用アカウント作成。共有ディレクトリのグループ権限設計。useradd -r でシステムアカウントを作る運用。',
+        related: ['最小権限', 'chmod/chown', 'sudoers', 'アカウント棚卸し'],
+      },
+      learned: ['useradd', 'usermod', 'groupadd', 'nologin', 'group-permission', 'least-privilege'],
+      solution: ['sudo useradd -m -s /usr/sbin/nologin svc_report', 'sudo groupadd reporters', 'sudo usermod -aG reporters svc_report', 'sudo usermod -aG reporters alice', 'sudo chown :reporters /srv/reports', 'sudo chmod 770 /srv/reports'],
+    },
+
+    {
+      id: 'l2-08-offboarding',
+      title: '退職者アカウントを無効化する',
+      minutes: 12,
+      objectives: ['アカウントのロックと権限剥奪を行う', '稼働中プロセスと鍵の後始末を行う', 'オフボーディングの手順を理解する'],
+      prereq: ['l2-07-useradd'],
+      briefing: '管理者の bob が退職した。アカウントを即座に使えなくしたいが、すぐ削除すると「誰が何をしたか」の証跡や所有ファイルの扱いに困る。まず無効化し、特権を外し、動いているものを止める——手順を踏んで安全に閉じる。',
+      concepts: [{
+        title: 'アカウントのオフボーディング',
+        why: '退職者や不要アカウントが残っていると、パスワードや鍵が漏れたときの侵入口になる。「消す」前に「使えなくする」手順を確実に実行する。',
+        problem: '退職者のアカウントを、証跡を残したまま、確実にログイン不能・権限なしにしたい。',
+        how: 'usermod -L(または passwd -l)でパスワードをロック。ただしロックはパスワード認証にしか効かないので、SSH公開鍵(authorized_keys)も無効化する。sudo グループから外す(gpasswd -d)。そのユーザーで動いているプロセスを止める(kill)。ファイルを引き継いだ後に userdel -r で削除。',
+        example: '$ sudo usermod -L bob\n$ sudo gpasswd -d bob sudo\n$ sudo kill 4321',
+        relation: 'bob のアカウントをロックし、特権を外し、動作中のプロセスを止め、鍵を無効化する。',
+      }],
+      env: {
+        hostname: 'srv-hr', user: 'analyst', sudo: true,
+        users: [{ name: 'bob', sudo: true }],
+        dirs: [{ path: '/home/bob/.ssh', mode: 0o700, owner: 'bob' }],
+        files: [{ path: '/home/bob/.ssh/authorized_keys', owner: 'bob', mode: 0o600, content: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI_bob_key bob@laptop\n' }],
+        processes: [{ pid: 5100, user: 'bob', cmd: 'sleep 99999', cpu: 0.0 }, { pid: 5101, user: 'bob', cmd: '/home/bob/sync.sh', cpu: 0.4 }],
+      },
+      quick: ['id bob', 'sudo passwd -S bob', 'ps aux', 'cat /home/bob/.ssh/authorized_keys', 'sudo usermod -L bob', 'sudo gpasswd -d bob sudo', 'sudo kill 5100', 'sudo rm /home/bob/.ssh/authorized_keys'],
+      tasks: [
+        {
+          q: 'まず bob のアカウントをロックしてください（パスワードでログインできなくする）。続けて、管理者権限を持つ sudo グループからも外してください。両方できたら done。',
+          narration: '「ロック」と「権限剥奪」は別の操作。ロックだけでは、すでに持っている管理者権限が残ってしまう(鍵認証や稼働中セッションなど別経路から使われうる)。両方行う。',
+          check: { type: 'user', name: 'bob', locked: true, notInGroup: 'sudo' },
+          noInput: true,
+          hints: ['ロックは usermod -L か passwd -l、グループから外すのは gpasswd -d', 'sudo usermod -L bob と sudo gpasswd -d bob sudo', 'sudo passwd -S bob が L(ロック)になり、id bob に sudo が無ければ成功'],
+          explain: 'usermod -L は shadow のパスワードハッシュ先頭に ! を付けて認証を拒否させる(元のハッシュは残るので、復帰時は -U で戻せる)。gpasswd -d で sudo グループから外すと管理者権限も失う。「ログインを止める」と「権限を剥ぐ」を別々に確実に行うのが要点。',
+        },
+        {
+          q: 'bob のプロセスがまだ動いています。ps aux で bob 所有のプロセスをすべて特定し、停止してください。すべて止まったら done。',
+          narration: 'アカウントをロックしても、すでに動いているプロセスは止まらない。ps aux で USER 列が bob の行を探してすべて kill する。',
+          check: { type: 'all', of: [{ type: 'process', absent: 'sleep 99999' }, { type: 'process', absent: '/home/bob/sync.sh' }] },
+          noInput: true,
+          hints: ['ps aux で USER が bob の行を探す', 'PID は 5100 と 5101。sudo kill で停止', 'ps aux で bob のプロセスが無くなったか確認'],
+          explain: 'ロックは新規ログインを止めるだけで、稼働中のプロセスは動き続ける。今回の /home/bob/sync.sh のようにバックグラウンドで走るスクリプトは、気づかないと退職後もデータを外部へ送り続けるかもしれない。アカウント停止の手順には「そのユーザーのプロセスをすべて止める」を必ず含める。',
+        },
+        {
+          q: 'パスワードをロックしても、SSH公開鍵認証では入れてしまいます。bob の authorized_keys を削除して、鍵でのログインも封じてください。削除できたら done。',
+          narration: 'SSHは公開鍵があればパスワード不要でログインできる。パスワードのロックでは防げない「裏口」を閉じる。',
+          check: { type: 'state', path: '/home/bob/.ssh/authorized_keys', exists: false },
+          noInput: true,
+          hints: ['authorized_keys は /home/bob/.ssh/ にある', 'sudo rm /home/bob/.ssh/authorized_keys', 'ls -la /home/bob/.ssh で消えたか確認'],
+          explain: 'パスワードロック(usermod -L)は、パスワード認証だけを止める。公開鍵認証は別経路なので、authorized_keys を消さなければ退職者が鍵で入れてしまう(SSH設定で UsePAM/PubkeyAuthentication の挙動にも依存する)。オフボーディングは「パスワード・鍵・権限・プロセス」の4点セットで確認する。最後に、ファイルの引き継ぎが済んでから userdel -r で削除する。',
+        },
+      ],
+      review: {
+        steps: ['usermod -L でパスワードをロック', 'gpasswd -d で sudo などの特権グループから外す', 'ps aux で bob のプロセスを特定して kill', 'authorized_keys を削除して鍵認証も封じる', '引き継ぎ後に userdel -r で削除'],
+        commands: [{ cmd: 'sudo usermod -L bob', meaning: 'パスワードをロック' }, { cmd: 'sudo gpasswd -d bob sudo', meaning: 'sudo グループから外す' }, { cmd: 'sudo kill 5100', meaning: '稼働中のプロセスを停止' }, { cmd: 'sudo rm /home/bob/.ssh/authorized_keys', meaning: 'SSH鍵を無効化' }],
+        why: '退職者アカウントの残存は典型的な侵入経路。ロック・権限・プロセス・鍵を漏れなく閉じることが、内部不正と乗っ取りの両方を防ぐ。',
+        practice: 'オフボーディング手順書、定期的なアカウント棚卸し(最終ログイン日の確認)、IdPでの一括無効化、SSH鍵のライフサイクル管理。',
+        related: ['アカウント棚卸し', 'authorized_keys', 'sudoers', '最小権限'],
+      },
+      learned: ['account-lock', 'offboarding', 'usermod-L', 'gpasswd', 'ssh-key-revocation'],
+      solution: ['sudo usermod -L bob', 'sudo gpasswd -d bob sudo', 'sudo kill 5100', 'sudo kill 5101', 'sudo rm /home/bob/.ssh/authorized_keys'],
+    },
   ],
 };
 
@@ -6965,7 +9038,7 @@ Oct 14 03:00:09 sshd[9]: Failed password for root from 185.22.3.7
           check: { type: 'answer', any: ['185.22.3.7'], normalizeIp: true },
           answerHint: '最多のIP',
           hints: ['grep "Failed password" auth.log | awk \'{print $NF}\' | sort | uniq -c | sort -rn', '$NF は行の最終列(IP)', '185.22.3.7 が最多'],
-          explain: '185.22.3.7 が5回失敗で最多＝主要な総当たり攻撃元。awk の $NF(最終フィールド)でIPを抜き、集計パイプで定量化した。この数値を根拠に、閾値超過のIPを fail2ban やファイアウォールで自動遮断する。検知の定量化が自動防御の土台。',
+          explain: '185.22.3.7 が6回失敗で最多＝主要な総当たり攻撃元。awk の $NF(最終フィールド)でIPを抜き、集計パイプで定量化した。この数値を根拠に、閾値超過のIPを fail2ban やファイアウォールで自動遮断する。検知の定量化が自動防御の土台。',
         },
         {
           q: '総当たりに紛れて、1件だけ認証に「成功」したログイン(Accepted)があります。そのアカウント名を答えてください（正規か要確認の対象）。',
@@ -7186,7 +9259,7 @@ const stageCTF = {
           narration: 'まず偵察。nmap で開放ポートとサービスを把握する。',
           check: { type: 'answer', any: ['80'] },
           hints: ['nmap target.lab', 'service が http の行', '80番'],
-          explain: 'nmap で 22(SSH)と 80(HTTP)を確認。Webがあるので、まずはそこを調べるのが定石。',
+          explain: 'nmap で 22(SSH)と 80(HTTP)を確認。SSHは認証が必要で総当たりは遅く目立つのに対し、Webは設定ミスや情報漏洩が見つかりやすい。まず公開ページ側(robots.txt・隠しパス)から調べるのが偵察の定石になる。',
         },
         {
           q: 'Webを偵察して情報漏洩を見つけ、最終的なフラグ FLAG{...} の中身を奪取してください。',
@@ -7226,10 +9299,11 @@ const stageCTF = {
       quick: ['sudo -l', 'id', 'find / -perm -4000 -type f 2>/dev/null', 'sudo cat /root/flag.txt'],
       tasks: [
         {
-          q: 'まず自分が sudo で何を許可されているか確認します。sudo -l の結果、管理者操作が「許可されている(may run)」か「いない(not allowed)」か、allowed か notallowed で答えてください。',
+          q: 'まず自分が sudo で何を許可されているか確認します。sudo -l の出力に表示される、実行を許可されているコマンドの範囲（括弧の後ろ）を答えてください。',
           narration: '権限昇格の第一歩は sudo -l。自分に許された特権操作を確認する。',
-          check: { type: 'answer', any: ['allowed'], ci: true },
-          hints: ['sudo -l を実行', 'may run the following commands と出るか', 'ALL が許可されている→allowed'],
+          check: { type: 'answer', any: ['ALL'], ci: true },
+          answerHint: '許可範囲(大文字3文字)',
+          hints: ['sudo -l を実行', '(ALL : ALL) ___ の形で最後に範囲が書かれている', 'ALL＝あらゆるコマンドを許可'],
           explain: 'sudo -l で、この analyst が sudo で管理者操作を実行できる(設定ミス/過剰権限)と判明。権限昇格はまず「自分の持つ特権」の棚卸しから。sudo 権限があれば root への昇格は容易。',
         },
         {
@@ -8728,6 +10802,358 @@ const stageAISec = {
 Object.assign(exports, { stageAISec });
 
 };
+__mods["js/missions/stage-packet.js"] = function (module, exports, __require) {
+// パケット解析（tcpdump でキャプチャファイルを読む）
+// キャプチャはすべてゲーム内の仮想データ。実在のネットワークからは一切取得しない。
+const { mcq } = __require("js/missions/_shared.js");
+
+// ---- キャプチャ生成ヘルパー（tcpdump 出力形式のテキスト） ----
+const line = (t, src, dst, detail, payload) =>
+  `${t} IP ${src} > ${dst}: ${detail}` + (payload ? '\n' + payload.map(l => '\t' + l).join('\n') : '');
+const stamp = (sec, us) => `10:${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}.${String(us).padStart(6, '0')}`;
+
+// 1) HTTP セッション（3ウェイハンドシェイク〜切断）＋無関係なDNS 2件
+function webSession() {
+  const C = '10.0.0.5.51234', S = '10.0.0.9.80';
+  const P = [
+    line(stamp(61, 100), C, S, 'Flags [S], seq 1000, win 64240, length 0'),
+    line(stamp(61, 300), S, C, 'Flags [S.], seq 5000, ack 1001, win 65160, length 0'),
+    line(stamp(61, 400), C, S, 'Flags [.], ack 5001, win 502, length 0'),
+    line(stamp(61, 600), C, S, 'Flags [P.], seq 1001:1087, ack 5001, win 502, length 86', ['GET /index.html HTTP/1.1', 'Host: web.lab', 'User-Agent: curl/7.81.0']),
+    line(stamp(61, 800), S, C, 'Flags [.], ack 1087, win 509, length 0'),
+    line(stamp(62, 100), S, C, 'Flags [P.], seq 5001:5317, ack 1087, win 509, length 316', ['HTTP/1.1 200 OK', 'Server: nginx/1.22', 'Content-Type: text/html']),
+    line(stamp(62, 200), C, S, 'Flags [.], ack 5317, win 501, length 0'),
+    line(stamp(62, 900), C, S, 'Flags [F.], seq 1087, ack 5317, win 501, length 0'),
+    line(stamp(62, 950), S, C, 'Flags [F.], seq 5317, ack 1088, win 509, length 0'),
+    line(stamp(63, 10), C, S, 'Flags [.], ack 5318, win 501, length 0'),
+  ];
+  // 無関係なDNS（ポート80の絞り込みが意味を持つように混ぜる）
+  P.splice(3, 0, line(stamp(61, 450), '10.0.0.5.53100', '10.0.0.2.53', '30211+ A? web.lab. (25)'));
+  P.splice(5, 0, line(stamp(61, 700), '10.0.0.2.53', '10.0.0.5.53100', '30211 1/0/0 A 10.0.0.9 (41)'));
+  return P.join('\n') + '\n';
+}
+
+// 2) 平文プロトコル: FTP ログインと HTTP Basic 認証
+function ftpLogin() {
+  const C = '10.0.0.5.40022', S = '10.0.0.20.21';
+  return [
+    line(stamp(10, 100), C, S, 'Flags [S], seq 200, win 64240, length 0'),
+    line(stamp(10, 250), S, C, 'Flags [S.], seq 900, ack 201, win 65160, length 0'),
+    line(stamp(10, 300), C, S, 'Flags [.], ack 901, win 502, length 0'),
+    line(stamp(10, 500), S, C, 'Flags [P.], seq 901:925, ack 201, win 509, length 24', ['220 (vsFTPd 3.0.3)']),
+    line(stamp(11, 100), C, S, 'Flags [P.], seq 201:213, ack 925, win 502, length 12', ['USER backup']),
+    line(stamp(11, 300), S, C, 'Flags [P.], seq 925:959, ack 213, win 509, length 34', ['331 Please specify the password.']),
+    line(stamp(12, 200), C, S, 'Flags [P.], seq 213:234, ack 959, win 502, length 21', ['PASS Spring#2024']),
+    line(stamp(12, 450), S, C, 'Flags [P.], seq 959:982, ack 234, win 509, length 23', ['230 Login successful.']),
+  ].join('\n') + '\n';
+}
+function httpBasic() {
+  const C = '10.0.0.5.52000', S = '10.0.0.50.8080';
+  return [
+    line(stamp(20, 100), C, S, 'Flags [S], seq 300, win 64240, length 0'),
+    line(stamp(20, 250), S, C, 'Flags [S.], seq 700, ack 301, win 65160, length 0'),
+    line(stamp(20, 300), C, S, 'Flags [.], ack 701, win 502, length 0'),
+    line(stamp(20, 500), C, S, 'Flags [P.], seq 301:420, ack 701, win 502, length 119', ['GET /admin HTTP/1.1', 'Host: intra.lab:8080', 'Authorization: Basic YWRtaW46U3VwZXJTZWNyZXQh', 'Accept: */*']),
+    line(stamp(20, 900), S, C, 'Flags [P.], seq 701:760, ack 420, win 509, length 59', ['HTTP/1.1 200 OK', 'Content-Type: text/html']),
+  ].join('\n') + '\n';
+}
+
+// 3) SYN スキャン
+function synScan() {
+  const A = '198.51.100.77.54321', V = '10.0.0.9';
+  const ports = [21, 22, 23, 25, 53, 80, 110, 139, 443, 445, 3306, 8080];
+  const open = new Set([22, 80, 443]);
+  const P = [];
+  // 正規ユーザーの通信（通常のHTTP）
+  P.push(line(stamp(30, 10), '10.0.0.5.51000', `${V}.80`, 'Flags [S], seq 10, win 64240, length 0'));
+  P.push(line(stamp(30, 200), `${V}.80`, '10.0.0.5.51000', 'Flags [S.], seq 20, ack 11, win 65160, length 0'));
+  P.push(line(stamp(30, 300), '10.0.0.5.51000', `${V}.80`, 'Flags [.], ack 21, win 502, length 0'));
+  let us = 1000;
+  for (const p of ports) {
+    P.push(line(stamp(31, us), A, `${V}.${p}`, 'Flags [S], seq 4000, win 1024, length 0'));
+    us += 120;
+    if (open.has(p)) {
+      P.push(line(stamp(31, us), `${V}.${p}`, A, 'Flags [S.], seq 7000, ack 4001, win 64240, length 0'));
+      us += 60;
+      P.push(line(stamp(31, us), A, `${V}.${p}`, 'Flags [R], seq 4001, win 0, length 0'));
+    } else {
+      P.push(line(stamp(31, us), `${V}.${p}`, A, 'Flags [R.], seq 0, ack 4001, win 0, length 0'));
+    }
+    us += 90;
+  }
+  return P.join('\n') + '\n';
+}
+
+// 4) DNS トンネリング
+function dnsTunnel() {
+  const Q = (sec, us, id, name) => line(stamp(sec, us), `10.0.0.5.${53000 + (id % 900)}`, '10.0.0.2.53', `${id}+ A? ${name} (${name.length + 5})`);
+  const hexChunks = ['464c41477b64', '6e735f74756e', '6e656c5f6f6b', '7d'];
+  const P = [
+    Q(40, 100, 41001, 'www.acme.lab.'), Q(40, 900, 41002, 'mail.acme.lab.'),
+    Q(41, 300, 41003, 'www.acme.lab.'), Q(42, 100, 41004, 'update.acme.lab.'),
+    Q(42, 700, 41005, 'www.acme.lab.'),
+  ];
+  hexChunks.forEach((h, i) => P.splice(2 + i, 0, Q(41, 100 * (i + 1), 41100 + i, `${h}.t.evil-dns.example.`)));
+  P.push(Q(43, 200, 41006, 'mail.acme.lab.'));
+  return P.join('\n') + '\n';
+}
+
+const review = (steps, commands, why, practice, related) => ({ steps, commands, why, practice, related });
+
+const stagePacket = {
+  id: 'packet',
+  title: 'Packet — パケットを読む',
+  subtitle: 'tcpdump でキャプチャを解析し、通信の中身から事実を読み取る',
+  intro: 'ログに残らないものでも、通信そのものには証拠が残る。パケットキャプチャ(pcap)を tcpdump で読み、ハンドシェイク・平文の認証情報・スキャン・DNSの悪用を見抜く。キャプチャはすべて訓練用の仮想データだ。',
+  missions: [
+    {
+      id: 'pk-01-handshake',
+      title: 'TCP通信をパケットで読む',
+      minutes: 12,
+      objectives: ['tcpdump でキャプチャファイルを読む', 'フィルタで通信を絞り込む', '3ウェイハンドシェイクをフラグから読み解く'],
+      prereq: ['nb-06-ports'],
+      briefing: 'Webサーバー web.lab への通信を記録したキャプチャ web-session.pcap がある。1回のHTTPアクセスで、実際にどんなパケットが何個やり取りされたのか。理論で学んだTCPの仕組みを、実物のパケットで確かめる。',
+      concepts: [{
+        title: 'tcpdump とパケットの読み方',
+        why: 'ログはアプリが「書いた」記録だが、パケットは実際に「流れた」事実そのもの。改ざんされにくく、アプリのログに出ない攻撃の痕跡も残る。',
+        problem: '1回のWebアクセスの裏で、どんな通信が起きているかを自分の目で確認したい。',
+        how: 'tcpdump -nr ファイル でキャプチャを読む(-n は名前解決しない、-r は読み込み)。フィルタは tcpdump -nr ファイル \'port 80\' や \'src host 10.0.0.5\' のように書く。TCPフラグは [S]=SYN, [S.]=SYN+ACK, [.]=ACK, [P.]=データ送信(PSH+ACK), [F.]=FIN(切断), [R]=RST(拒否/リセット)。-A を付けるとペイロード(通信の中身)も表示される。',
+        example: '$ tcpdump -nr web-session.pcap \'dst port 80\' 2>/dev/null\n… Flags [S], seq 1000 …',
+        relation: 'キャプチャを読み、フィルタで絞り、ハンドシェイクと中身を確認する。',
+      }],
+      env: {
+        hostname: 'soc', user: 'analyst', dirs: ['/home/analyst/pcap'],
+        files: [{ path: '/home/analyst/pcap/web-session.pcap', owner: 'analyst', content: webSession() }],
+      },
+      quick: ['cd /home/analyst/pcap', 'tcpdump -nr web-session.pcap 2>/dev/null', 'tcpdump -nr web-session.pcap \'dst port 80\' 2>/dev/null', 'tcpdump -nAr web-session.pcap \'port 80\' 2>/dev/null', 'tcpdump -nr web-session.pcap \'tcp and src host 10.0.0.9\' 2>/dev/null'],
+      tasks: [
+        {
+          q: 'web-session.pcap には全部で何個のパケットが記録されていますか。tcpdump の出力行数を数えてください。',
+          narration: 'tcpdump は読み込み中のメッセージを標準エラー出力に出す。数えるときは 2>/dev/null で捨ててから wc -l に渡すと、パケット行だけを数えられる。',
+          check: { type: 'answer', any: ['12'] },
+          answerHint: '個数',
+          hints: ['tcpdump -nr web-session.pcap を実行', 'パイプで wc -l。標準エラーは 2>/dev/null で捨てる', 'tcpdump -nr web-session.pcap 2>/dev/null | wc -l'],
+          explain: 'キャプチャは12パケット(HTTPセッション10 + 無関係なDNS 2)。tcpdump の「reading from file …」は標準エラー出力なので、数えるときは 2>/dev/null で除いておく。パイプと標準エラーの分離(Shellステージ)がここで実際に役立つ。',
+        },
+        {
+          q: 'クライアント(10.0.0.5)からWebサーバーのポート80へ向かうパケット(宛先ポートが80)は何個ありますか。フィルタ \'dst port 80\' を使ってください。',
+          narration: 'フィルタは引用符で囲んで tcpdump に渡す。dst port 80 は「宛先ポートが80」。DNSなど無関係な通信が除かれて、Webへ向かう通信だけが残る。',
+          check: { type: 'answer', any: ['6'] },
+          hints: ['tcpdump -nr web-session.pcap \'dst port 80\'', '| wc -l で数える(2>/dev/null を忘れずに)', 'SYN・ACK・データ・ACK・FIN・ACK の6個'],
+          explain: 'クライアント→サーバー方向のパケットは6個(SYN, ACK, GET, ACK, FIN, ACK)。BPFフィルタ(dst port / src host / and / or / not)で必要な通信だけに絞り込めるので、大量のキャプチャでも目的の通信を素早く抽出できる。',
+        },
+        {
+          q: 'サーバーが返す最初のパケットのフラグは [S.] です。これは SYN と、もう一つ別のフラグの組み合わせです。そのフラグ名(英大文字3文字)を答えてください。',
+          narration: 'TCP接続は3ウェイハンドシェイクで確立される。クライアントがSYN、サーバーがSYN+ACK、クライアントがACK。tcpdump の表記では ACK を「.」で表す。',
+          check: { type: 'answer', any: ['ACK'], ci: true },
+          answerHint: '英大文字3文字',
+          hints: ['フラグ表記: [S]=SYN, [.]=ACK', '[S.] は S と . の組み合わせ', 'SYN+ACK(サーバーが「受け付けた、こちらも接続する」と返す)'],
+          explain: '[S.] = SYN+ACK。3ウェイハンドシェイクは ①クライアント SYN → ②サーバー SYN+ACK → ③クライアント ACK。この3パケットが揃って初めて接続が確立する。ポートスキャンでは、この途中で止めたり(SYNだけ送る)する特徴が現れる(後のミッションで見る)。',
+        },
+        {
+          q: 'クライアントがリクエストしたURLのパス(GET の後ろ)を、パケットの中身から読み取って答えてください。ペイロードを表示するには -A を使います。',
+          narration: 'HTTP は平文なので、-A で通信の中身が読める。GET行にリクエスト先が書かれている。',
+          check: { type: 'answer', any: ['/index.html'] },
+          answerHint: '/ から始まるパス',
+          hints: ['tcpdump に -A を付けるとペイロードが見える(-nAr のようにまとめて書ける)', 'tcpdump -nAr web-session.pcap \'port 80\' 2>/dev/null', 'GET /index.html HTTP/1.1'],
+          explain: 'HTTP(暗号化なし)は、リクエストもレスポンスも通信路上で丸見えになる。GETのパス、Hostヘッダ、User-Agent、レスポンスのサーバー名まで読み取れた。だから通信の暗号化(HTTPS/TLS)が重要になる——次のミッションで、平文の危険を具体的に見る。',
+        },
+      ],
+      review: review(
+        ['tcpdump -nr でキャプチャを読む(読み込みメッセージは 2>/dev/null)', 'BPFフィルタで通信を絞る', 'フラグ表記から3ウェイハンドシェイクを確認', '-A でペイロード(平文の中身)を読む'],
+        [{ cmd: 'tcpdump -nr web-session.pcap 2>/dev/null | wc -l', meaning: 'パケット数を数える' }, { cmd: "tcpdump -nr web-session.pcap 'dst port 80'", meaning: '宛先ポート80だけに絞る' }, { cmd: "tcpdump -nAr web-session.pcap 'port 80'", meaning: '中身(ペイロード)も表示' }],
+        'パケットは「実際に流れた事実」で、アプリのログより改ざんされにくい。通信を読めれば、ログに残らない攻撃や不審な挙動も確認できる。',
+        'インシデント時のpcap解析、ネットワーク障害の切り分け(SYNに返事が無い等)、Wiresharkでの詳細解析の前段としての絞り込み。',
+        ['3ウェイハンドシェイク', 'Wireshark', '平文プロトコルの危険']),
+      learned: ['tcpdump', 'pcap', 'tcp-flags', 'bpf-filter', 'packet-analysis'],
+      solution: ['cd /home/analyst/pcap', 'tcpdump -nr web-session.pcap 2>/dev/null | wc -l', "tcpdump -nr web-session.pcap 'dst port 80' 2>/dev/null | wc -l", "tcpdump -nAr web-session.pcap 'port 80' 2>/dev/null"],
+    },
+
+    {
+      id: 'pk-02-cleartext',
+      title: '平文通信から認証情報を読む',
+      minutes: 13,
+      objectives: ['平文プロトコルの危険を実物のパケットで確認する', 'Base64 のHTTP Basic認証を復号する', '暗号化された代替手段を選ぶ'],
+      prereq: ['pk-01-handshake', 'c-01-base64'],
+      briefing: '社内のスイッチで取得した通信に、FTPのログインとHTTP Basic認証が含まれている。通信路上の誰かが同じものを見ていたら、何が盗まれるのか。攻撃者の視点で確かめ、防御策につなげる。',
+      concepts: [{
+        title: '平文プロトコルと盗聴',
+        why: 'FTP・Telnet・HTTP(暗号化なし)は、認証情報を含めてすべて平文で流れる。同じネットワークにいる者が通信を覗けば、パスワードがそのまま見える。',
+        problem: 'ネットワーク上のパケットから、ユーザー名・パスワードを取り出せてしまう。これが「盗聴」で、暗号化しない通信の根本的な弱点だ。',
+        how: 'FTPは USER/PASS コマンドをそのまま送る。HTTP Basic認証は「ユーザー名:パスワード」を Base64 でエンコードして Authorization ヘッダに載せるだけで、暗号化ではない(base64 -d で誰でも復号できる)。対策は、通信そのものをTLSやSSHで暗号化すること(SFTP・FTPS・HTTPS)。',
+        example: 'Authorization: Basic YWRtaW46… → echo YWRtaW46… | base64 -d → admin:…',
+        relation: 'キャプチャからFTPの資格情報とBasic認証を取り出し、暗号化の必要性を実感する。',
+      }],
+      env: {
+        hostname: 'soc', user: 'analyst', dirs: ['/home/analyst/pcap'],
+        files: [
+          { path: '/home/analyst/pcap/ftp-login.pcap', owner: 'analyst', content: ftpLogin() },
+          { path: '/home/analyst/pcap/http-basic.pcap', owner: 'analyst', content: httpBasic() },
+        ],
+      },
+      quick: ['cd /home/analyst/pcap', "tcpdump -nAr ftp-login.pcap 'port 21' 2>/dev/null", "tcpdump -nAr ftp-login.pcap 2>/dev/null | grep -E 'USER|PASS'", 'tcpdump -nAr http-basic.pcap 2>/dev/null | grep Authorization', 'echo YWRtaW46U3VwZXJTZWNyZXQh | base64 -d'],
+      tasks: [
+        {
+          q: 'ftp-login.pcap から、FTPログインに使われたユーザー名を読み取ってください。',
+          narration: 'FTPの制御通信(ポート21)は平文。-A でペイロードを表示し、USER コマンドを探す。',
+          check: { type: 'answer', any: ['backup'], ci: true },
+          answerHint: 'ユーザー名',
+          hints: ['tcpdump -nAr ftp-login.pcap 2>/dev/null でペイロード付きで表示', 'grep USER で絞ると速い', 'USER backup'],
+          explain: 'ユーザー名 backup が通信から丸見え。FTPはコマンドもデータも暗号化しないため、同一ネットワーク上で通信を取得できる者(悪意ある端末・侵害されたスイッチ・不正なWi-Fiアクセスポイント等)に、認証情報が見えてしまう。',
+        },
+        {
+          q: '同じFTPセッションのパスワードも平文で流れています。PASS コマンドの引数(パスワード)を答えてください。',
+          narration: 'USER の次に PASS が送られる。同じキャプチャのペイロードを探す。',
+          check: { type: 'answer', any: ['Spring#2024'] },
+          answerHint: 'パスワード',
+          hints: ['grep -E \'USER|PASS\' で認証コマンドだけを抜き出す', 'tcpdump -nAr ftp-login.pcap 2>/dev/null | grep PASS', 'PASS Spring#2024'],
+          explain: 'パスワード Spring#2024 が平文で取得できた。本物の攻撃者はこの情報でそのままFTPにログインできる。しかもこの手のパスワードは他のサービスでも使い回されがちなので、被害は1つのサーバーに留まらない可能性がある。',
+        },
+        {
+          q: 'http-basic.pcap の Authorization ヘッダには Base64 の文字列があります。それを復号し、含まれていたパスワード(コロンの後ろ)を答えてください。',
+          narration: 'HTTP Basic認証は「ユーザー名:パスワード」を Base64 でエンコードしただけ。暗号化ではないので、base64 -d で戻せる。cut -d: -f2 でコロンの後ろだけ取り出せる。',
+          check: { type: 'answer', any: ['SuperSecret!'] },
+          answerHint: 'パスワード',
+          hints: ['tcpdump -nAr http-basic.pcap 2>/dev/null | grep Authorization で文字列を探す', 'Basic の後ろを echo して base64 -d にパイプ', 'echo YWRtaW46U3VwZXJTZWNyZXQh | base64 -d → admin:SuperSecret!'],
+          explain: 'admin:SuperSecret! と復号できた。HTTP Basic認証は「Base64」であって暗号化ではないため、HTTPSで包まなければ平文と同じ。Cryptoステージで学んだ「エンコードと暗号化の違い」が、実際の認証情報の漏洩として現れた例。',
+        },
+        mcq('これらの平文通信による認証情報漏洩への対策として、最も適切なものはどれか。',
+          ['パスワードをもっと長く複雑にする', 'FTPをSFTP/FTPS、HTTPをHTTPSに置き換え通信を暗号化する', 'サーバーのポート番号を標準から変更する', 'ファイアウォールでICMPを遮断する'], 2,
+          '正解は2。根本原因は「通信が暗号化されていないこと」なので、SFTP(SSH上)・FTPS(TLS)・HTTPSで通信路を暗号化するのが本質的な対策。パスワードを複雑にしても平文で流れれば丸見え(1)、ポート変更は発見を少し遅らせるだけ(3)、ICMP遮断は無関係(4)。',
+          { narration: '何が問題の根本かを考える。' }),
+      ],
+      review: review(
+        ['tcpdump -A で平文のペイロードを表示', 'grep で USER/PASS/Authorization を抽出', 'Base64 を base64 -d で復号', '通信の暗号化(SFTP/HTTPS)に置き換える'],
+        [{ cmd: "tcpdump -nAr ftp-login.pcap 2>/dev/null | grep -E 'USER|PASS'", meaning: 'FTPの認証情報を抜き出す' }, { cmd: 'echo YWRtaW46… | base64 -d', meaning: 'Basic認証を復号' }],
+        '平文プロトコルの危険は理論だけでなく「実際に読める」事実として理解する。暗号化の必要性を説明できる根拠になる。',
+        'ペネトレーションテストでの盗聴リスク評価、レガシープロトコル(Telnet/FTP/HTTP)の棚卸しと暗号化プロトコルへの移行。',
+        ['TLS', 'HTTPS', 'SFTP', 'Cryptoステージ(base64)']),
+      learned: ['cleartext-protocols', 'sniffing', 'http-basic-auth', 'ftp-credentials', 'encryption-in-transit'],
+      solution: ['cd /home/analyst/pcap', "tcpdump -nAr ftp-login.pcap 2>/dev/null | grep -E 'USER|PASS'", 'tcpdump -nAr http-basic.pcap 2>/dev/null | grep Authorization', 'echo YWRtaW46U3VwZXJTZWNyZXQh | base64 -d'],
+    },
+
+    {
+      id: 'pk-03-synscan',
+      title: 'ポートスキャンをパケットから見抜く',
+      minutes: 14,
+      objectives: ['SYNスキャンの特徴をパケットで確認する', 'tcpdump と awk/sort/uniq で攻撃元を特定する', '開いているポートを応答から判定する'],
+      prereq: ['pk-01-handshake', 'n-02-portscan'],
+      briefing: 'IDS(侵入検知)が web サーバー 10.0.0.9 へのスキャンを疑った。nmap のようなスキャンは、1つの攻撃元から短時間に多数のポートへパケットを送るという、はっきりした形でキャプチャに残る。',
+      concepts: [{
+        title: 'SYNスキャンのパケットパターン',
+        why: 'nmap の既定のスキャン(SYNスキャン)は、接続を最後まで完了させず、SYNに対する応答だけで各ポートの開閉を判定する。ログには残りにくいが、パケットには特徴が出る。',
+        problem: '大量のパケットから、スキャンしている攻撃元と、その結果(どのポートが開いていたか)を読み取りたい。',
+        how: '攻撃元は1つのIPから多数の異なる宛先ポートへ SYN を送る。サーバーの応答は、開いているポートなら SYN+ACK([S.])、閉じているポートなら RST([R.])。攻撃者は開いていたポートに RST を返して接続を完了させない。集計は tcpdump の出力を awk で必要な列にし、cut/sort/uniq -c で数える。',
+        example: 'SYN → SYN+ACK(開) / SYN → RST+ACK(閉)',
+        relation: 'スキャン元・探索ポート数・開いていたポートを、パケットから集計して割り出す。',
+      }],
+      env: {
+        hostname: 'soc', user: 'analyst', dirs: ['/home/analyst/pcap'],
+        files: [{ path: '/home/analyst/pcap/scan.pcap', owner: 'analyst', content: synScan() }],
+      },
+      quick: ['cd /home/analyst/pcap', 'tcpdump -nr scan.pcap 2>/dev/null | head -8', "tcpdump -nr scan.pcap 2>/dev/null | grep 'Flags \\[S\\],'", "tcpdump -nr scan.pcap 'src host 198.51.100.77' 2>/dev/null | awk '{print $5}' | sort -u | wc -l", "tcpdump -nr scan.pcap 2>/dev/null | grep 'Flags \\[S\\.\\]'"],
+      tasks: [
+        {
+          q: 'SYN だけを送っているパケット(Flags [S],)の送信元IPアドレスを集計し、最も多くSYNを送っているIPを答えてください。送信元は「IP.ポート」の形なので、ポートを除いたIPで数えます。',
+          narration: 'tcpdump の出力は空白区切り。3列目が送信元(IP.ポート)。cut -d. -f1-4 で最初の4つのピリオド区切り(=IP部分)だけを取り出して、sort | uniq -c で数える。',
+          check: { type: 'answer', any: ['198.51.100.77'], normalizeIp: true },
+          answerHint: '最多のIP',
+          hints: ["tcpdump -nr scan.pcap 2>/dev/null | grep 'Flags \\[S\\],' で SYN だけにする", "awk '{print $3}' | cut -d. -f1-4 | sort | uniq -c | sort -rn", '198.51.100.77 が12個、正規ユーザー 10.0.0.5 は1個'],
+          explain: '198.51.100.77 が12個のSYNを送っており、正規ユーザー(10.0.0.5)の1個と比べて突出している。1つのIPから短時間に大量のSYN——これがスキャンの典型的な形。grep(絞る)→awk(列を取る)→cut(IPだけ)→sort|uniq -c(数える) という、ログ集計でおなじみの型がパケット解析でもそのまま使える。',
+        },
+        {
+          q: 'このスキャン元(198.51.100.77)は、10.0.0.9 の異なる宛先ポートを全部でいくつ探っていますか。送信元がそのIPのパケットに絞り、宛先ポートの種類を数えてください。',
+          narration: 'フィルタ \'src host 198.51.100.77\' で攻撃元のパケットだけに絞る。5列目が宛先(IP.ポート:)。sort -u で重複を除いて数える。',
+          check: { type: 'answer', any: ['12'] },
+          hints: ["tcpdump -nr scan.pcap 'src host 198.51.100.77' 2>/dev/null", "awk '{print $5}' で宛先列を取り出し、sort -u で重複を除く", '| wc -l で数える。12種類のポート'],
+          explain: '12種類のポート(21,22,23,25,53,80,110,139,443,445,3306,8080)を短時間に探っている。人間が普通に使う通信では、同じ相手の何十種類ものポートに立て続けに接続することはない。「多数のポートへの試行」「1つの攻撃元」「短時間」の3点が、スキャン検知の基本条件になる。',
+        },
+        {
+          q: 'サーバー 10.0.0.9 がスキャン元に対して SYN+ACK([S.])を返したポート、つまり「開いている」と判定されたポートは全部でいくつありますか。',
+          narration: '開いているポートは SYN+ACK で応答し、閉じているポートは RST で応答する。サーバーからスキャン元への応答で [S.] のものを数える。',
+          check: { type: 'answer', any: ['3'] },
+          hints: ["tcpdump -nr scan.pcap 'src host 10.0.0.9 and dst host 198.51.100.77' 2>/dev/null", "grep -c 'Flags \\[S\\.\\]' で SYN+ACK の数を数える", '22・80・443 の3ポートが開いていた'],
+          explain: '開いていたのは 22(SSH)・80(HTTP)・443(HTTPS) の3ポート。攻撃者はこの結果から、SSH総当たりやWebの脆弱性探索といった次の手を選ぶ。防御側は、不要なポートを閉じて攻撃面を減らし、スキャンを検知したら送信元を遮断する。パケットから「何が見つかってしまったか」まで割り出せた。',
+        },
+        mcq('SYNスキャンを検知するための特徴として、最も適切なものはどれか。',
+          ['1つの送信元が短時間に多数の異なる宛先ポートへSYNを送る', '同じポートに大量のHTTPリクエストが来る', 'パケットサイズが常に最大である', 'DNSの応答が遅い'], 1,
+          '正解は1。スキャンは「1つの送信元IP × 短時間 × 多数の異なる宛先ポート」が特徴。2はHTTPフラッド、3・4はスキャンとは無関係。IDS(Suricata/Snort)も同様の条件(閾値)でスキャンを検知する。検知後は送信元の遮断と、公開ポートの見直しを行う。',
+          { narration: 'スキャンの本質は「手当たり次第にポートを試す」こと。' }),
+      ],
+      review: review(
+        ['tcpdump + grep でSYNだけを抽出', 'awk/cut/sort/uniq -c で送信元を集計', '宛先ポートの種類数を数える', '[S.](開)と[R.](閉)で結果を読む'],
+        [{ cmd: "tcpdump -nr scan.pcap 2>/dev/null | grep 'Flags \\[S\\],' | awk '{print $3}' | cut -d. -f1-4 | sort | uniq -c | sort -rn", meaning: 'SYN送信元のランキング' }, { cmd: "tcpdump -nr scan.pcap 'src host 198.51.100.77' | awk '{print $5}' | sort -u | wc -l", meaning: '探索したポート数' }],
+        'スキャン検知は偵察段階を見つける重要な手がかり。送信元・探索範囲・発見されたサービスを割り出すと、次に狙われる場所の予測と対策ができる。',
+        'IDS/IPSのスキャン検知ルール、ファイアウォールでの送信元遮断、不要ポートの閉鎖、定期的な自己スキャンによる攻撃面の確認。',
+        ['nmap', 'IDS/IPS', 'ファイアウォール', '攻撃面の削減']),
+      learned: ['syn-scan-detection', 'port-scan-analysis', 'syn-ack-rst', 'packet-aggregation'],
+      solution: ['cd /home/analyst/pcap', "tcpdump -nr scan.pcap 2>/dev/null | grep 'Flags \\[S\\],' | awk '{print $3}' | cut -d. -f1-4 | sort | uniq -c | sort -rn", "tcpdump -nr scan.pcap 'src host 198.51.100.77' 2>/dev/null | awk '{print $5}' | sort -u | wc -l", "tcpdump -nr scan.pcap 'src host 10.0.0.9 and dst host 198.51.100.77' 2>/dev/null | grep -c 'Flags \\[S\\.\\]'"],
+    },
+
+    {
+      id: 'pk-04-dns-tunnel',
+      title: 'DNSトンネリングによる持ち出しを見抜く',
+      minutes: 15,
+      objectives: ['DNS通信の異常を見つける', 'サブドメインに埋め込まれたデータを復元する', 'DNSを悪用した持ち出しの検知方法を理解する'],
+      prereq: ['pk-03-synscan', 'nb-04-dns'],
+      briefing: '社内のPCから、ファイアウォールで許可されているDNSを使って、データが外部に持ち出されている疑いがある。DNSは「名前を引くだけ」の通信と思われがちだが、問い合わせ名の中にデータを詰めれば、外部の攻撃者サーバーへ情報を送れてしまう。',
+      concepts: [{
+        title: 'DNSトンネリング',
+        why: 'DNSはほぼ必ず許可される通信で、中身が細かく監視されないことが多い。そのため、攻撃者は「問い合わせるドメイン名」にデータを埋め込んで外へ送る(トンネリング)。',
+        problem: '通常のDNSクエリに紛れた、データ持ち出し用のクエリを見つけ、何が送られたのかを復元したい。',
+        how: '通常のクエリは www.acme.lab のような短く読める名前。トンネリングは「ランダムな長い文字列.攻撃者のドメイン」を大量に引く。その長い部分(ラベル)がデータの断片で、16進やBase32で符号化されている。tcpdump で名前だけ取り出し、先頭ラベルをつなげて xxd -r -p で復元すれば、送られた中身が分かる。',
+        example: '464c41477b64.t.evil-dns.example. → 先頭ラベル 464c41477b64 は16進(FLAG{d…)',
+        relation: 'DNSクエリから異常なドメインを特定し、埋め込まれたデータを復元する。',
+      }],
+      env: {
+        hostname: 'soc', user: 'analyst', dirs: ['/home/analyst/pcap'],
+        files: [{ path: '/home/analyst/pcap/dns.pcap', owner: 'analyst', content: dnsTunnel() }],
+      },
+      quick: ['cd /home/analyst/pcap', 'tcpdump -nr dns.pcap 2>/dev/null', "tcpdump -nr dns.pcap 2>/dev/null | awk '{print $8}'", "tcpdump -nr dns.pcap 2>/dev/null | awk '{print $8}' | sort | uniq -c | sort -rn", "tcpdump -nr dns.pcap 2>/dev/null | grep evil-dns | awk '{print $8}' | cut -d. -f1"],
+      tasks: [
+        {
+          q: 'dns.pcap のDNSクエリ(問い合わせ名は8列目)を一覧すると、通常の acme.lab 宛てに混じって、異常に長い16進の文字列を先頭に持つ名前があります。それを問い合わせている、攻撃者のドメイン名(末尾のドット無し、サブドメイン t を除く)を答えてください。',
+          narration: 'awk \'{print $8}\' で問い合わせ名の列だけを取り出して眺める。www.acme.lab のような短く読める名前の中に、見慣れない長い文字列がある。',
+          check: { type: 'answer', any: ['evil-dns.example', 'evil-dns.example.', 't.evil-dns.example', 't.evil-dns.example.'], ci: true },
+          answerHint: 'ドメイン名',
+          hints: ["tcpdump -nr dns.pcap 2>/dev/null | awk '{print $8}'", '名前の末尾(右側)を見る。acme.lab 以外のドメイン', 'evil-dns.example(長い16進ラベル.t.evil-dns.example.)'],
+          explain: '長い16進ラベル付きの名前は evil-dns.example 宛て。正規の問い合わせ(www/mail/update.acme.lab)は短く読める名前なのに対し、これは人間が使わない不自然な長いランダム文字列。「異常に長い・ランダムなサブドメイン」はDNSトンネリングの最も分かりやすい兆候。',
+        },
+        {
+          q: 'その攻撃者ドメイン(evil-dns.example)へのクエリは全部で何件ありますか。',
+          narration: 'grep で evil-dns を含む行に絞って数える。1回の通信量は小さいので、データを送るには何度も分けて問い合わせる必要がある。',
+          check: { type: 'answer', any: ['4'] },
+          hints: ["tcpdump -nr dns.pcap 2>/dev/null | grep -c evil-dns", "または grep evil-dns | wc -l", '4件(データを4つに分割して送っている)'],
+          explain: '4件のクエリ。DNS名には長さの上限(1ラベル63文字)があるため、データは小さく分割して何度にも分けて送られる。同じドメインに対する短時間の連続した問い合わせは、トンネリングの2つ目の兆候。実際の攻撃では数百〜数千件になることもある。',
+        },
+        {
+          q: '4件のクエリの先頭ラベル(16進の文字列)を送信された順につなげ、xxd -r -p で復元して、埋め込まれていたデータ FLAG{...} の中身を答えてください。',
+          narration: 'grep → awk(名前の列)→ cut -d. -f1(先頭ラベル)→ tr -d \'\\n\'(改行を消して1本につなぐ)→ xxd -r -p(16進を文字に戻す)。パイプでつなげて一気に処理する。',
+          check: { type: 'answer', any: ['dns_tunnel_ok'], stripFlag: true, ci: true },
+          answerHint: 'FLAG{ } の中身',
+          hints: ["grep evil-dns で攻撃者宛てだけにし、awk '{print $8}' | cut -d. -f1 で先頭ラベルを取り出す", "tr -d '\\n' で改行を消して1行につなぐ", "tcpdump -nr dns.pcap 2>/dev/null | grep evil-dns | awk '{print $8}' | cut -d. -f1 | tr -d '\\n' | xxd -r -p"],
+          explain: '先頭ラベルをつなげた 464c41477b646e735f74756e6e656c5f6f6b7d を xxd -r -p で復元すると FLAG{dns_tunnel_ok}。DNSの問い合わせ名に、持ち出したいデータが16進で埋め込まれていた。この一連の処理(grep→awk→cut→tr→xxd)は、これまでのステージで身につけたテキスト処理と符号化の知識の総合応用になっている。',
+        },
+        mcq('DNSトンネリングの検知に有効な指標として、適切でないものはどれか。',
+          ['問い合わせ名が異常に長い、またはランダムな文字列に見える', '同じドメインに対して短時間に大量の問い合わせがある', 'TXTレコードなど通常あまり使われない種類のクエリが多い', 'クエリの応答が常に1ミリ秒以内である'], 4,
+          '適切でないのは4。応答時間の速さはトンネリングの指標にならない(むしろ外部の攻撃者サーバーへ往復するので遅くなりがち)。有効なのは、名前の長さ・ランダム性(エントロピー)、同一ドメインへの高頻度クエリ、TXT/NULLなど珍しいレコード種別。対策は、社内DNSリゾルバでの記録と異常検知、許可していない外部DNSへの直接通信の遮断。',
+          { narration: '「トンネリングらしさ」を示さないものを選ぶ。' }),
+      ],
+      review: review(
+        ['awk でクエリ名の列を取り出して眺める', '異常に長い/ランダムなラベルのドメインを特定', '攻撃者ドメイン宛ての件数を数える', 'cut/tr/xxd でラベルをつなげて16進を復元'],
+        [{ cmd: "tcpdump -nr dns.pcap 2>/dev/null | awk '{print $8}'", meaning: 'クエリ名だけを取り出す' }, { cmd: "… | grep evil-dns | awk '{print $8}' | cut -d. -f1 | tr -d '\\n' | xxd -r -p", meaning: '埋め込みデータを復元' }],
+        'DNSは許可されやすく、データ持ち出し経路になる。クエリ名の異常(長さ・頻度・種別)を検知できれば、ファイアウォールを素通りする持ち出しを発見できる。',
+        'DNSログ/パケットの異常検知、DNSファイアウォール(RPZ)、社内リゾルバ以外への直接DNS通信の遮断、SIEMでのエントロピー検知。',
+        ['データ持ち出し', 'C2通信', 'DNS', 'MITRE ATT&CK 持ち出し']),
+      learned: ['dns-tunneling', 'data-exfiltration', 'hex-decode', 'dns-anomaly'],
+      solution: ['cd /home/analyst/pcap', "tcpdump -nr dns.pcap 2>/dev/null | awk '{print $8}'", 'tcpdump -nr dns.pcap 2>/dev/null | grep -c evil-dns', "tcpdump -nr dns.pcap 2>/dev/null | grep evil-dns | awk '{print $8}' | cut -d. -f1 | tr -d '\\n' | xxd -r -p"],
+    },
+  ],
+};
+
+Object.assign(exports, { stagePacket });
+
+};
 __mods["js/missions/index.js"] = function (module, exports, __require) {
 // ステージ構成の統合。学習順（依存関係）に並べる。
 const { stage0 } = __require("js/missions/stage0-tutorial.js");
@@ -8755,6 +11181,7 @@ const { stageApiSec } = __require("js/missions/stage-apisec.js");
 const { stageCloud } = __require("js/missions/stage-cloud.js");
 const { stageDetect } = __require("js/missions/stage-detect.js");
 const { stageAISec } = __require("js/missions/stage-aisec.js");
+const { stagePacket } = __require("js/missions/stage-packet.js");
 
 const STAGES = [
   stage0,          // 入門: ターミナル基礎
@@ -8769,6 +11196,7 @@ const STAGES = [
   stageNetBasics,  // ネットワーク理論
   stage4,          // ネットワーク調査(実技)
   stageNetAdv,     // ネットワーク調査 II(深掘り)
+  stagePacket,     // パケット解析(tcpdump)
   stageSecBasics,  // セキュリティ基礎理論
   stageCrypto,     // 暗号・ハッシュ(実技)
   stage3,          // ログ解析・インシデント
@@ -8820,6 +11248,187 @@ function nextMissionInStage(stage, isDone) {
 Object.assign(exports, { STAGES, getMission, getStageOf, missionOrder, allMissions, isMissionUnlocked, nextMissionInStage });
 
 };
+__mods["js/story.js"] = function (module, exports, __require) {
+// ============================================================
+// ゲーム全体の軽量ストーリー（組織・人物・事件はすべて架空・教材用）
+// lines: [{ who: 'asagiri'|'hayama'|'narr', text }]
+// ============================================================
+
+const CAST = { asagiri: '主任 朝霧', hayama: '分析官 葉山', narr: null };
+
+const PROLOGUE = {
+  title: 'Prologue — ARGUS Lab 訓練プログラム',
+  lines: [
+    { who: 'narr', text: 'あなたは情報セキュリティ研究機関「ARGUS Lab」の見習いエンジニア。与えられたのは仮想の訓練環境と一台のターミナルだけ。' },
+    { who: 'asagiri', text: '主任の朝霧だ。この教材は、昨年うちが調査を手伝った侵害事案を分解して作ってある。社内では「ケース・ゼロ」と呼んでいる。' },
+    { who: 'asagiri', text: '課題は一つずつは小さい。だが全部終えれば、あの事案で何が起き、どこで防げたのかを自分の言葉で説明できるようになる。' },
+    { who: 'hayama', text: '監視チームの葉山です。ときどき現場の話をしに来ますね。まずは端末に慣れることから。' },
+  ],
+};
+
+// stage.id → { title, intro[], outro[] }
+const CHAPTERS = {
+  stage0: {
+    title: '最初の一歩',
+    intro: [{ who: 'asagiri', text: 'ここでは何も教えてもらえない。自分で問い合わせた分だけ情報が手に入る。今いる場所、周りにあるもの、その中身——まずはこの3つを確かめる癖をつけろ。' }],
+    outro: [{ who: 'asagiri', text: '手は動くようになったな。次は、ケース・ゼロの実物のディスクを触ってもらう。' }],
+  },
+  stage1: {
+    title: '最初の手がかり',
+    intro: [
+      { who: 'hayama', text: '侵害が疑われるWebサーバーのディスクを渡します。ログもファイルも大量です。' },
+      { who: 'asagiri', text: '全部を目で読む必要はない。find で探し、grep で絞り、パイプで集計する。それだけで景色が変わる。' },
+    ],
+    outro: [{ who: 'hayama', text: 'ログイン失敗を繰り返していた 203.0.113.9……この番号、ケース・ゼロの記録にもありました。覚えておいてください。' }],
+  },
+  textproc: {
+    title: '膨大なログ',
+    intro: [{ who: 'asagiri', text: '事案のログは一日で数万行になる。読むんじゃない。切って、並べて、数えるんだ。' }],
+    outro: [{ who: 'asagiri', text: 'テキスト処理の道具が揃ったな。この先ずっとこれを使う。' }],
+  },
+  linux2: {
+    title: '証拠を整える',
+    intro: [{ who: 'asagiri', text: '調査は見つけて終わりじゃない。原本を壊さず複製し、誰のアカウントが何を持つかを把握しておけ。' }],
+    outro: [{ who: 'hayama', text: '証拠フォルダとアカウント一覧、受け取りました。次は実際に侵害されたサーバーの対応をお願いします。' }],
+  },
+  stage2: {
+    title: '設定ミスの代償',
+    intro: [
+      { who: 'hayama', text: 'app-02 で、誰でも読める秘密鍵と、CPUを食い続ける見覚えのないプロセスが見つかりました。' },
+      { who: 'asagiri', text: '今回は調べて終わりじゃない。権限を締めて、不審なプロセスは止める。防御側の仕事だ。' },
+    ],
+    outro: [{ who: 'asagiri', text: '止めたな。だが相手は、止められる前提で何度でも戻る仕掛けを置いていく。それを次で学ぶ。' }],
+  },
+  'shell-auto': {
+    title: '自動化の表と裏',
+    intro: [{ who: 'asagiri', text: '環境変数、スクリプト、cron。運用を楽にする仕組みは、そのまま居座りの手段にもなる。両方の目で見ろ。' }],
+    outro: [{ who: 'asagiri', text: '正規のジョブと不審なジョブを見分けられるようになった。' }],
+  },
+  sysadmin: {
+    title: '止まらないサーバー',
+    intro: [{ who: 'hayama', text: 'srv-20 でディスク逼迫のアラート。それと、深夜に何かが導入された形跡があります。' }],
+    outro: [{ who: 'hayama', text: '深夜に入っていたツール群……攻撃者が持ち込む定番の道具でした。運用ログは正直です。' }],
+  },
+  powertools: {
+    title: '一段上の道具',
+    intro: [{ who: 'asagiri', text: 'ここからは実務でよく使う応用だ。JSON を jq で捌き、SUID 以外の昇格経路や新しい永続化も知っておけ。使う側も狙う側も同じ道具を使う。' }],
+    outro: [{ who: 'asagiri', text: '古典だけ見ていては足をすくわれる。道具の引き出しが増えたな。' }],
+  },
+  recon: {
+    title: '情報を集める',
+    intro: [{ who: 'asagiri', text: '攻防はどちらも情報を制した側が有利だ。設定・メタデータ・アカウント——漏れている手がかりを機械的に拾い集めろ。' }],
+    outro: [{ who: 'hayama', text: '平文の鍵や消し忘れのメモ……現実でも、ここから崩れることが本当に多いんです。' }],
+  },
+  'net-basics': {
+    title: 'ネットワークの原理',
+    intro: [{ who: 'asagiri', text: 'ツールを使う前に原理だ。パケットがなぜ届くのか分かっていれば、未知のトラブルにも自分で対処できる。' }],
+    outro: [{ who: 'asagiri', text: '土台はできた。次は実際にネットワークを調べてもらう。' }],
+  },
+  stage4: {
+    title: '攻撃面を見渡す',
+    intro: [{ who: 'hayama', text: '評価対象の内部ネットワークです。どの機器が、何のサービスを、どのポートで公開しているか——攻撃者より先に把握してください。' }],
+    outro: [{ who: 'asagiri', text: '開いている窓を数えられるようになった。次はその窓の「中身」まで踏み込む。' }],
+  },
+  'net-adv': {
+    title: '深掘り偵察',
+    intro: [{ who: 'asagiri', text: 'ポートが開いている、の先だ。何が、どのバージョンで動くか。そこまで分かって初めて的確な判断ができる。' }],
+    outro: [{ who: 'hayama', text: '古いバージョンのサービスがいくつか……ケース・ゼロも、ここが入口でした。' }],
+  },
+  packet: {
+    title: 'パケットを読む',
+    intro: [{ who: 'hayama', text: 'ログに残らないものも、通信そのものには証拠が残ります。社内で取得したキャプチャを何本か用意しました。' }],
+    outro: [{ who: 'asagiri', text: 'パケットが読めると、攻撃の言い逃れができなくなる。次は守りの原則を固めよう。' }],
+  },
+  'sec-basics': {
+    title: '守るための原則',
+    intro: [{ who: 'asagiri', text: '手を動かす前に、何を・なぜ守るのかを固めろ。原則があるから、個々の対策に優先順位がつけられる。' }],
+    outro: [{ who: 'asagiri', text: 'CIA、認証と認可、暗号とハッシュ——判断の軸ができたな。' }],
+  },
+  'crypto-lab': {
+    title: 'エンコードと暗号',
+    intro: [{ who: 'asagiri', text: 'エンコードと暗号は混同されがちだ。手を動かして「可逆か／鍵が要るか」を体で覚えろ。' }],
+    outro: [{ who: 'hayama', text: 'base64 を暗号だと思い込む人、本当に多いんですよ。違いが分かる人は強いです。' }],
+  },
+  stage3: {
+    title: '侵入の痕跡を追う',
+    intro: [
+      { who: 'hayama', text: 'ケース・ゼロの中核です。サーバー intra-07 で不審な外向き通信が見つかりました。' },
+      { who: 'asagiri', text: 'どうやって入られ、どうやって居座っているのか。ログと設定から再構成しろ。' },
+    ],
+    outro: [{ who: 'asagiri', text: '侵入口と居座りの仕掛けが見えたな。次は、痕跡をもっと細かく読み解く。' }],
+  },
+  forensics: {
+    title: '痕跡を読む',
+    intro: [{ who: 'asagiri', text: '攻撃者は隠す。だが完全には消せない。隠しファイル、更新時刻、改ざんされた設定——点の証拠を時系列に並べて線にしろ。' }],
+    outro: [{ who: 'hayama', text: '事案の全体像がだいぶ見えてきました。あとは、同じことを起こさせない側に回る番です。' }],
+  },
+  defense: {
+    title: '守る側へ',
+    intro: [{ who: 'asagiri', text: '再発させないために、検知・封じ込め・堅牢化・復旧を実際にやってもらう。ケース・ゼロで足りなかったのは、まさにこの部分だ。' }],
+    outro: [{ who: 'asagiri', text: '守りの型はひと通り身についた。次は、入口になった弱点そのものを、訓練環境の中で再現して理解する。' }],
+  },
+  stage5: {
+    title: '入口の弱点',
+    intro: [{ who: 'asagiri', text: '対象はすべて訓練用の仮想アプリだ。弱点の仕組みを理解するための再現であり、現実のサイトに試すことは許されない。' }],
+    outro: [{ who: 'hayama', text: '原因はどちらも「入力を信用しすぎた」こと。対策まで言えるようになってくださいね。' }],
+  },
+  'web-adv': {
+    title: '攻撃面の広がり',
+    intro: [{ who: 'asagiri', text: '入力を信用した結果は一つではない。コマンド実行、スクリプト混入、他人のデータの閲覧、不正なファイル設置。共通点を掴め。' }],
+    outro: [{ who: 'asagiri', text: '入口の種類は増えても、守りの原則は変わらない。入力を疑い、権限を絞る。' }],
+  },
+  'api-sec': {
+    title: '現代のアプリは API で動く',
+    intro: [{ who: 'hayama', text: '最近の案件はAPIとトークンが主役です。トークンの中身を読み、検証が甘い実装がどう崩れるかを見てください。' }],
+    outro: [{ who: 'asagiri', text: '「署名を検証しない」「サーバーに任意のURLを取らせる」——どちらもクラウドでは致命傷になる。次はそのクラウドだ。' }],
+  },
+  'cloud-container': {
+    title: 'クラウドとコンテナ',
+    intro: [{ who: 'asagiri', text: '今のインフラは設定ファイルでできている。ポリシーの過剰な権限、公開設定、Dockerfile の不備——設定を読んで穴を見つけろ。' }],
+    outro: [{ who: 'hayama', text: 'クラウドの事故は、侵入よりも「うっかり公開」の方が多いんです。設定を疑う癖を。' }],
+  },
+  advanced: {
+    title: '視野を広げる',
+    intro: [{ who: 'asagiri', text: '現場はLinuxだけでは完結しない。ディレクトリサービス、Windows、証明書、マルウェア、インシデント対応の型。地図を完成させろ。' }],
+    outro: [{ who: 'asagiri', text: '概念の地図はひと通り埋まった。次は、守りを「設計」する側の話だ。' }],
+  },
+  detection: {
+    title: '守りを設計する',
+    intro: [{ who: 'hayama', text: '検知は気合いではなく設計です。攻撃を共通の枠組みで整理して、ログから検知ルールを起こし、得られた指標を共有します。' }],
+    outro: [{ who: 'hayama', text: 'ケース・ゼロで見逃した兆候、今ならルールにできますね。' }],
+  },
+  'ai-sec': {
+    title: '新しい攻撃面',
+    intro: [{ who: 'asagiri', text: '最近は生成AIを組み込んだ製品が増えた。便利さの裏で、新しい種類の弱点が生まれている。仮想のボットで確かめろ。' }],
+    outro: [{ who: 'asagiri', text: '原理はこれまでと同じだ。信頼できない入力を、信頼したまま扱わない。' }],
+  },
+  ctf: {
+    title: '最終試験',
+    intro: [
+      { who: 'asagiri', text: '最終試験だ。ヒントは最小限、手順も自分で組み立てろ。これまで学んだすべてを使っていい。' },
+      { who: 'hayama', text: '最後の課題は、ケース・ゼロの全体像を再構成することです。' },
+    ],
+    outro: [{ who: 'asagiri', text: 'よくやった。' }],
+  },
+};
+
+const EPILOGUE = {
+  title: 'Epilogue — ケース・ゼロ、完',
+  lines: [
+    { who: 'asagiri', text: '侵入口、昇格、居座り、持ち出し。ケース・ゼロの全体を、君は自分の手で再構成した。' },
+    { who: 'hayama', text: '報告書の最後に必ず書くことがあります。「どこで止められたか」。もう答えられますよね。' },
+    { who: 'asagiri', text: '訓練は終わりだ。ここからは、本物の現場で学び続けろ。調べて、確かめて、記録を残す。それが一番の武器だ。' },
+    { who: 'narr', text: 'ARGUS Lab 訓練プログラム、修了。' },
+  ],
+};
+
+// 章の取得（無ければ空）
+function chapterOf(stageId) { return CHAPTERS[stageId] || { title: '', intro: [], outro: [] }; }
+
+
+Object.assign(exports, { CAST, PROLOGUE, CHAPTERS, EPILOGUE, chapterOf });
+
+};
 __mods["js/app.js"] = function (module, exports, __require) {
 // ============================================================
 // CyberLab — アプリ本体（画面遷移・ミッション実行）
@@ -8830,6 +11439,7 @@ const { Terminal } = __require("js/terminal.js");
 const { evaluate, needsAnswer } = __require("js/checker.js");
 const store = __require("js/storage.js");
 const { STAGES, getMission, getStageOf, isMissionUnlocked, allMissions } = __require("js/missions/index.js");
+const { CAST, PROLOGUE, EPILOGUE, chapterOf } = __require("js/story.js");
 
 const app = document.getElementById('app');
 const isDone = id => store.missionState(id).done;
@@ -8846,6 +11456,8 @@ function route() {
   if (parts[0] === 'mission' && parts[1]) return renderMissionDetail(parts[1]);
   if (parts[0] === 'play' && parts[1]) return startPlay(parts[1]);
   if (parts[0] === 'progress') return renderProgress();
+  if (parts[0] === 'story') return renderStory();
+  if (!store.storySeen() && parts.length === 0) return renderStory(true);
   return renderHome();
 }
 window.addEventListener('hashchange', route);
@@ -8862,6 +11474,47 @@ function topbar(title, back) {
 }
 
 function screen(children) { clear(app); const m = el('main', {}, children); app.appendChild(m); window.scrollTo(0, 0); }
+
+// ---------- ストーリー ----------
+function dialogue(lines) {
+  return el('div', { class: 'story-lines' }, (lines || []).map(l => {
+    const who = CAST[l.who];
+    return el('div', { class: 'story-line ' + (who ? 'say ' + l.who : 'narr') }, [
+      who ? el('div', { class: 'story-who', text: who }) : null,
+      el('div', { class: 'story-text', text: l.text }),
+    ]);
+  }));
+}
+
+function renderStory(first) {
+  const done = STAGES.filter(st => st.missions.every(m => isDone(m.id))).length;
+  const chapters = STAGES.map((st, i) => {
+    const ch = chapterOf(st.id);
+    const cleared = st.missions.every(m => isDone(m.id));
+    const open = isMissionUnlocked(st.missions[0].id, isDone);
+    return el('div', { class: 'chapter-row' + (open ? '' : ' locked') }, [
+      el('div', { class: 'chapter-no', text: String(i + 1) }),
+      el('div', { class: 'chapter-body' }, [
+        el('div', { class: 'chapter-title', text: ch.title || st.title }),
+        el('div', { class: 'chapter-sub', text: open ? (cleared ? '読了' : '進行中') : '未解放' }),
+      ]),
+    ]);
+  });
+  const all = done === STAGES.length;
+  screen([
+    topbar('ストーリー', first ? null : '#/'),
+    el('div', { class: 'story-hero' }, [
+      el('div', { class: 'hero-badge', text: 'PROLOGUE' }),
+      el('h2', { class: 'detail-title', text: PROLOGUE.title }),
+    ]),
+    dialogue(PROLOGUE.lines),
+    first ? el('div', { class: 'detail-cta' }, [el('button', { class: 'btn-primary', text: '訓練を始める ▸', onclick: () => { store.markStorySeen(); go('#/'); renderHome(); } })]) : null,
+    first ? null : el('div', { class: 'section-label', text: '章の一覧' }),
+    first ? null : el('div', { class: 'chapter-list' }, chapters),
+    first || !all ? null : el('div', { class: 'section-label', text: 'エピローグ' }),
+    first || !all ? null : dialogue(EPILOGUE.lines),
+  ]);
+}
 
 // ---------- ホーム ----------
 function renderHome() {
@@ -8887,6 +11540,7 @@ function renderHome() {
   const cont = el('div', { class: 'home-actions' }, [
     el('button', { class: 'btn-primary', text: next ? (done ? '続きから学習する ▸' : '訓練を開始する ▸') : '全ミッション踏破済み ✓', onclick: () => next ? go('#/mission/' + next.id) : go('#/progress') }),
     el('button', { class: 'btn-ghost', text: 'ステージ一覧を見る', onclick: () => go('#/stage/' + STAGES[0].id) }),
+    el('button', { class: 'btn-ghost', text: 'ストーリーを読む', onclick: () => go('#/story') }),
   ]);
 
   const map = el('div', { class: 'stage-list' }, STAGES.map(st => stageRow(st)));
@@ -8933,13 +11587,20 @@ function renderStage(stageId) {
       el('div', { class: 'mc-arrow', text: unlocked ? '›' : '' }),
     ]);
   }));
+  const ch = chapterOf(st.id);
+  const idx = STAGES.indexOf(st);
+  const cleared = st.missions.every(m => isDone(m.id));
   screen([
     topbar(st.title, '#/'),
     el('div', { class: 'stage-hero' }, [
       el('div', { class: 'section-label', text: st.title }),
+      ch.title ? el('div', { class: 'chapter-head', text: `第${idx + 1}章 ${ch.title}` }) : null,
+      dialogue(ch.intro),
       el('p', { class: 'stage-intro', text: st.intro }),
     ]),
     list,
+    cleared && ch.outro.length ? el('div', { class: 'section-label', text: 'この章の締め' }) : null,
+    cleared ? dialogue(ch.outro) : null,
   ]);
 }
 
@@ -9183,6 +11844,9 @@ function renderReview(m) {
   const stageId = getStageOf(m.id);
   const st = STAGES.find(s => s.id === stageId);
   const nextInStage = st.missions.find(x => !isDone(x.id));
+  const ch = chapterOf(st.id);
+  const stageCleared = !nextInStage;
+  const gameCleared = stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
   let nextBtn;
   if (nextInStage) nextBtn = el('button', { class: 'btn-primary', text: '次のミッションへ ▸', onclick: () => { play = null; go('#/mission/' + nextInStage.id); } });
   else {
@@ -9205,6 +11869,10 @@ function renderReview(m) {
     rv.why ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: 'なぜこの操作が必要だったか' }), el('div', { class: 'db-text', text: rv.why })]) : null,
     rv.practice ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '実務での使いどころ' }), el('div', { class: 'db-text', text: rv.practice })]) : null,
     rv.related && rv.related.length ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '次につながる知識' }), el('div', { class: 'chips' }, rv.related.map(r => el('span', { class: 'chip', text: r })))]) : null,
+    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `第${STAGES.indexOf(st) + 1}章 クリア` }) : null,
+    stageCleared ? dialogue(ch.outro) : null,
+    gameCleared ? el('div', { class: 'section-label', text: EPILOGUE.title }) : null,
+    gameCleared ? dialogue(EPILOGUE.lines) : null,
     el('div', { class: 'detail-cta' }, [nextBtn]),
   ]);
 }

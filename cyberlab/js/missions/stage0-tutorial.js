@@ -37,7 +37,7 @@ export const stage0 = {
           check: { type: 'answer', any: ['/home/analyst'] },
           answerHint: 'pwd の出力をそのまま入力',
           hints: ['いま自分がいる場所を表示するコマンドがある', 'print working directory の略', 'pwd と入力して実行し、表示されたパスを答える'],
-          explain: 'pwd はカレントディレクトリの絶対パスを表示する。ホームディレクトリは慣例的に /home/ユーザー名 に置かれる。',
+          explain: 'pwd (print working directory) はカレントディレクトリの絶対パスを表示する。ホームディレクトリは慣例的に /home/ユーザー名 に置かれ、ログイン直後はここが現在地になる。ファイル操作の前に pwd で現在地を確かめる習慣は、誤ったディレクトリで rm や mv をしてしまう事故を防ぐ。',
         },
         {
           q: 'このディレクトリには隠しファイルを含めていくつのエントリ（. と .. を除く通常/隠しファイル）がありますか。ls -a で確認して数を答えてください。',
@@ -98,14 +98,14 @@ export const stage0 = {
           { path: '/opt/training/day2/lesson.txt', content: 'Day2: 権限の考え方。\n' },
         ],
       },
-      quick: ['cd /opt/training', 'ls', 'cd ..', 'cat readme.txt', 'cd day1', 'pwd'],
+      quick: ['cd /opt/training', 'ls', 'cat readme.txt', 'cd day1', 'pwd', 'cd ..'],
       tasks: [
         {
           q: '/opt/training に移動し、その場所の絶対パスを答えてください。',
           narration: '絶対パスを使えば、今どこにいても一発で目的地へ飛べる。cd /opt/training を実行しよう。',
           check: { type: 'answer', any: ['/opt/training'] },
           hints: ['cd に絶対パスを渡す', 'cd /opt/training', '移動後に pwd で確認してその値を答える'],
-          explain: 'cd に / で始まる絶対パスを渡すと、現在地に関係なくそこへ移動できる。',
+          explain: 'cd に / で始まる絶対パスを渡すと、現在地に関係なくそこへ移動できる。絶対パスは「どこから見ても同じ場所」を指すので、手順書やスクリプトでは相対パスより事故が少ない。移動後は pwd で現在地を確認できる。',
         },
         {
           q: 'day1 ディレクトリの中の lesson.txt に書かれている「合言葉」を答えてください。',

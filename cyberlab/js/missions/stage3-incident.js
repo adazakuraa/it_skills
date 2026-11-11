@@ -46,7 +46,7 @@ Oct 14 09:30:00 intra-07 sshd[3001]: Accepted publickey for analyst from 198.51.
           narration: '総当たり攻撃の規模をまず掴む。grep で失敗行を抽出し件数を数える。',
           check: { type: 'answer', any: ['6', '６'] },
           hints: ['grep -c "Failed password" /var/log/auth.log', 'クォートで囲むとスペースを含む語を1つのパターンにできる', '6回失敗している'],
-          explain: '短時間に6回の認証失敗が同一IPから発生。典型的なSSH総当たり。grep -c で件数を即座に把握できる。',
+          explain: '短時間（約10秒間）に6回の認証失敗が同一IPから発生しており、典型的なSSH総当たり攻撃の形をしている。正規ユーザーの打ち間違いなら、これほど短い間隔で複数のアカウント名(admin/root/backup)を試すことはない。grep -c で件数を即座に把握し、攻撃の規模を見積もる。',
         },
         {
           q: '総当たりの末に、ログインに「成功」してしまったアカウント名を答えてください。',
