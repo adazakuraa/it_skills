@@ -6,10 +6,15 @@
 import { FsError, ERRMSG, modeString, lsDate, isoDate, nodeSize } from './vfs.js';
 import { escapeRe } from './shell.js';
 import { MANPAGES } from './manpages.js';
+import { runAwk, AwkError } from './awk.js';
+import { parseSed, runSedLines, SedError } from './sed.js';
 
 function fsMsg(e) { return e instanceof FsError ? (ERRMSG[e.code] || e.code) : String(e && e.message || e); }
 
 // オプション解析: spec 例 { l:'bool', n:'val', '--color':'optval' }
+class OptError extends Error { constructor(msg) { super(msg); this.name = 'OptError'; } }
+export { OptError };
+
 function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
   const opts = {};
   const operands = [];
@@ -23,7 +28,7 @@ function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
       if (spec[key] === 'val' || spec[key] === 'optval') {
         opts[key] = eq >= 0 ? a.slice(eq + 1) : (spec[key] === 'val' ? args[++i] : true);
       } else if (spec[key] === 'bool') opts[key] = true;
-      else return { error: `unrecognized option '${a}'` };
+      else throw new OptError(`unrecognized option '${a}'`);
       continue;
     }
     if (a.length > 1 && a[0] === '-' && a !== '-') {
@@ -36,7 +41,7 @@ function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
           if (val) opts[f] = val;
           else opts[f] = args[++i];
           j = a.length; break;
-        } else return { error: `invalid option -- '${f}'` };
+        } else throw new OptError(`invalid option -- '${f}'`);
       }
       continue;
     }
@@ -189,6 +194,8 @@ export function makeCommands(getCmds) {
   C.head = (args, ctx) => headtail(args, ctx, 'head');
   C.tail = (args, ctx) => headtail(args, ctx, 'tail');
   function headtail(args, ctx, name) {
+    // 旧式の数値オプション (head -3 / tail -5) を -n N に正規化
+    args = args.flatMap(a => (/^-\d+$/.test(a) ? ['-n', a.slice(1)] : [a]));
     const { opts, operands } = parseOpts(args, { n: 'val', c: 'val', f: 'bool', q: 'bool' });
     let n = 10;
     if (opts.n != null) { n = parseInt(opts.n, 10); if (isNaN(n)) { ctx.err(`${name}: invalid number\n`); return 1; } }
@@ -212,14 +219,14 @@ export function makeCommands(getCmds) {
   }
 
   C.grep = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { i: 'bool', v: 'bool', n: 'bool', c: 'bool', r: 'bool', R: 'bool', E: 'bool', o: 'bool', l: 'bool', w: 'bool', H: 'bool', h: 'bool', F: 'bool', q: 'bool', a: 'bool' }, { stopAtNonOption: true });
+    const { opts, operands } = parseOpts(args, { i: 'bool', v: 'bool', n: 'bool', c: 'bool', r: 'bool', R: 'bool', E: 'bool', o: 'bool', l: 'bool', w: 'bool', H: 'bool', h: 'bool', F: 'bool', q: 'bool', a: 'bool', s: 'bool', e: 'val', A: 'val', B: 'val', C: 'val', m: 'val' });
     let pattern = opts.e;
     const ops = [...operands];
     if (pattern == null) pattern = ops.shift();
     if (pattern == null) { ctx.err('grep: 検索パターンがありません\n'); return 2; }
     let re;
     try {
-      let pat = opts.F ? escapeRe(pattern) : pattern;
+      let pat = opts.F ? escapeRe(pattern) : posixToJs(pattern, !!opts.E);
       if (opts.w) pat = `\\b(?:${pat})\\b`;
       re = new RegExp(pat, opts.i ? 'gi' : 'g');
     } catch (e) { ctx.err(`grep: 無効な正規表現: ${e.message}\n`); return 2; }
@@ -227,27 +234,37 @@ export function makeCommands(getCmds) {
     let matched = false;
     let code = 1;
     const vfs = ctx.sh.vfs;
+    const ctxA = parseInt(opts.A ?? opts.C ?? 0, 10) || 0;
+    const ctxB = parseInt(opts.B ?? opts.C ?? 0, 10) || 0;
+    const maxCount = opts.m != null ? parseInt(opts.m, 10) : Infinity;
     const searchText = (data, label) => {
-      let count = 0;
       const lines = data.split('\n');
       if (lines[lines.length - 1] === '') lines.pop();
-      lines.forEach((ln, i) => {
-        re.lastIndex = 0;
-        const hit = re.test(ln);
-        if (hit !== !!opts.v) {
-          matched = true; code = 0; count++;
-          if (opts.q || opts.l || opts.c) return;
-          const prefix = (label && (opts.H || recursive || opts.H)) ? label + ':' : '';
-          if (opts.o && !opts.v) {
-            re.lastIndex = 0; let m;
-            while ((m = re.exec(ln))) { ctx.out(prefix + (opts.n ? (i + 1) + ':' : '') + m[0] + '\n'); if (m.index === re.lastIndex) re.lastIndex++; }
-          } else {
-            ctx.out(prefix + (opts.n ? (i + 1) + ':' : '') + ln + '\n');
-          }
-        }
-      });
+      const isHit = lines.map(ln => { re.lastIndex = 0; return re.test(ln) !== !!opts.v; });
+      // -m: 最初の N 件のみ
+      let seen = 0;
+      for (let k = 0; k < isHit.length; k++) if (isHit[k]) { seen++; if (seen > maxCount) isHit[k] = false; }
+      const count = isHit.filter(Boolean).length;
+      if (count) { matched = true; code = 0; }
+      const prefixName = (label && (opts.H || recursive)) ? label : '';
       if (opts.c && !opts.q) ctx.out((label ? label + ':' : '') + count + '\n');
       if (opts.l && count && !opts.q) ctx.out(label + '\n');
+      if (opts.q || opts.l || opts.c) return count;
+      // 出力する行（マッチ＋前後の文脈）
+      const show = new Array(lines.length).fill(false);
+      isHit.forEach((h, k) => { if (!h) return; for (let d = -ctxB; d <= ctxA; d++) if (lines[k + d] !== undefined) show[k + d] = true; });
+      let lastShown = -2;
+      lines.forEach((ln, k) => {
+        if (!show[k]) return;
+        if ((ctxA || ctxB) && lastShown >= 0 && k > lastShown + 1) ctx.out('--\n');
+        lastShown = k;
+        const sep = isHit[k] ? ':' : '-';
+        const pre = (prefixName ? prefixName + sep : '') + (opts.n ? (k + 1) + sep : '');
+        if (opts.o && !opts.v && isHit[k]) {
+          re.lastIndex = 0; let m;
+          while ((m = re.exec(ln))) { ctx.out(pre + m[0] + '\n'); if (m.index === re.lastIndex) re.lastIndex++; }
+        } else ctx.out(pre + ln + '\n');
+      });
       return count;
     };
     if (!ops.length || ops[0] === '-') { searchText(ctx.stdin, opts.H ? '(standard input)' : ''); return opts.q ? (matched ? 0 : 1) : code; }
@@ -272,44 +289,91 @@ export function makeCommands(getCmds) {
     let i = 0;
     for (; i < args.length; i++) { if (args[i].startsWith('-') || args[i] === '!' || args[i] === '(') break; paths.push(args[i]); }
     if (!paths.length) paths.push('.');
-    const tests = args.slice(i);
+    const toks = args.slice(i);
     const vfs = ctx.sh.vfs, user = ctx.sh.user;
     let code = 0;
-    // 述語を関数に変換
-    const preds = [];
-    const actions = [];
-    for (let k = 0; k < tests.length; k++) {
-      const t = tests[k];
-      const val = () => tests[++k];
-      if (t === '-name') { const pat = globRe(val()); preds.push((p, n, name) => pat.test(name)); }
-      else if (t === '-iname') { const pat = globRe(val(), true); preds.push((p, n, name) => pat.test(name)); }
-      else if (t === '-type') { const ty = val(); preds.push((p, n) => (ty === 'f' ? n.type === 'f' : ty === 'd' ? n.type === 'd' : ty === 'l' ? n.type === 'l' : true)); }
-      else if (t === '-maxdepth') { ctx._maxdepth = parseInt(val(), 10); }
-      else if (t === '-mindepth') { ctx._mindepth = parseInt(val(), 10); }
-      else if (t === '-perm') { const spec = val(); preds.push((p, n) => permMatch(n.mode, spec)); }
-      else if (t === '-user') { const u = val(); const uu = vfs.userByName(u); preds.push((p, n) => n.uid === (uu ? uu.uid : parseInt(u, 10))); }
-      else if (t === '-group') { const g = val(); const gg = vfs.groupByName(g); preds.push((p, n) => n.gid === (gg ? gg.gid : parseInt(g, 10))); }
-      else if (t === '-size') { const spec = val(); preds.push((p, n) => sizeMatch(nodeSize(n), spec)); }
-      else if (t === '-empty') { preds.push((p, n) => n.type === 'f' ? n.content === '' : Object.keys(n.children).length === 0); }
-      else if (t === '-print') { /* default */ }
-      else if (t === '-type') { }
-      else if (t === '-o' || t === '-a' || t === '!' || t === '(' || t === ')') { /* 簡易: AND のみ対応 */ }
-      else { ctx.err(`find: 未対応の述語 '${t}' は無視します\n`); }
+    let maxd = Infinity, mind = 0;
+    let hasAction = false;
+    const pendingDelete = [];
+    // ---- 式パーサ: or > and > not > primary ----
+    let pos = 0;
+    const peek = () => toks[pos];
+    const need = (name) => { if (pos >= toks.length) throw new OptError(`missing argument to \`${name}'`); return toks[pos++]; };
+    function parseOr() {
+      let left = parseAnd();
+      while (peek() === '-o' || peek() === '-or') { pos++; const right = parseAnd(); const l = left; left = (e) => l(e) || right(e); }
+      return left;
     }
-    const maxd = ctx._maxdepth ?? Infinity;
-    const mind = ctx._mindepth ?? 0;
-    delete ctx._maxdepth; delete ctx._mindepth;
+    function parseAnd() {
+      let left = parseNot();
+      while (pos < toks.length && peek() !== '-o' && peek() !== '-or' && peek() !== ')') {
+        if (peek() === '-a' || peek() === '-and') pos++;
+        const right = parseNot(); const l = left; left = (e) => l(e) && right(e);
+      }
+      return left;
+    }
+    function parseNot() {
+      if (peek() === '!' || peek() === '-not') { pos++; const inner = parseNot(); return (e) => !inner(e); }
+      return parsePrimary();
+    }
+    function parsePrimary() {
+      const t = toks[pos++];
+      if (t === undefined) throw new OptError('invalid expression');
+      if (t === '(') { const inner = parseOr(); if (toks[pos++] !== ')') throw new OptError('unmatched ( in expression'); return inner; }
+      switch (t) {
+        case '-name': { const re = globRe(need(t)); return (e) => re.test(e.name); }
+        case '-iname': { const re = globRe(need(t), true); return (e) => re.test(e.name); }
+        case '-path': { const re = globRe(need(t)); return (e) => re.test(e.path); }
+        case '-type': { const ty = need(t); return (e) => (ty === 'f' ? e.node.type === 'f' : ty === 'd' ? e.node.type === 'd' : ty === 'l' ? e.node.type === 'l' : false); }
+        case '-perm': { const spec = need(t); return (e) => permMatch(e.node.mode, spec); }
+        case '-user': { const u = need(t); const uu = vfs.userByName(u); return (e) => e.node.uid === (uu ? uu.uid : parseInt(u, 10)); }
+        case '-group': { const g = need(t); const gg = vfs.groupByName(g); return (e) => e.node.gid === (gg ? gg.gid : parseInt(g, 10)); }
+        case '-size': { const spec = need(t); return (e) => sizeMatch(nodeSize(e.node), spec); }
+        case '-empty': return (e) => (e.node.type === 'f' ? e.node.content === '' : Object.keys(e.node.children).length === 0);
+        case '-mtime': case '-mmin': {
+          const spec = need(t); const unit = t === '-mtime' ? 86400000 : 60000;
+          const n = parseInt(spec.replace(/^[+-]/, ''), 10);
+          return (e) => { const age = Math.floor((vfs.clock - e.node.mtime) / unit); return spec[0] === '+' ? age > n : spec[0] === '-' ? age < n : age === n; };
+        }
+        case '-newer': { const ref = need(t); let rn; try { rn = lookup(ctx, ref); } catch (er) { throw new OptError(`'${ref}': ${fsMsg(er)}`); } return (e) => e.node.mtime > rn.mtime; }
+        case '-maxdepth': maxd = parseInt(need(t), 10); return () => true;
+        case '-mindepth': mind = parseInt(need(t), 10); return () => true;
+        case '-print': hasAction = true; return (e) => { ctx.out(e.shown + '\n'); return true; };
+        case '-delete': hasAction = true; return (e) => { pendingDelete.push(e.abs); return true; };
+        case '-exec': case '-execdir': {
+          hasAction = true;
+          const cmd = [];
+          while (pos < toks.length && toks[pos] !== ';' && toks[pos] !== '+') cmd.push(toks[pos++]);
+          if (pos >= toks.length) throw new OptError("missing argument to `-exec'");
+          pos++; // ; or +
+          if (!cmd.length) throw new OptError("missing argument to `-exec'");
+          return (e) => ctx.sh.exec(cmd.map(a => a.split('{}').join(e.shown)), ctx) === 0;
+        }
+        default: throw new OptError(`unknown predicate \`${t}'`);
+      }
+    }
+    const expr = toks.length ? parseOr() : () => true;
+    if (pos < toks.length) throw new OptError(`paths must precede expression: \`${toks[pos]}'`);
+    const run = hasAction ? expr : (e) => { if (!expr(e)) return false; ctx.out(e.shown + '\n'); return true; };
     for (const start of paths) {
       let node;
       try { node = lookup(ctx, start); } catch (e) { ctx.err(`find: '${start}': ${fsMsg(e)}\n`); code = 1; continue; }
-      vfs.walk(resolve(ctx, start), node, user,
+      const startAbs = resolve(ctx, start);
+      const trimmedStart = start.length > 1 ? start.replace(/\/+$/, '') : start;
+      vfs.walk(startAbs, node, user,
         (path, nd, depth) => {
           if (depth < mind || depth > maxd) return;
+          const rest = path.slice(startAbs.length === 1 ? 0 : startAbs.length);
+          const shown = depth === 0 ? start : (trimmedStart === '/' ? '/' + rest.replace(/^\//, '') : trimmedStart + rest);
           const name = path === '/' ? '/' : path.split('/').pop();
-          if (preds.every(fn => fn(path, nd, name))) ctx.out(path + '\n');
+          run({ path: shown, abs: path, shown, node: nd, name: depth === 0 && start.endsWith('.') ? start : name });
         },
         path => { ctx.err(`find: '${path}': Permission denied\n`); code = 1; },
         0, maxd);
+    }
+    for (const abs of pendingDelete.reverse()) {
+      try { const nd = vfs.lookup(abs, '/', null); if (nd.type === 'd') vfs.rmdir(abs, '/', user); else vfs.remove(abs, '/', user); }
+      catch (e) { ctx.err(`find: cannot delete '${abs}': ${fsMsg(e)}\n`); code = 1; }
     }
     return code;
   };
@@ -762,91 +826,101 @@ export function makeCommands(getCmds) {
   };
 
   C.sed = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { n: 'bool', i: 'bool', e: 'val', E: 'bool', r: 'bool' });
-    let script = opts.e;
-    const ops = [...operands];
-    if (script == null) script = ops.shift();
-    let data = ops.length ? safeRead(ctx, ops[0], 'sed') : ctx.stdin;
-    if (data == null) return 1;
-    const lines = data.split('\n');
-    const had = lines[lines.length - 1] === '';
-    if (had) lines.pop();
-    // 対応: s/old/new/flags, Np, Nd, /re/d, /re/p
-    const m = script.match(/^s(.)(.*?)\1(.*?)\1([gip0-9]*)$/);
-    let outLines = [];
-    try {
-      if (m) {
-        const [, , pat, rep, flags] = m;
-        const re = new RegExp(pat, flags.includes('g') ? (flags.includes('i') ? 'gi' : 'g') : (flags.includes('i') ? 'i' : ''));
-        const repl = rep.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-        for (const l of lines) {
-          const r = l.replace(re, repl.replace(/&/g, '$$&'));
-          if (flags.includes('p')) { if (!opts.n) outLines.push(l); outLines.push(r); }
-          else outLines.push(r);
+    // オプション: -n -E -r -i[SUFFIX] -e script (複数可) -f file / --expression=
+    let quiet = false, ere = false, inPlace = false, suffix = '';
+    const scripts = []; const operands = [];
+    for (let k = 0; k < args.length; k++) {
+      const a = args[k];
+      if (a === '--') { operands.push(...args.slice(k + 1)); break; }
+      if (a === '-e' || a === '--expression') { const v = args[++k]; if (v == null) { ctx.err('sed: -e にはスクリプトが必要です\n'); return 1; } scripts.push(v); }
+      else if (a.startsWith('--expression=')) scripts.push(a.slice(13));
+      else if (a === '-f') { const f = args[++k]; const t = f == null ? null : safeRead(ctx, f, 'sed'); if (t == null) return 1; scripts.push(t.replace(/\n$/, '')); }
+      else if (a === '--quiet' || a === '--silent') quiet = true;
+      else if (a === '--regexp-extended') ere = true;
+      else if (a.startsWith('--in-place')) { inPlace = true; suffix = a.includes('=') ? a.split('=')[1] : ''; }
+      else if (a.length > 1 && a[0] === '-' && a[1] !== '-') {
+        for (let j = 1; j < a.length; j++) {
+          const f = a[j];
+          if (f === 'n') quiet = true;
+          else if (f === 'E' || f === 'r') ere = true;
+          else if (f === 'i') { inPlace = true; suffix = a.slice(j + 1); break; }
+          else if (f === 's') { /* 各ファイル個別: 既定で近似 */ }
+          else if (f === 'e') { const v = a.slice(j + 1) || args[++k]; if (v == null) { ctx.err('sed: -e にはスクリプトが必要です\n'); return 1; } scripts.push(v); break; }
+          else throw new OptError(`invalid option -- '${f}'`);
         }
-        if (flags.includes('p') && opts.n) outLines = lines.map(l => l.replace(re, repl)).filter((_, i) => re.test(lines[i]));
-      } else if (/^\d+d$/.test(script)) {
-        const n = parseInt(script, 10); outLines = lines.filter((_, i) => i + 1 !== n);
-      } else if (/d$/.test(script) && script.startsWith('/')) {
-        const re = new RegExp(script.slice(1, script.lastIndexOf('/')));
-        outLines = lines.filter(l => !re.test(l));
-      } else if (/^\d+p$/.test(script) && opts.n) {
-        const n = parseInt(script, 10); if (lines[n - 1] != null) outLines = [lines[n - 1]];
-      } else { ctx.err(`sed: このシミュレーターでは一部のスクリプトのみ対応しています (${script})\n`); return 1; }
-    } catch (e) { ctx.err(`sed: -e 式 #1 の解釈に失敗: ${e.message}\n`); return 1; }
-    const result = outLines.map(l => l + '\n').join('');
-    if (opts.i && ops.length) { try { ctx.sh.vfs.writeFile(ops[0], ctx.sh.cwd, ctx.sh.user, result); } catch (e) { ctx.err(`sed: ${fsMsg(e)}\n`); return 1; } }
-    else ctx.out(result);
-    return 0;
+      }
+      else operands.push(a);
+    }
+    if (!scripts.length) { if (!operands.length) { ctx.err("usage: sed [-n] [-E] [-i[SUFFIX]] script [file ...]\n"); return 1; } scripts.push(operands.shift()); }
+    let cmds;
+    try { cmds = parseSed(scripts.join('\n'), ere); }
+    catch (e) { if (e instanceof SedError) { ctx.err(`sed: -e 式 #1: ${e.message}\n`); return 1; } throw e; }
+    const toLines = (text) => { const l = text.split('\n'); if (l[l.length - 1] === '') l.pop(); return l; };
+    try {
+      if (inPlace) {
+        if (!operands.length) { ctx.err('sed: -i にはファイルが必要です\n'); return 1; }
+        let code = 0;
+        for (const f of operands) {
+          const text = safeRead(ctx, f, 'sed'); if (text == null) { code = 1; continue; }
+          const out = runSedLines(cmds, toLines(text), { quiet });
+          try {
+            if (suffix) ctx.sh.vfs.writeFile(suffix.includes('*') ? suffix.replace('*', f) : f + suffix, ctx.sh.cwd, ctx.sh.user, text);
+            ctx.sh.vfs.writeFile(f, ctx.sh.cwd, ctx.sh.user, out.length ? out.join('\n') + '\n' : '');
+          } catch (e) { ctx.err(`sed: ${f}: ${fsMsg(e)}\n`); code = 1; }
+        }
+        return code;
+      }
+      let lines = [];
+      if (!operands.length) lines = toLines(ctx.stdin);
+      else for (const f of operands) { const t = f === '-' ? ctx.stdin : safeRead(ctx, f, 'sed'); if (t == null) return 1; lines.push(...toLines(t)); }
+      const out = runSedLines(cmds, lines, { quiet });
+      if (out.length) ctx.out(out.join('\n') + '\n');
+      return 0;
+    } catch (e) { if (e instanceof SedError) { ctx.err(`sed: ${e.message}\n`); return 1; } throw e; }
   };
 
   C.awk = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { F: 'val' });
-    const prog = operands.shift();
-    let data = operands.length ? safeRead(ctx, operands[0], 'awk') : ctx.stdin;
-    if (data == null) return 1;
-    const FS = opts.F || /\s+/;
-    const lines = data.split('\n');
-    if (lines[lines.length - 1] === '') lines.pop();
-    // 対応: '{print $N}', '{print $N, $M}', '/re/{print...}', 'NR==N', '{print}'
-    const bodyMatch = prog.match(/^\s*(?:\/([^/]*)\/)?\s*(?:\{(.*)\})?\s*$/);
-    let reFilter = null, body = 'print';
-    if (bodyMatch) { if (bodyMatch[1]) reFilter = new RegExp(bodyMatch[1]); if (bodyMatch[2] != null) body = bodyMatch[2].trim(); }
-    const condMatch = prog.match(/^\s*(NR|NF)\s*(==|>|<|>=|<=)\s*(\d+)\s*(?:\{(.*)\})?\s*$/);
-    lines.forEach((line, idx) => {
-      const trimmed = opts.F ? line : line.trim();
-      const fields = opts.F ? line.split(FS) : (line.trim() === '' ? [] : line.trim().split(FS));
-      const NR = idx + 1, NF = fields.length;
-      let pass = true;
-      if (reFilter) pass = reFilter.test(line);
-      if (condMatch) {
-        const lhs = condMatch[1] === 'NR' ? NR : NF;
-        const rhs = parseInt(condMatch[3], 10);
-        const op = condMatch[2];
-        pass = op === '==' ? lhs === rhs : op === '>' ? lhs > rhs : op === '<' ? lhs < rhs : op === '>=' ? lhs >= rhs : lhs <= rhs;
-        if (condMatch[4] != null) body = condMatch[4].trim();
-        else body = 'print';
+    // 手動でオプションを解析（-F fs / -v var=val(複数可) / -f progfile / --）
+    let FS = null; const vars = {}; let progFile = null; let i = 0;
+    const unesc = (v) => v.replace(/\\t/g, '\t').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+    for (; i < args.length; i++) {
+      const a = args[i];
+      if (a === '--') { i++; break; }
+      if (a.startsWith('-F')) { const v = a.length > 2 ? a.slice(2) : args[++i]; if (v == null) { ctx.err('awk: -F には区切り文字が必要です\n'); return 2; } FS = v === 't' ? '\t' : unesc(v); }
+      else if (a.startsWith('-v')) {
+        const v = a.length > 2 ? a.slice(2) : args[++i];
+        const m = (v || '').match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s);
+        if (!m) { ctx.err('awk: -v には var=value の形式が必要です\n'); return 2; }
+        vars[m[1]] = unesc(m[2]);
       }
-      if (!pass) return;
-      const printMatch = body.match(/^print\s*(.*)$/);
-      if (printMatch != null) {
-        const arg = printMatch[1].trim();
-        if (!arg) { ctx.out(line + '\n'); return; }
-        const parts = arg.split(',').map(tok => {
-          tok = tok.trim();
-          if (tok === '$0') return line;
-          if (tok === '$NF') return fields[NF - 1] ?? '';
-          if (tok === '$(NF-1)') return fields[NF - 2] ?? '';
-          const fm = tok.match(/^\$(\d+)$/);
-          if (fm) return fields[parseInt(fm[1], 10) - 1] ?? '';
-          if (tok === 'NR') return String(NR);
-          if (tok === 'NF') return String(NF);
-          return tok.replace(/^"|"$/g, '');
-        });
-        ctx.out(parts.join(' ') + '\n');
+      else if (a === '-f') { progFile = args[++i]; if (progFile == null) { ctx.err('awk: -f にはファイル名が必要です\n'); return 2; } }
+      else if (a.startsWith('-') && a.length > 1) { ctx.err(`awk: 未対応のオプション ${a}\n`); return 2; }
+      else break;
+    }
+    let program;
+    if (progFile != null) {
+      program = safeRead(ctx, progFile, 'awk'); if (program == null) return 2;
+    } else {
+      program = args[i++];
+      if (program == null) { ctx.err('usage: awk [-F fs] [-v var=value] \'prog\' [file ...]\n'); return 2; }
+    }
+    const files = args.slice(i);
+    const inputs = [];
+    if (!files.length) inputs.push({ name: '', text: ctx.stdin });
+    else {
+      for (const f of files) {
+        if (f === '-') { inputs.push({ name: '-', text: ctx.stdin }); continue; }
+        const text = safeRead(ctx, f, 'awk');
+        if (text == null) return 2;
+        inputs.push({ name: f, text });
       }
-    });
-    return 0;
+    }
+    try {
+      return runAwk({ program, inputs, vars, FS, out: (t) => ctx.out(t) });
+    } catch (e) {
+      if (e instanceof AwkError) { ctx.err(`awk: ${e.message}\n`); return 2; }
+      throw e;
+    }
   };
 
   C.tee = (args, ctx) => {
@@ -1087,6 +1161,42 @@ export function makeCommands(getCmds) {
   };
 
   return C;
+}
+
+
+// POSIX 正規表現(BRE/ERE) → JavaScript RegExp ソース変換。
+// BRE(既定): \| \( \) \{ \} \+ \? が特殊、素の | ( ) { } + ? はリテラル。ERE(-E): 逆。
+const POSIX_CLASS = { alpha: 'A-Za-z', digit: '0-9', alnum: 'A-Za-z0-9', upper: 'A-Z', lower: 'a-z', space: ' \\t\\n\\r\\f\\v', blank: ' \\t', punct: '!-\\/:-@\\[-`{-~', xdigit: '0-9A-Fa-f' };
+export function posixToJs(pat, ere) {
+  let out = ''; let i = 0; let inBr = false;
+  const SPECIAL = '|(){}+?';
+  while (i < pat.length) {
+    const c = pat[i];
+    if (inBr) {
+      if (c === ']') { inBr = false; out += ']'; i++; continue; }
+      if (c === '[' && pat[i + 1] === ':') {
+        const end = pat.indexOf(':]', i + 2);
+        if (end > 0) { out += POSIX_CLASS[pat.slice(i + 2, end)] ?? ''; i = end + 2; continue; }
+      }
+      out += c === '\\' ? '\\\\' : c; i++; continue;
+    }
+    if (c === '[') {
+      inBr = true; out += '['; i++;
+      if (pat[i] === '^') { out += '^'; i++; }
+      if (pat[i] === ']') { out += '\\]'; i++; }
+      continue;
+    }
+    if (c === '\\') {
+      const n = pat[i + 1]; i += 2;
+      if (n === undefined) { out += '\\\\'; break; }
+      if (SPECIAL.includes(n)) { out += ere ? '\\' + n : n; continue; }
+      if (n === '<' || n === '>') { out += '\\b'; continue; }
+      out += '\\' + n; continue;
+    }
+    if (!ere && SPECIAL.includes(c)) { out += '\\' + c; i++; continue; }
+    out += c; i++;
+  }
+  return out;
 }
 
 // ---------- jq (簡易版) ----------

@@ -887,6 +887,7 @@ class Shell {
       return typeof r === 'number' ? r : 0;
     } catch (e) {
       if (e instanceof FsError) { ctx.err(`${name}: ${e.path}: ${ERRMSG[e.code] || e.code}\n`); return 1; }
+      if (e && e.name === 'OptError') { ctx.err(`${name}: ${e.message}\nTry 'man ${name}' for more information.\n`); return 2; }
       ctx.err(`${name}: 内部エラー: ${e.message}\n`);
       return 1;
     }
@@ -1013,6 +1014,857 @@ const MANPAGES = {
 Object.assign(exports, { MANPAGES });
 
 };
+__mods["js/awk.js"] = function (module, exports, __require) {
+// ============================================================
+// 安全な AWK インタプリタ（eval / Function 不使用）。
+// 対応: BEGIN/END, パターン/範囲パターン, 条件式, 連想配列, for/while/if,
+//       print/printf, 正規表現, 主要な組み込み関数・変数。
+// 非対応(明示エラー): getline, system, パイプ/ファイルへの出力, ユーザー定義関数
+// ============================================================
+const { posixToJs } = __require("js/commands.js");
+
+class AwkError extends Error {}
+
+// ---------- 字句解析 ----------
+const KEYWORDS = new Set(['BEGIN', 'END', 'if', 'else', 'while', 'for', 'in', 'do', 'break', 'continue', 'next', 'exit', 'delete', 'print', 'printf', 'getline', 'function', 'return']);
+const BUILTIN_FUNCS = new Set(['length', 'substr', 'index', 'split', 'sub', 'gsub', 'match', 'sprintf', 'tolower', 'toupper', 'int', 'sqrt', 'exp', 'log', 'sin', 'cos', 'atan2', 'rand', 'srand', 'system']);
+const OPS = ['**=', '&&', '||', '==', '!=', '<=', '>=', '++', '--', '+=', '-=', '*=', '/=', '%=', '^=', '!~', '>>', '**'];
+
+function lex(src) {
+  const toks = [];
+  let i = 0;
+  const last = () => toks[toks.length - 1];
+  const divAllowed = () => {
+    const t = last();
+    if (!t) return false;
+    if (t.t === 'num' || t.t === 'str' || t.t === 'name' || t.t === 'regex' || t.t === 'func') return true;
+    if (t.t === 'op') return t.v === ')' || t.v === ']' || t.v === '++' || t.v === '--';
+    return false;
+  };
+  while (i < src.length) {
+    const c = src[i];
+    if (c === ' ' || c === '\t' || c === '\r') { i++; continue; }
+    if (c === '\\' && src[i + 1] === '\n') { i += 2; continue; }
+    if (c === '#') { while (i < src.length && src[i] !== '\n') i++; continue; }
+    if (c === '\n') {
+      // 継続可能な位置の改行は無視
+      const t = last();
+      if (!(t && t.t === 'op' && ['{', '&&', '||', ',', ';'].includes(t.v)) && !(t && t.t === 'kw' && ['else', 'do'].includes(t.v))) toks.push({ t: 'nl' });
+      i++; continue;
+    }
+    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(src[i + 1] || ''))) {
+      const m = src.slice(i).match(/^(0[xX][0-9a-fA-F]+|(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)/);
+      toks.push({ t: 'num', v: Number(m[0]) }); i += m[0].length; continue;
+    }
+    if (c === '"') {
+      let j = i + 1, out = '';
+      while (j < src.length && src[j] !== '"') {
+        if (src[j] === '\\' && j + 1 < src.length) {
+          const n = src[j + 1];
+          out += n === 'n' ? '\n' : n === 't' ? '\t' : n === 'r' ? '\r' : n === '\\' ? '\\' : n === '"' ? '"' : n === '/' ? '/' : '\\' + n;
+          j += 2;
+        } else { out += src[j]; j++; }
+      }
+      if (j >= src.length) throw new AwkError('syntax error: 文字列が閉じられていません');
+      toks.push({ t: 'str', v: out }); i = j + 1; continue;
+    }
+    if (c === '/' && !divAllowed()) {
+      let j = i + 1, out = '', inBr = false;
+      while (j < src.length && (src[j] !== '/' || inBr)) {
+        if (src[j] === '\n') throw new AwkError('syntax error: 正規表現が閉じられていません');
+        if (src[j] === '\\' && j + 1 < src.length) { out += src[j] + src[j + 1]; j += 2; continue; }
+        if (src[j] === '[') inBr = true; else if (src[j] === ']') inBr = false;
+        out += src[j]; j++;
+      }
+      if (j >= src.length) throw new AwkError('syntax error: 正規表現が閉じられていません');
+      toks.push({ t: 'regex', v: out }); i = j + 1; continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i; while (j < src.length && /[A-Za-z0-9_]/.test(src[j])) j++;
+      const w = src.slice(i, j); i = j;
+      if (KEYWORDS.has(w)) toks.push({ t: 'kw', v: w });
+      else if (BUILTIN_FUNCS.has(w)) toks.push({ t: 'func', v: w });
+      else toks.push({ t: 'name', v: w });
+      continue;
+    }
+    let matched = null;
+    for (const op of OPS) if (src.startsWith(op, i)) { matched = op; break; }
+    if (!matched && '+-*/%^<>=!~?:,;(){}[]$'.includes(c)) matched = c;
+    if (!matched) throw new AwkError(`syntax error: 未対応の文字 '${c}'（パイプ | や & は未対応です）`);
+    const len = matched.length;
+    if (matched === '**') matched = '^';
+    if (matched === '**=') matched = '^=';
+    toks.push({ t: 'op', v: matched }); i += len;
+  }
+  return toks;
+}
+
+// ---------- 構文解析 ----------
+function parseProgram(src) {
+  const toks = lex(src);
+  let pos = 0;
+  const peek = (o = 0) => toks[pos + o];
+  const isOp = (v, o = 0) => { const t = toks[pos + o]; return t && t.t === 'op' && t.v === v; };
+  const isKw = (v, o = 0) => { const t = toks[pos + o]; return t && t.t === 'kw' && t.v === v; };
+  const fail = (m) => { throw new AwkError(`syntax error: ${m}`); };
+  const expectOp = (v) => { if (!isOp(v)) fail(`'${v}' が必要です`); pos++; };
+  const skipTerms = () => { while (peek() && (peek().t === 'nl' || isOp(';'))) pos++; };
+  const skipNl = () => { while (peek() && peek().t === 'nl') pos++; };
+
+  // ----- 式 -----
+  let noGt = 0; // print 引数内では > を比較演算子にしない
+  let noIn = 0; // for(... in ...) 判定用
+  function parseExpr() { return parseTernary(); }
+  function parseTernary() {
+    const cond = parseOr();
+    if (isOp('?')) {
+      pos++; skipNl(); const a = parseTernary(); skipNl(); expectOp(':'); skipNl(); const b = parseTernary();
+      return { k: 'cond', c: cond, a, b };
+    }
+    if (peek() && peek().t === 'op' && ['=', '+=', '-=', '*=', '/=', '%=', '^='].includes(peek().v)) {
+      if (!['var', 'field', 'index'].includes(cond.k)) fail('代入の左辺が不正です');
+      const op = peek().v; pos++; skipNl();
+      const rhs = parseTernary();
+      return { k: 'assign', op, l: cond, r: rhs };
+    }
+    return cond;
+  }
+  function parseOr() { let l = parseAnd(); while (isOp('||')) { pos++; skipNl(); l = { k: 'or', l, r: parseAnd() }; } return l; }
+  function parseAnd() { let l = parseIn(); while (isOp('&&')) { pos++; skipNl(); l = { k: 'and', l, r: parseIn() }; } return l; }
+  function parseIn() {
+    let l = parseMatch();
+    while (!noIn && isKw('in')) { pos++; const t = peek(); if (!t || t.t !== 'name') fail('in の右辺は配列名です'); pos++; l = { k: 'in', key: l, arr: t.v }; }
+    return l;
+  }
+  function parseMatch() {
+    let l = parseRel();
+    while (isOp('~') || isOp('!~')) { const neg = isOp('!~'); pos++; l = { k: 'match', neg, l, r: parseRel() }; }
+    return l;
+  }
+  function parseRel() {
+    const l = parseConcat();
+    const t = peek();
+    if (t && t.t === 'op' && ['<', '<=', '==', '!=', '>=', '>'].includes(t.v) && !(t.v === '>' && noGt)) {
+      pos++; const r = parseConcat(); return { k: 'rel', op: t.v, l, r };
+    }
+    return l;
+  }
+  function startsOperand() {
+    const t = peek();
+    if (!t) return false;
+    if (t.t === 'num' || t.t === 'str' || t.t === 'name' || t.t === 'func' || t.t === 'regex') return true;
+    if (t.t === 'op') return ['$', '(', '!', '-', '+', '++', '--'].includes(t.v) && !['-', '+'].includes(t.v);
+    return false;
+  }
+  function parseConcat() {
+    let l = parseAdd();
+    while (startsOperand() && !isKw('in')) { const r = parseAdd(); l = { k: 'concat', l, r }; }
+    return l;
+  }
+  function parseAdd() {
+    let l = parseMul();
+    while (isOp('+') || isOp('-')) { const op = peek().v; pos++; l = { k: 'bin', op, l, r: parseMul() }; }
+    return l;
+  }
+  function parseMul() {
+    let l = parseUnary();
+    while (isOp('*') || isOp('/') || isOp('%')) { const op = peek().v; pos++; l = { k: 'bin', op, l, r: parseUnary() }; }
+    return l;
+  }
+  function parseUnary() {
+    if (isOp('!')) { pos++; return { k: 'not', e: parseUnary() }; }
+    if (isOp('-')) { pos++; return { k: 'neg', e: parseUnary() }; }
+    if (isOp('+')) { pos++; return { k: 'pos', e: parseUnary() }; }
+    return parsePow();
+  }
+  function parsePow() {
+    const base = parsePostfix();
+    if (isOp('^')) { pos++; const exp = parseUnaryForPow(); return { k: 'bin', op: '^', l: base, r: exp }; }
+    return base;
+  }
+  function parseUnaryForPow() { if (isOp('-')) { pos++; return { k: 'neg', e: parseUnaryForPow() }; } const b = parsePostfix(); if (isOp('^')) { pos++; return { k: 'bin', op: '^', l: b, r: parseUnaryForPow() }; } return b; }
+  function parsePostfix() {
+    if (isOp('++') || isOp('--')) { const op = peek().v; pos++; const target = parsePrimary(); if (!['var', 'field', 'index'].includes(target.k)) fail('++/-- の対象が不正です'); return { k: 'incdec', op, pre: true, t: target }; }
+    const e = parsePrimary();
+    if ((isOp('++') || isOp('--')) && ['var', 'field', 'index'].includes(e.k)) { const op = peek().v; pos++; return { k: 'incdec', op, pre: false, t: e }; }
+    return e;
+  }
+  function parsePrimary() {
+    const t = peek();
+    if (!t) fail('式が途中で終わっています');
+    if (t.t === 'num') { pos++; return { k: 'num', v: t.v }; }
+    if (t.t === 'str') { pos++; return { k: 'str', v: t.v }; }
+    if (t.t === 'regex') { pos++; return { k: 'regex', v: t.v }; }
+    if (t.t === 'op' && t.v === '$') { pos++; const e = parseFieldIndex(); return { k: 'field', e }; }
+    if (t.t === 'op' && t.v === '(') {
+      pos++; const saveGt = noGt, saveIn = noIn; noGt = 0; noIn = 0;
+      const e = parseExpr(); noGt = saveGt; noIn = saveIn;
+      if (isOp(',')) { // (i,j) in arr 用の多次元は未対応
+        fail('カンマ区切りの添字は未対応です');
+      }
+      expectOp(')'); return { k: 'group', e };
+    }
+    if (t.t === 'func') {
+      pos++;
+      if (t.v === 'system') throw new AwkError('system() はこのシミュレーターでは未対応です（安全のため）');
+      let args = [];
+      if (isOp('(')) {
+        pos++; const saveGt = noGt, saveIn = noIn; noGt = 0; noIn = 0;
+        if (!isOp(')')) { args.push(parseExpr()); while (isOp(',')) { pos++; skipNl(); args.push(parseExpr()); } }
+        noGt = saveGt; noIn = saveIn; expectOp(')');
+      } else if (t.v !== 'length') fail(`${t.v} には括弧が必要です`);
+      return { k: 'call', name: t.v, args };
+    }
+    if (t.t === 'kw' && t.v === 'getline') throw new AwkError('getline はこのシミュレーターでは未対応です');
+    if (t.t === 'name') {
+      pos++;
+      if (isOp('[')) { pos++; const idx = parseExpr(); expectOp(']'); return { k: 'index', name: t.v, e: idx }; }
+      return { k: 'var', name: t.v };
+    }
+    fail(`予期しないトークン '${t.v ?? t.t}'`);
+  }
+  function parseFieldIndex() {
+    // $NF, $i, $(expr), $i++ は ($i)++ ではなく $(i++) になるが簡略化: 前置増減 or 一次式のみ
+    if (isOp('++') || isOp('--')) return parsePostfix();
+    if (isOp('-')) { pos++; return { k: 'neg', e: parseFieldIndex() }; }
+    return parsePrimary();
+  }
+
+  // ----- 文 -----
+  function parseSimpleOrBlock() {
+    skipNl();
+    return parseStmt();
+  }
+  function endStmt() {
+    // 文の終端: ; 改行 } または EOF
+    if (isOp(';') || (peek() && peek().t === 'nl')) { pos++; return; }
+    if (!peek() || isOp('}')) return;
+    fail(`文の終端が必要ですが '${peek().v ?? peek().t}' がありました`);
+  }
+  function parseBlock() {
+    expectOp('{');
+    const body = [];
+    skipTerms();
+    while (!isOp('}')) {
+      if (!peek()) fail("'}' が必要です");
+      body.push(parseStmt());
+      skipTerms();
+    }
+    pos++;
+    return { k: 'block', body };
+  }
+  function parsePrintArgs() {
+    const saveGt = noGt; noGt = 1;
+    const args = [];
+    // print (a, b) 形式
+    if (isOp('(')) {
+      const save = pos;
+      try {
+        pos++; noGt = 0;
+        const list = [parseExpr()];
+        while (isOp(',')) { pos++; list.push(parseExpr()); }
+        expectOp(')');
+        if (!peek() || isOp(';') || isOp('}') || peek().t === 'nl' || isOp('>')) { noGt = saveGt; return list; }
+      } catch (e) { /* 通常解析へ */ }
+      pos = save; noGt = 1;
+    }
+    if (peek() && !isOp(';') && !isOp('}') && peek().t !== 'nl' && !isOp('>')) {
+      args.push(parseExpr());
+      while (isOp(',')) { pos++; skipNl(); args.push(parseExpr()); }
+    }
+    noGt = saveGt;
+    return args;
+  }
+  function parseStmt() {
+    const t = peek();
+    if (!t) fail('文が途中で終わっています');
+    if (isOp('{')) return parseBlock();
+    if (t.t === 'kw') {
+      if (t.v === 'if') {
+        pos++; expectOp('('); const c = parseExpr(); expectOp(')');
+        const then = parseSimpleOrBlock();
+        // else の探索（; や改行を挟んでもよい）
+        const save = pos; skipTerms();
+        let els = null;
+        if (isKw('else')) { pos++; els = parseSimpleOrBlock(); } else pos = save;
+        return { k: 'if', c, then, els };
+      }
+      if (t.v === 'while') { pos++; expectOp('('); const c = parseExpr(); expectOp(')'); return { k: 'while', c, body: parseSimpleOrBlock() }; }
+      if (t.v === 'do') { pos++; const body = parseSimpleOrBlock(); skipTerms(); if (!isKw('while')) fail("do に対応する while が必要です"); pos++; expectOp('('); const c = parseExpr(); expectOp(')'); return { k: 'do', c, body }; }
+      if (t.v === 'for') {
+        pos++; expectOp('(');
+        if (peek() && peek().t === 'name' && isKw('in', 1) && peek(2) && peek(2).t === 'name' && isOp(')', 3)) {
+          const v = peek().v, arr = peek(2).v; pos += 4;
+          return { k: 'forin', v, arr, body: parseSimpleOrBlock() };
+        }
+        const init = isOp(';') ? null : parseStmtExprOnly(); expectOp(';');
+        const c = isOp(';') ? null : parseExpr(); expectOp(';');
+        const inc = isOp(')') ? null : parseStmtExprOnly(); expectOp(')');
+        return { k: 'for', init, c, inc, body: parseSimpleOrBlock() };
+      }
+      if (t.v === 'break') { pos++; endStmt(); return { k: 'break' }; }
+      if (t.v === 'continue') { pos++; endStmt(); return { k: 'continue' }; }
+      if (t.v === 'next') { pos++; endStmt(); return { k: 'next' }; }
+      if (t.v === 'exit') { pos++; let e = null; if (peek() && !isOp(';') && !isOp('}') && peek().t !== 'nl') e = parseExpr(); endStmt(); return { k: 'exit', e }; }
+      if (t.v === 'delete') {
+        pos++; const n = peek(); if (!n || n.t !== 'name') fail('delete の対象は配列です'); pos++;
+        let e = null; if (isOp('[')) { pos++; e = parseExpr(); expectOp(']'); }
+        endStmt(); return { k: 'delete', name: n.v, e };
+      }
+      if (t.v === 'print' || t.v === 'printf') {
+        pos++; const args = parsePrintArgs();
+        if (isOp('>') || isOp('>>')) throw new AwkError('print のファイル出力リダイレクトは未対応です（シェルの > を使ってください）');
+        endStmt(); return { k: t.v, args };
+      }
+      if (t.v === 'function' || t.v === 'return') throw new AwkError('ユーザー定義関数は未対応です');
+    }
+    const e = parseExpr(); endStmt(); return { k: 'expr', e };
+  }
+  function parseStmtExprOnly() { return { k: 'expr', e: parseExpr() }; }
+
+  // ----- プログラム全体 -----
+  const items = [];
+  skipTerms();
+  while (peek()) {
+    const it = { begin: false, end: false, pat: null, pat2: null, action: null };
+    if (isKw('BEGIN')) { pos++; it.begin = true; skipNl(); it.action = parseBlock(); }
+    else if (isKw('END')) { pos++; it.end = true; skipNl(); it.action = parseBlock(); }
+    else {
+      if (!isOp('{')) {
+        it.pat = parseExpr();
+        if (isOp(',')) { pos++; skipNl(); it.pat2 = parseExpr(); }
+      }
+      if (isOp('{')) it.action = parseBlock();
+    }
+    items.push(it);
+    skipTerms();
+  }
+  return items;
+}
+
+
+// ---------- 値の変換 ----------
+const NUM_RE = /^\s*[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?\s*$/;
+const looksNumeric = (v) => typeof v === 'number' || (typeof v === 'string' && NUM_RE.test(v));
+function toNum(v) {
+  if (typeof v === 'number') return v;
+  if (v === undefined || v === '') return 0;
+  const m = String(v).match(/^\s*[-+]?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)/);
+  return m ? Number(m[0]) : 0;
+}
+function numToStr(n) {
+  if (Number.isInteger(n) && Math.abs(n) < 1e16) return String(n);
+  if (!isFinite(n)) return Number.isNaN(n) ? 'nan' : (n > 0 ? 'inf' : '-inf');
+  return String(parseFloat(n.toPrecision(6)));
+}
+const toStr = (v) => (typeof v === 'number' ? numToStr(v) : v === undefined ? '' : String(v));
+function toBool(v) {
+  if (typeof v === 'number') return v !== 0;
+  if (v === undefined) return false;
+  return NUM_RE.test(v) ? Number(v) !== 0 : v !== '';
+}
+
+// ---------- printf ----------
+function fmtOne(flags, width, prec, conv, arg) {
+  let s;
+  const n0 = toNum(arg);
+  const signOf = (n) => (n < 0 ? '-' : flags.includes('+') ? '+' : flags.includes(' ') ? ' ' : '');
+  switch (conv) {
+    case 'd': case 'i': { const n = Number.isFinite(n0) ? Math.trunc(n0) : 0; let b = String(Math.abs(n)); if (prec != null) b = b.padStart(prec, '0'); s = signOf(n) + b; break; }
+    case 'u': { const n = Math.trunc(n0); s = String(n < 0 ? n >>> 0 : n); break; }
+    case 'o': s = (flags.includes('#') ? '0' : '') + Math.trunc(n0).toString(8); break;
+    case 'x': s = (flags.includes('#') ? '0x' : '') + Math.trunc(n0).toString(16); break;
+    case 'X': s = (flags.includes('#') ? '0X' : '') + Math.trunc(n0).toString(16).toUpperCase(); break;
+    case 'e': case 'E': { const e = Math.abs(n0).toExponential(prec ?? 6).replace(/e([+-])(\d)$/, 'e$10$2'); s = signOf(n0) + (conv === 'E' ? e.toUpperCase() : e); break; }
+    case 'f': case 'F': s = signOf(n0) + Math.abs(n0).toFixed(prec ?? 6); break;
+    case 'g': case 'G': {
+      let p = prec ?? 6; if (p === 0) p = 1;
+      const a = Math.abs(n0);
+      if (a === 0) s = '0';
+      else {
+        const exp = Math.floor(Math.log10(a));
+        if (exp < -4 || exp >= p) {
+          s = a.toExponential(p - 1);
+          if (!flags.includes('#')) s = s.replace(/\.?0+e/, 'e');
+          s = s.replace(/e([+-])(\d)$/, 'e$10$2');
+        } else {
+          s = a.toFixed(Math.max(0, p - 1 - exp));
+          if (!flags.includes('#') && s.includes('.')) s = s.replace(/\.?0+$/, '');
+        }
+      }
+      s = signOf(n0) + (conv === 'G' ? s.toUpperCase() : s); break;
+    }
+    case 'c': s = typeof arg === 'number' ? String.fromCharCode(arg) : (toStr(arg)[0] ?? ''); break;
+    case 's': s = toStr(arg); if (prec != null) s = s.slice(0, prec); break;
+    default: s = '';
+  }
+  if (width != null && s.length < width) {
+    if (flags.includes('-')) s = s.padEnd(width);
+    else if (flags.includes('0') && 'diouxXeEfFgG'.includes(conv) && prec == null) { const sign = /^[+\- ]/.test(s) ? s[0] : ''; s = sign + s.slice(sign.length).padStart(width - sign.length, '0'); }
+    else s = s.padStart(width);
+  }
+  return s;
+}
+function sprintf(fmt, args) {
+  let ai = 0;
+  return fmt.replace(/%([-+ #0]*)(\*|\d+)?(?:\.(\*|\d+))?([diouxXeEfFgGcs%])/g, (m, flags, w, pr, conv) => {
+    if (conv === '%') return '%';
+    let width = w === '*' ? toNum(args[ai++]) : (w != null ? Number(w) : null);
+    let prec = pr === '*' ? toNum(args[ai++]) : (pr != null ? Number(pr) : null);
+    if (width != null && width < 0) { flags += '-'; width = -width; }
+    return fmtOne(flags, width, prec, conv, args[ai++]);
+  });
+}
+
+// ---------- 実行 ----------
+class NextSignal {}
+class BreakSignal {}
+class ContinueSignal {}
+class ExitSignal { constructor(code) { this.code = code; } }
+const STRING_FUNCS = new Set(['substr', 'tolower', 'toupper', 'sprintf']);
+const MAX_STEPS = 3_000_000;
+
+class Interp {
+  constructor(items, { out, FS, vars }) {
+    this.items = items; this.out = out; this.steps = 0;
+    this.vars = Object.create(null); this.arrays = Object.create(null);
+    Object.assign(this.vars, { FS: ' ', OFS: ' ', ORS: '\n', NR: 0, FNR: 0, NF: 0, FILENAME: '', SUBSEP: '\x1c', RSTART: 0, RLENGTH: -1 });
+    if (FS != null) this.vars.FS = FS;
+    Object.assign(this.vars, vars || {});
+    this.record = ''; this.fields = []; this.regexCache = new Map(); this.range = new Map(); this.seed = 1;
+  }
+  tick() { if (++this.steps > MAX_STEPS) throw new AwkError('実行ステップ数の上限を超えました（無限ループの可能性）'); }
+  regex(src, flags = '') {
+    const key = flags + '/' + src;
+    let re = this.regexCache.get(key);
+    if (!re) { try { re = new RegExp(posixToJs(src, true), flags); } catch (e) { throw new AwkError(`無効な正規表現: ${src}`); } this.regexCache.set(key, re); }
+    re.lastIndex = 0; return re;
+  }
+  arr(name) { return this.arrays[name] || (this.arrays[name] = new Map()); }
+
+  // --- レコードとフィールド ---
+  splitStr(str, fs) {
+    if (fs === ' ') { const t = str.replace(/^[ \t\n]+|[ \t\n]+$/g, ''); return t === '' ? [] : t.split(/[ \t\n]+/); }
+    if (str === '') return [];
+    if (fs.length === 1) return str.split(fs);
+    return str.split(this.regex(fs));
+  }
+  setRecord(str) { this.record = str; this.fields = this.splitStr(str, toStr(this.vars.FS)); this.vars.NF = this.fields.length; }
+  getField(i) {
+    i = Math.trunc(toNum(i));
+    if (i < 0) throw new AwkError(`負のフィールド番号 $${i} は使えません`);
+    return i === 0 ? this.record : (this.fields[i - 1] ?? '');
+  }
+  setField(i, v) {
+    i = Math.trunc(toNum(i));
+    if (i < 0) throw new AwkError(`負のフィールド番号 $${i} は使えません`);
+    if (i === 0) { this.setRecord(toStr(v)); return; }
+    while (this.fields.length < i) this.fields.push('');
+    this.fields[i - 1] = toStr(v); this.vars.NF = this.fields.length;
+    this.record = this.fields.join(toStr(this.vars.OFS));
+  }
+  setVar(name, v) {
+    if (name === 'NF') {
+      const n = Math.max(0, Math.trunc(toNum(v)));
+      this.fields.length = Math.min(this.fields.length, n); while (this.fields.length < n) this.fields.push('');
+      this.vars.NF = n; this.record = this.fields.join(toStr(this.vars.OFS)); return;
+    }
+    this.vars[name] = v;
+  }
+
+  // --- 式の評価 ---
+  isStrNode(n) { while (n.k === 'group') n = n.e; return n.k === 'str' || n.k === 'concat' || (n.k === 'call' && STRING_FUNCS.has(n.name)); }
+  compare(op, a, b, forceStr) {
+    if (a === undefined) a = (typeof b === 'number' || looksNumeric(b)) ? 0 : '';
+    if (b === undefined) b = (typeof a === 'number' || looksNumeric(a)) ? 0 : '';
+    let c;
+    if (!forceStr && looksNumeric(a) && looksNumeric(b)) { const x = toNum(a), y = toNum(b); c = x < y ? -1 : x > y ? 1 : 0; }
+    else { const x = toStr(a), y = toStr(b); c = x < y ? -1 : x > y ? 1 : 0; }
+    switch (op) { case '<': return c < 0; case '<=': return c <= 0; case '==': return c === 0; case '!=': return c !== 0; case '>=': return c >= 0; default: return c > 0; }
+  }
+  lval(node) {
+    if (node.k === 'var') return { get: () => this.vars[node.name], set: (v) => this.setVar(node.name, v) };
+    if (node.k === 'field') { const i = this.eval(node.e); return { get: () => this.getField(i), set: (v) => this.setField(i, v) }; }
+    const key = toStr(this.eval(node.e)); const a = this.arr(node.name);
+    return { get: () => a.get(key), set: (v) => a.set(key, v) };
+  }
+  eval(n) {
+    this.tick();
+    switch (n.k) {
+      case 'num': return n.v;
+      case 'str': return n.v;
+      case 'regex': return this.regex(n.v).test(this.record) ? 1 : 0;
+      case 'group': return this.eval(n.e);
+      case 'var': return this.vars[n.name];
+      case 'field': return this.getField(this.eval(n.e));
+      case 'index': { const a = this.arr(n.name), key = toStr(this.eval(n.e)); if (!a.has(key)) a.set(key, undefined); return a.get(key); }
+      case 'assign': {
+        const lv = this.lval(n.l);
+        let v;
+        if (n.op === '=') v = this.eval(n.r);
+        else { const x = toNum(lv.get()), y = toNum(this.eval(n.r)); v = n.op === '+=' ? x + y : n.op === '-=' ? x - y : n.op === '*=' ? x * y : n.op === '/=' ? this.div(x, y) : n.op === '%=' ? this.mod(x, y) : x ** y; }
+        lv.set(v); return v;
+      }
+      case 'cond': return toBool(this.eval(n.c)) ? this.eval(n.a) : this.eval(n.b);
+      case 'or': return toBool(this.eval(n.l)) || toBool(this.eval(n.r)) ? 1 : 0;
+      case 'and': return toBool(this.eval(n.l)) && toBool(this.eval(n.r)) ? 1 : 0;
+      case 'not': return toBool(this.eval(n.e)) ? 0 : 1;
+      case 'neg': return -toNum(this.eval(n.e));
+      case 'pos': return toNum(this.eval(n.e));
+      case 'bin': {
+        const x = toNum(this.eval(n.l)), y = toNum(this.eval(n.r));
+        switch (n.op) { case '+': return x + y; case '-': return x - y; case '*': return x * y; case '/': return this.div(x, y); case '%': return this.mod(x, y); default: return x ** y; }
+      }
+      case 'rel': return this.compare(n.op, this.eval(n.l), this.eval(n.r), this.isStrNode(n.l) || this.isStrNode(n.r)) ? 1 : 0;
+      case 'match': {
+        const s = toStr(this.eval(n.l));
+        const re = n.r.k === 'regex' ? this.regex(n.r.v) : this.regex(toStr(this.eval(n.r)));
+        return re.test(s) !== n.neg ? 1 : 0;
+      }
+      case 'concat': return toStr(this.eval(n.l)) + toStr(this.eval(n.r));
+      case 'in': return this.arr(n.arr).has(toStr(this.eval(n.key))) ? 1 : 0;
+      case 'incdec': {
+        const lv = this.lval(n.t); const old = toNum(lv.get()); const nv = n.op === '++' ? old + 1 : old - 1;
+        lv.set(nv); return n.pre ? nv : old;
+      }
+      case 'call': return this.call(n);
+      default: throw new AwkError(`内部エラー: 未知の式 ${n.k}`);
+    }
+  }
+  div(x, y) { if (y === 0) throw new AwkError('division by zero'); return x / y; }
+  mod(x, y) { if (y === 0) throw new AwkError('division by zero in %'); return x % y; }
+
+  call(n) {
+    const a = n.args;
+    const sarg = (i) => toStr(this.eval(a[i]));
+    const need = (min, max = min) => { if (a.length < min || a.length > max) throw new AwkError(`${n.name}: 引数の数が不正です`); };
+    switch (n.name) {
+      case 'length': {
+        if (a.length === 0) return this.record.length;
+        if (a[0].k === 'var' && this.arrays[a[0].name]) return this.arrays[a[0].name].size;
+        return sarg(0).length;
+      }
+      case 'substr': {
+        need(2, 3); const s = sarg(0); const m = Math.round(toNum(this.eval(a[1])));
+        const len = a.length === 3 ? Math.round(toNum(this.eval(a[2]))) : Infinity;
+        const start = Math.max(1, m); const end = Math.min(s.length + 1, m + len);
+        return end <= start ? '' : s.slice(start - 1, end - 1);
+      }
+      case 'index': need(2); return sarg(0).indexOf(sarg(1)) + 1;
+      case 'tolower': need(1); return sarg(0).toLowerCase();
+      case 'toupper': need(1); return sarg(0).toUpperCase();
+      case 'sprintf': { if (!a.length) throw new AwkError('sprintf: フォーマットがありません'); return sprintf(sarg(0), a.slice(1).map(x => this.eval(x))); }
+      case 'int': need(1); return Math.trunc(toNum(this.eval(a[0])));
+      case 'sqrt': need(1); return Math.sqrt(toNum(this.eval(a[0])));
+      case 'exp': need(1); return Math.exp(toNum(this.eval(a[0])));
+      case 'log': need(1); return Math.log(toNum(this.eval(a[0])));
+      case 'sin': need(1); return Math.sin(toNum(this.eval(a[0])));
+      case 'cos': need(1); return Math.cos(toNum(this.eval(a[0])));
+      case 'atan2': need(2); return Math.atan2(toNum(this.eval(a[0])), toNum(this.eval(a[1])));
+      case 'rand': this.seed = (this.seed * 1103515245 + 12345) & 0x7fffffff; return this.seed / 0x80000000;
+      case 'srand': { const old = this.seed; this.seed = a.length ? Math.trunc(toNum(this.eval(a[0]))) : 0; return old; }
+      case 'split': {
+        need(2, 3);
+        if (a[1].k !== 'var') throw new AwkError('split の第2引数は配列名です');
+        const s = sarg(0); const arr = this.arr(a[1].name); arr.clear();
+        let parts;
+        if (a.length === 3 && a[2].k === 'regex') parts = s === '' ? [] : s.split(this.regex(a[2].v));
+        else parts = this.splitStr(s, a.length === 3 ? sarg(2) : toStr(this.vars.FS));
+        parts.forEach((p, i) => arr.set(String(i + 1), p));
+        return parts.length;
+      }
+      case 'match': {
+        need(2); const s = sarg(0);
+        const re = a[1].k === 'regex' ? this.regex(a[1].v) : this.regex(sarg(1));
+        const m = re.exec(s);
+        this.vars.RSTART = m ? m.index + 1 : 0; this.vars.RLENGTH = m ? m[0].length : -1;
+        return this.vars.RSTART;
+      }
+      case 'sub': case 'gsub': {
+        need(2, 3);
+        const src = a[0].k === 'regex' ? a[0].v : sarg(0);
+        const repl = sarg(1);
+        const target = a.length === 3 ? a[2] : { k: 'field', e: { k: 'num', v: 0 } };
+        if (!['var', 'field', 'index'].includes(target.k)) throw new AwkError(`${n.name}: 第3引数が代入可能ではありません`);
+        const lv = this.lval(target);
+        const str = toStr(lv.get());
+        const re = this.regex(src, n.name === 'gsub' ? 'g' : '');
+        let count = 0;
+        const out = str.replace(re, (m) => { count++; return repl.replace(/\\&|&/g, (x) => (x === '&' ? m : '&')); });
+        if (count) lv.set(out);
+        return count;
+      }
+      default: throw new AwkError(`未対応の関数: ${n.name}`);
+    }
+  }
+
+  // --- 文の実行 ---
+  emit(text) { this.out(text); }
+  exec(st) {
+    this.tick();
+    switch (st.k) {
+      case 'block': for (const s of st.body) this.exec(s); return;
+      case 'expr': this.eval(st.e); return;
+      case 'print': {
+        const vals = st.args.length ? st.args.map(e => toStr(this.eval(e))) : [this.record];
+        this.emit(vals.join(toStr(this.vars.OFS)) + toStr(this.vars.ORS)); return;
+      }
+      case 'printf': {
+        if (!st.args.length) throw new AwkError('printf: フォーマットがありません');
+        const vals = st.args.map(e => this.eval(e));
+        this.emit(sprintf(toStr(vals[0]), vals.slice(1))); return;
+      }
+      case 'if': if (toBool(this.eval(st.c))) this.exec(st.then); else if (st.els) this.exec(st.els); return;
+      case 'while': this.loop(() => toBool(this.eval(st.c)), st.body); return;
+      case 'do': { let first = true; this.loop(() => { if (first) { first = false; return true; } return toBool(this.eval(st.c)); }, st.body); return; }
+      case 'for': {
+        if (st.init) this.exec(st.init);
+        this.loop(() => (st.c ? toBool(this.eval(st.c)) : true), st.body, st.inc ? () => this.exec(st.inc) : null); return;
+      }
+      case 'forin': {
+        for (const key of [...this.arr(st.arr).keys()]) {
+          this.setVar(st.v, key);
+          try { this.exec(st.body); } catch (e) { if (e instanceof BreakSignal) break; if (e instanceof ContinueSignal) continue; throw e; }
+        }
+        return;
+      }
+      case 'delete': if (st.e) this.arr(st.name).delete(toStr(this.eval(st.e))); else this.arr(st.name).clear(); return;
+      case 'break': throw new BreakSignal();
+      case 'continue': throw new ContinueSignal();
+      case 'next': throw new NextSignal();
+      case 'exit': throw new ExitSignal(st.e ? Math.trunc(toNum(this.eval(st.e))) : 0);
+      default: throw new AwkError(`内部エラー: 未知の文 ${st.k}`);
+    }
+  }
+  loop(cond, body, step) {
+    while (cond()) {
+      this.tick();
+      try { this.exec(body); } catch (e) { if (e instanceof BreakSignal) break; if (!(e instanceof ContinueSignal)) throw e; }
+      if (step) step();
+    }
+  }
+
+  runMain(mains) {
+    for (const it of mains) {
+      if (it.pat2) {
+        let active = this.range.get(it);
+        if (!active) { if (!toBool(this.eval(it.pat))) continue; active = true; }
+        if (toBool(this.eval(it.pat2))) active = false;
+        this.range.set(it, active);
+      } else if (it.pat && !toBool(this.eval(it.pat))) continue;
+      if (it.action) this.exec(it.action); else this.emit(this.record + toStr(this.vars.ORS));
+    }
+  }
+  run(inputs) {
+    const begins = this.items.filter(i => i.begin), ends = this.items.filter(i => i.end);
+    const mains = this.items.filter(i => !i.begin && !i.end);
+    let code = 0, exited = false;
+    try {
+      for (const b of begins) this.exec(b.action);
+      if (mains.length || ends.length) {
+        for (const inp of inputs) {
+          this.vars.FILENAME = inp.name; this.vars.FNR = 0;
+          const lines = inp.text.split('\n'); if (lines[lines.length - 1] === '') lines.pop();
+          for (const line of lines) {
+            this.vars.NR = toNum(this.vars.NR) + 1; this.vars.FNR = toNum(this.vars.FNR) + 1;
+            this.setRecord(line);
+            try { this.runMain(mains); } catch (e) { if (e instanceof NextSignal) continue; throw e; }
+          }
+        }
+      }
+    } catch (e) { if (e instanceof ExitSignal) { code = e.code; exited = true; } else throw e; }
+    try { for (const en of ends) this.exec(en.action); }
+    catch (e) { if (e instanceof ExitSignal) code = e.code; else throw e; }
+    return code;
+  }
+}
+
+// 実行エントリ。inputs: [{ name, text }]。out(text) に出力を渡す。戻り値は終了コード。
+function runAwk({ program, inputs, vars, FS, out }) {
+  const items = parseProgram(program);
+  const it = new Interp(items, { out, FS, vars });
+  return it.run(inputs);
+}
+
+
+
+Object.assign(exports, { AwkError, runAwk, parseProgram });
+
+};
+__mods["js/sed.js"] = function (module, exports, __require) {
+// ============================================================
+// 安全な sed エンジン（eval 不使用）。
+// 対応: s///[g p i N], d, p, q, y///, a/i/c テキスト, =、
+//       アドレス N / $ / /re/ / N,M / N,$ / /re/,/re/ / N,+K / 否定 !
+//       複数コマンド(; または改行、-e 複数)、BRE/ERE、後方参照 \1..\9 と &
+// 非対応(明示エラー): { } ブロック, ホールドスペース(h/g/x), n/N/D/P, w/r ファイル操作
+// ============================================================
+const { posixToJs } = __require("js/commands.js");
+
+class SedError extends Error {}
+
+function readDelimited(src, i, delim, what) {
+  // delim までを読む。\delim は delim 1文字に、それ以外の \x は保持
+  let out = '';
+  while (i < src.length && src[i] !== delim) {
+    if (src[i] === '\\' && i + 1 < src.length) {
+      if (src[i + 1] === delim) { out += delim; i += 2; continue; }
+      out += src[i] + src[i + 1]; i += 2; continue;
+    }
+    out += src[i]; i++;
+  }
+  if (i >= src.length) throw new SedError(`${what} が閉じられていません`);
+  return { text: out, next: i + 1 };
+}
+
+function parseSed(script, ere) {
+  const cmds = [];
+  let i = 0;
+  const ws = () => { while (i < script.length && (script[i] === ' ' || script[i] === '\t')) i++; };
+  const readAddr = () => {
+    const c = script[i];
+    if (c >= '0' && c <= '9') { let j = i; while (/[0-9]/.test(script[j] || '')) j++; const n = Number(script.slice(i, j)); i = j; return { t: 'num', n }; }
+    if (c === '$') { i++; return { t: 'last' }; }
+    if (c === '/') {
+      const r = readDelimited(script, i + 1, '/', 'アドレスの正規表現'); i = r.next;
+      let flag = ''; if (script[i] === 'I') { flag = 'i'; i++; }
+      return { t: 're', re: new RegExp(posixToJs(r.text, ere), flag) };
+    }
+    return null;
+  };
+  while (i < script.length) {
+    while (i < script.length && /[\s;]/.test(script[i])) i++;
+    if (i >= script.length) break;
+    const cmd = { a1: null, a2: null, neg: false, c: '' };
+    cmd.a1 = readAddr();
+    if (cmd.a1 && script[i] === ',') {
+      i++;
+      if (script[i] === '+') { i++; let j = i; while (/[0-9]/.test(script[j] || '')) j++; cmd.a2 = { t: 'rel', n: Number(script.slice(i, j)) }; i = j; }
+      else { cmd.a2 = readAddr(); if (!cmd.a2) throw new SedError('アドレス範囲の終端が不正です'); }
+    }
+    ws();
+    while (script[i] === '!') { cmd.neg = true; i++; ws(); }
+    const c = script[i++];
+    if (c === undefined) throw new SedError('コマンドが不足しています');
+    cmd.c = c;
+    if (c === 's') {
+      const delim = script[i++];
+      if (!delim || delim === '\n' || delim === '\\') throw new SedError("s コマンドの区切り文字が不正です");
+      const p = readDelimited(script, i, delim, 's の検索パターン'); i = p.next;
+      const r = readDelimited(script, i, delim, 's の置換文字列'); i = r.next;
+      let flags = '';
+      while (i < script.length && !/[;\n}]/.test(script[i])) { if (script[i] !== ' ') flags += script[i]; i++; }
+      cmd.g = flags.includes('g'); cmd.p = flags.includes('p'); const nm = flags.match(/\d+/); cmd.nth = nm ? Number(nm[0]) : 1;
+      const bad = flags.replace(/[gpiI\d]/g, '');
+      if (bad) throw new SedError(`s コマンドの未対応フラグ: ${bad}`);
+      try { cmd.re = new RegExp(posixToJs(p.text, ere), 'g' + (/[iI]/.test(flags) ? 'i' : '')); } catch (e) { throw new SedError(`無効な正規表現: ${p.text}`); }
+      cmd.repl = parseRepl(r.text);
+    } else if (c === 'y') {
+      const delim = script[i++];
+      const a = readDelimited(script, i, delim, 'y のソース'); i = a.next;
+      const b = readDelimited(script, i, delim, 'y の置換先'); i = b.next;
+      const un = (t) => t.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\\\/g, '\\');
+      cmd.src = [...un(a.text)]; cmd.dst = [...un(b.text)];
+      if (cmd.src.length !== cmd.dst.length) throw new SedError('y: 文字列の長さが一致しません');
+    } else if (c === 'a' || c === 'i' || c === 'c') {
+      ws();
+      if (script[i] === '\\') { i++; if (script[i] === '\n') i++; }
+      let j = i; while (j < script.length && script[j] !== '\n') j++;
+      cmd.text = script.slice(i, j); i = j;
+    } else if (c === 'd' || c === 'p' || c === 'q' || c === '=') {
+      if (c === 'q') { while (/[0-9 ]/.test(script[i] || '')) i++; }
+    } else if (c === '{' || c === '}') {
+      throw new SedError('{ } によるコマンドのグループ化はこのシミュレーターでは未対応です');
+    } else if ('hHgGxnNDPwWrR'.includes(c)) {
+      throw new SedError(`コマンド '${c}' はこのシミュレーターでは未対応です`);
+    } else throw new SedError(`未知のコマンド: '${c}'`);
+    cmds.push(cmd);
+  }
+  return cmds;
+}
+
+// 置換文字列 → [{lit}|{grp}]
+function parseRepl(s) {
+  const parts = []; let lit = '';
+  const flush = () => { if (lit) { parts.push({ lit }); lit = ''; } };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < s.length) {
+      const n = s[++i];
+      if (/[0-9]/.test(n)) { flush(); parts.push({ grp: Number(n) }); }
+      else if (n === 'n') lit += '\n'; else if (n === 't') lit += '\t'; else lit += n;
+    } else if (c === '&') { flush(); parts.push({ grp: 0 }); }
+    else lit += c;
+  }
+  flush(); return parts;
+}
+const expand = (parts, m) => parts.map(p => (p.lit !== undefined ? p.lit : (m[p.grp] ?? ''))).join('');
+
+// 1ストリーム(行配列)を処理して出力行配列を返す
+function runSedLines(cmds, lines, { quiet = false } = {}) {
+  const out = [];
+  const state = cmds.map(() => ({ active: false, endLine: null }));
+  const total = lines.length;
+  let quit = false;
+  for (let idx = 0; idx < total && !quit; idx++) {
+    const ln = idx + 1; const isLast = ln === total;
+    let ps = lines[idx]; let deleted = false; const appendQ = [];
+    const test = (a) => (a.t === 'num' ? ln === a.n : a.t === 'last' ? isLast : a.re.test(ps));
+    for (let ci = 0; ci < cmds.length && !deleted && !quit; ci++) {
+      const c = cmds[ci], st = state[ci];
+      let m;
+      if (!c.a1) m = true;
+      else if (!c.a2) m = test(c.a1);
+      else if (!st.active) {
+        m = test(c.a1);
+        if (m) {
+          if (c.a2.t === 'num') st.active = c.a2.n > ln;
+          else if (c.a2.t === 'rel') { st.endLine = ln + c.a2.n; st.active = c.a2.n > 0; }
+          else if (c.a2.t === 'last') st.active = !isLast;
+          else st.active = true; // 正規表現は次行以降で終端判定
+        }
+      } else {
+        m = true;
+        if (c.a2.t === 'num') { if (ln >= c.a2.n) st.active = false; }
+        else if (c.a2.t === 'rel') { if (ln >= st.endLine) st.active = false; }
+        else if (c.a2.t === 'last') { if (isLast) st.active = false; }
+        else if (c.a2.re.test(ps)) st.active = false;
+      }
+      if (c.neg) m = !m;
+      if (!m) continue;
+      switch (c.c) {
+        case 's': {
+          let count = 0, replaced = false;
+          const re = c.re; re.lastIndex = 0;
+          const res = ps.replace(re, (...a) => {
+            count++;
+            const mm = a.slice(0, a.findIndex((x) => typeof x === 'number'));
+            if (count < c.nth || (!c.g && count > c.nth)) return mm[0];
+            replaced = true; return expand(c.repl, mm);
+          });
+          if (replaced) { ps = res; if (c.p) out.push(ps); }
+          break;
+        }
+        case 'd': deleted = true; break;
+        case 'p': out.push(ps); break;
+        case 'q': quit = true; break;
+        case 'y': { const map = new Map(c.src.map((ch, k) => [ch, c.dst[k]])); ps = [...ps].map(ch => (map.has(ch) ? map.get(ch) : ch)).join(''); break; }
+        case 'a': appendQ.push(c.text); break;
+        case 'i': out.push(c.text); break;
+        case 'c': { if (!c.a2 || !st.active) out.push(c.text); deleted = true; break; }
+        case '=': out.push(String(ln)); break;
+        default: break;
+      }
+    }
+    if (!deleted && !quiet) out.push(ps);
+    for (const t of appendQ) out.push(t);
+  }
+  return out;
+}
+
+Object.assign(exports, { SedError, parseSed, runSedLines });
+
+};
 __mods["js/commands.js"] = function (module, exports, __require) {
 // ============================================================
 // コマンド実装。すべて仮想FS上の操作のみ。
@@ -1022,10 +1874,15 @@ __mods["js/commands.js"] = function (module, exports, __require) {
 const { FsError, ERRMSG, modeString, lsDate, isoDate, nodeSize } = __require("js/vfs.js");
 const { escapeRe } = __require("js/shell.js");
 const { MANPAGES } = __require("js/manpages.js");
+const { runAwk, AwkError } = __require("js/awk.js");
+const { parseSed, runSedLines, SedError } = __require("js/sed.js");
 
 function fsMsg(e) { return e instanceof FsError ? (ERRMSG[e.code] || e.code) : String(e && e.message || e); }
 
 // オプション解析: spec 例 { l:'bool', n:'val', '--color':'optval' }
+class OptError extends Error { constructor(msg) { super(msg); this.name = 'OptError'; } }
+
+
 function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
   const opts = {};
   const operands = [];
@@ -1039,7 +1896,7 @@ function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
       if (spec[key] === 'val' || spec[key] === 'optval') {
         opts[key] = eq >= 0 ? a.slice(eq + 1) : (spec[key] === 'val' ? args[++i] : true);
       } else if (spec[key] === 'bool') opts[key] = true;
-      else return { error: `unrecognized option '${a}'` };
+      else throw new OptError(`unrecognized option '${a}'`);
       continue;
     }
     if (a.length > 1 && a[0] === '-' && a !== '-') {
@@ -1052,7 +1909,7 @@ function parseOpts(args, spec = {}, { stopAtNonOption = false } = {}) {
           if (val) opts[f] = val;
           else opts[f] = args[++i];
           j = a.length; break;
-        } else return { error: `invalid option -- '${f}'` };
+        } else throw new OptError(`invalid option -- '${f}'`);
       }
       continue;
     }
@@ -1205,6 +2062,8 @@ function makeCommands(getCmds) {
   C.head = (args, ctx) => headtail(args, ctx, 'head');
   C.tail = (args, ctx) => headtail(args, ctx, 'tail');
   function headtail(args, ctx, name) {
+    // 旧式の数値オプション (head -3 / tail -5) を -n N に正規化
+    args = args.flatMap(a => (/^-\d+$/.test(a) ? ['-n', a.slice(1)] : [a]));
     const { opts, operands } = parseOpts(args, { n: 'val', c: 'val', f: 'bool', q: 'bool' });
     let n = 10;
     if (opts.n != null) { n = parseInt(opts.n, 10); if (isNaN(n)) { ctx.err(`${name}: invalid number\n`); return 1; } }
@@ -1228,14 +2087,14 @@ function makeCommands(getCmds) {
   }
 
   C.grep = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { i: 'bool', v: 'bool', n: 'bool', c: 'bool', r: 'bool', R: 'bool', E: 'bool', o: 'bool', l: 'bool', w: 'bool', H: 'bool', h: 'bool', F: 'bool', q: 'bool', a: 'bool' }, { stopAtNonOption: true });
+    const { opts, operands } = parseOpts(args, { i: 'bool', v: 'bool', n: 'bool', c: 'bool', r: 'bool', R: 'bool', E: 'bool', o: 'bool', l: 'bool', w: 'bool', H: 'bool', h: 'bool', F: 'bool', q: 'bool', a: 'bool', s: 'bool', e: 'val', A: 'val', B: 'val', C: 'val', m: 'val' });
     let pattern = opts.e;
     const ops = [...operands];
     if (pattern == null) pattern = ops.shift();
     if (pattern == null) { ctx.err('grep: 検索パターンがありません\n'); return 2; }
     let re;
     try {
-      let pat = opts.F ? escapeRe(pattern) : pattern;
+      let pat = opts.F ? escapeRe(pattern) : posixToJs(pattern, !!opts.E);
       if (opts.w) pat = `\\b(?:${pat})\\b`;
       re = new RegExp(pat, opts.i ? 'gi' : 'g');
     } catch (e) { ctx.err(`grep: 無効な正規表現: ${e.message}\n`); return 2; }
@@ -1243,27 +2102,37 @@ function makeCommands(getCmds) {
     let matched = false;
     let code = 1;
     const vfs = ctx.sh.vfs;
+    const ctxA = parseInt(opts.A ?? opts.C ?? 0, 10) || 0;
+    const ctxB = parseInt(opts.B ?? opts.C ?? 0, 10) || 0;
+    const maxCount = opts.m != null ? parseInt(opts.m, 10) : Infinity;
     const searchText = (data, label) => {
-      let count = 0;
       const lines = data.split('\n');
       if (lines[lines.length - 1] === '') lines.pop();
-      lines.forEach((ln, i) => {
-        re.lastIndex = 0;
-        const hit = re.test(ln);
-        if (hit !== !!opts.v) {
-          matched = true; code = 0; count++;
-          if (opts.q || opts.l || opts.c) return;
-          const prefix = (label && (opts.H || recursive || opts.H)) ? label + ':' : '';
-          if (opts.o && !opts.v) {
-            re.lastIndex = 0; let m;
-            while ((m = re.exec(ln))) { ctx.out(prefix + (opts.n ? (i + 1) + ':' : '') + m[0] + '\n'); if (m.index === re.lastIndex) re.lastIndex++; }
-          } else {
-            ctx.out(prefix + (opts.n ? (i + 1) + ':' : '') + ln + '\n');
-          }
-        }
-      });
+      const isHit = lines.map(ln => { re.lastIndex = 0; return re.test(ln) !== !!opts.v; });
+      // -m: 最初の N 件のみ
+      let seen = 0;
+      for (let k = 0; k < isHit.length; k++) if (isHit[k]) { seen++; if (seen > maxCount) isHit[k] = false; }
+      const count = isHit.filter(Boolean).length;
+      if (count) { matched = true; code = 0; }
+      const prefixName = (label && (opts.H || recursive)) ? label : '';
       if (opts.c && !opts.q) ctx.out((label ? label + ':' : '') + count + '\n');
       if (opts.l && count && !opts.q) ctx.out(label + '\n');
+      if (opts.q || opts.l || opts.c) return count;
+      // 出力する行（マッチ＋前後の文脈）
+      const show = new Array(lines.length).fill(false);
+      isHit.forEach((h, k) => { if (!h) return; for (let d = -ctxB; d <= ctxA; d++) if (lines[k + d] !== undefined) show[k + d] = true; });
+      let lastShown = -2;
+      lines.forEach((ln, k) => {
+        if (!show[k]) return;
+        if ((ctxA || ctxB) && lastShown >= 0 && k > lastShown + 1) ctx.out('--\n');
+        lastShown = k;
+        const sep = isHit[k] ? ':' : '-';
+        const pre = (prefixName ? prefixName + sep : '') + (opts.n ? (k + 1) + sep : '');
+        if (opts.o && !opts.v && isHit[k]) {
+          re.lastIndex = 0; let m;
+          while ((m = re.exec(ln))) { ctx.out(pre + m[0] + '\n'); if (m.index === re.lastIndex) re.lastIndex++; }
+        } else ctx.out(pre + ln + '\n');
+      });
       return count;
     };
     if (!ops.length || ops[0] === '-') { searchText(ctx.stdin, opts.H ? '(standard input)' : ''); return opts.q ? (matched ? 0 : 1) : code; }
@@ -1288,44 +2157,91 @@ function makeCommands(getCmds) {
     let i = 0;
     for (; i < args.length; i++) { if (args[i].startsWith('-') || args[i] === '!' || args[i] === '(') break; paths.push(args[i]); }
     if (!paths.length) paths.push('.');
-    const tests = args.slice(i);
+    const toks = args.slice(i);
     const vfs = ctx.sh.vfs, user = ctx.sh.user;
     let code = 0;
-    // 述語を関数に変換
-    const preds = [];
-    const actions = [];
-    for (let k = 0; k < tests.length; k++) {
-      const t = tests[k];
-      const val = () => tests[++k];
-      if (t === '-name') { const pat = globRe(val()); preds.push((p, n, name) => pat.test(name)); }
-      else if (t === '-iname') { const pat = globRe(val(), true); preds.push((p, n, name) => pat.test(name)); }
-      else if (t === '-type') { const ty = val(); preds.push((p, n) => (ty === 'f' ? n.type === 'f' : ty === 'd' ? n.type === 'd' : ty === 'l' ? n.type === 'l' : true)); }
-      else if (t === '-maxdepth') { ctx._maxdepth = parseInt(val(), 10); }
-      else if (t === '-mindepth') { ctx._mindepth = parseInt(val(), 10); }
-      else if (t === '-perm') { const spec = val(); preds.push((p, n) => permMatch(n.mode, spec)); }
-      else if (t === '-user') { const u = val(); const uu = vfs.userByName(u); preds.push((p, n) => n.uid === (uu ? uu.uid : parseInt(u, 10))); }
-      else if (t === '-group') { const g = val(); const gg = vfs.groupByName(g); preds.push((p, n) => n.gid === (gg ? gg.gid : parseInt(g, 10))); }
-      else if (t === '-size') { const spec = val(); preds.push((p, n) => sizeMatch(nodeSize(n), spec)); }
-      else if (t === '-empty') { preds.push((p, n) => n.type === 'f' ? n.content === '' : Object.keys(n.children).length === 0); }
-      else if (t === '-print') { /* default */ }
-      else if (t === '-type') { }
-      else if (t === '-o' || t === '-a' || t === '!' || t === '(' || t === ')') { /* 簡易: AND のみ対応 */ }
-      else { ctx.err(`find: 未対応の述語 '${t}' は無視します\n`); }
+    let maxd = Infinity, mind = 0;
+    let hasAction = false;
+    const pendingDelete = [];
+    // ---- 式パーサ: or > and > not > primary ----
+    let pos = 0;
+    const peek = () => toks[pos];
+    const need = (name) => { if (pos >= toks.length) throw new OptError(`missing argument to \`${name}'`); return toks[pos++]; };
+    function parseOr() {
+      let left = parseAnd();
+      while (peek() === '-o' || peek() === '-or') { pos++; const right = parseAnd(); const l = left; left = (e) => l(e) || right(e); }
+      return left;
     }
-    const maxd = ctx._maxdepth ?? Infinity;
-    const mind = ctx._mindepth ?? 0;
-    delete ctx._maxdepth; delete ctx._mindepth;
+    function parseAnd() {
+      let left = parseNot();
+      while (pos < toks.length && peek() !== '-o' && peek() !== '-or' && peek() !== ')') {
+        if (peek() === '-a' || peek() === '-and') pos++;
+        const right = parseNot(); const l = left; left = (e) => l(e) && right(e);
+      }
+      return left;
+    }
+    function parseNot() {
+      if (peek() === '!' || peek() === '-not') { pos++; const inner = parseNot(); return (e) => !inner(e); }
+      return parsePrimary();
+    }
+    function parsePrimary() {
+      const t = toks[pos++];
+      if (t === undefined) throw new OptError('invalid expression');
+      if (t === '(') { const inner = parseOr(); if (toks[pos++] !== ')') throw new OptError('unmatched ( in expression'); return inner; }
+      switch (t) {
+        case '-name': { const re = globRe(need(t)); return (e) => re.test(e.name); }
+        case '-iname': { const re = globRe(need(t), true); return (e) => re.test(e.name); }
+        case '-path': { const re = globRe(need(t)); return (e) => re.test(e.path); }
+        case '-type': { const ty = need(t); return (e) => (ty === 'f' ? e.node.type === 'f' : ty === 'd' ? e.node.type === 'd' : ty === 'l' ? e.node.type === 'l' : false); }
+        case '-perm': { const spec = need(t); return (e) => permMatch(e.node.mode, spec); }
+        case '-user': { const u = need(t); const uu = vfs.userByName(u); return (e) => e.node.uid === (uu ? uu.uid : parseInt(u, 10)); }
+        case '-group': { const g = need(t); const gg = vfs.groupByName(g); return (e) => e.node.gid === (gg ? gg.gid : parseInt(g, 10)); }
+        case '-size': { const spec = need(t); return (e) => sizeMatch(nodeSize(e.node), spec); }
+        case '-empty': return (e) => (e.node.type === 'f' ? e.node.content === '' : Object.keys(e.node.children).length === 0);
+        case '-mtime': case '-mmin': {
+          const spec = need(t); const unit = t === '-mtime' ? 86400000 : 60000;
+          const n = parseInt(spec.replace(/^[+-]/, ''), 10);
+          return (e) => { const age = Math.floor((vfs.clock - e.node.mtime) / unit); return spec[0] === '+' ? age > n : spec[0] === '-' ? age < n : age === n; };
+        }
+        case '-newer': { const ref = need(t); let rn; try { rn = lookup(ctx, ref); } catch (er) { throw new OptError(`'${ref}': ${fsMsg(er)}`); } return (e) => e.node.mtime > rn.mtime; }
+        case '-maxdepth': maxd = parseInt(need(t), 10); return () => true;
+        case '-mindepth': mind = parseInt(need(t), 10); return () => true;
+        case '-print': hasAction = true; return (e) => { ctx.out(e.shown + '\n'); return true; };
+        case '-delete': hasAction = true; return (e) => { pendingDelete.push(e.abs); return true; };
+        case '-exec': case '-execdir': {
+          hasAction = true;
+          const cmd = [];
+          while (pos < toks.length && toks[pos] !== ';' && toks[pos] !== '+') cmd.push(toks[pos++]);
+          if (pos >= toks.length) throw new OptError("missing argument to `-exec'");
+          pos++; // ; or +
+          if (!cmd.length) throw new OptError("missing argument to `-exec'");
+          return (e) => ctx.sh.exec(cmd.map(a => a.split('{}').join(e.shown)), ctx) === 0;
+        }
+        default: throw new OptError(`unknown predicate \`${t}'`);
+      }
+    }
+    const expr = toks.length ? parseOr() : () => true;
+    if (pos < toks.length) throw new OptError(`paths must precede expression: \`${toks[pos]}'`);
+    const run = hasAction ? expr : (e) => { if (!expr(e)) return false; ctx.out(e.shown + '\n'); return true; };
     for (const start of paths) {
       let node;
       try { node = lookup(ctx, start); } catch (e) { ctx.err(`find: '${start}': ${fsMsg(e)}\n`); code = 1; continue; }
-      vfs.walk(resolve(ctx, start), node, user,
+      const startAbs = resolve(ctx, start);
+      const trimmedStart = start.length > 1 ? start.replace(/\/+$/, '') : start;
+      vfs.walk(startAbs, node, user,
         (path, nd, depth) => {
           if (depth < mind || depth > maxd) return;
+          const rest = path.slice(startAbs.length === 1 ? 0 : startAbs.length);
+          const shown = depth === 0 ? start : (trimmedStart === '/' ? '/' + rest.replace(/^\//, '') : trimmedStart + rest);
           const name = path === '/' ? '/' : path.split('/').pop();
-          if (preds.every(fn => fn(path, nd, name))) ctx.out(path + '\n');
+          run({ path: shown, abs: path, shown, node: nd, name: depth === 0 && start.endsWith('.') ? start : name });
         },
         path => { ctx.err(`find: '${path}': Permission denied\n`); code = 1; },
         0, maxd);
+    }
+    for (const abs of pendingDelete.reverse()) {
+      try { const nd = vfs.lookup(abs, '/', null); if (nd.type === 'd') vfs.rmdir(abs, '/', user); else vfs.remove(abs, '/', user); }
+      catch (e) { ctx.err(`find: cannot delete '${abs}': ${fsMsg(e)}\n`); code = 1; }
     }
     return code;
   };
@@ -1778,91 +2694,101 @@ function makeCommands(getCmds) {
   };
 
   C.sed = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { n: 'bool', i: 'bool', e: 'val', E: 'bool', r: 'bool' });
-    let script = opts.e;
-    const ops = [...operands];
-    if (script == null) script = ops.shift();
-    let data = ops.length ? safeRead(ctx, ops[0], 'sed') : ctx.stdin;
-    if (data == null) return 1;
-    const lines = data.split('\n');
-    const had = lines[lines.length - 1] === '';
-    if (had) lines.pop();
-    // 対応: s/old/new/flags, Np, Nd, /re/d, /re/p
-    const m = script.match(/^s(.)(.*?)\1(.*?)\1([gip0-9]*)$/);
-    let outLines = [];
-    try {
-      if (m) {
-        const [, , pat, rep, flags] = m;
-        const re = new RegExp(pat, flags.includes('g') ? (flags.includes('i') ? 'gi' : 'g') : (flags.includes('i') ? 'i' : ''));
-        const repl = rep.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-        for (const l of lines) {
-          const r = l.replace(re, repl.replace(/&/g, '$$&'));
-          if (flags.includes('p')) { if (!opts.n) outLines.push(l); outLines.push(r); }
-          else outLines.push(r);
+    // オプション: -n -E -r -i[SUFFIX] -e script (複数可) -f file / --expression=
+    let quiet = false, ere = false, inPlace = false, suffix = '';
+    const scripts = []; const operands = [];
+    for (let k = 0; k < args.length; k++) {
+      const a = args[k];
+      if (a === '--') { operands.push(...args.slice(k + 1)); break; }
+      if (a === '-e' || a === '--expression') { const v = args[++k]; if (v == null) { ctx.err('sed: -e にはスクリプトが必要です\n'); return 1; } scripts.push(v); }
+      else if (a.startsWith('--expression=')) scripts.push(a.slice(13));
+      else if (a === '-f') { const f = args[++k]; const t = f == null ? null : safeRead(ctx, f, 'sed'); if (t == null) return 1; scripts.push(t.replace(/\n$/, '')); }
+      else if (a === '--quiet' || a === '--silent') quiet = true;
+      else if (a === '--regexp-extended') ere = true;
+      else if (a.startsWith('--in-place')) { inPlace = true; suffix = a.includes('=') ? a.split('=')[1] : ''; }
+      else if (a.length > 1 && a[0] === '-' && a[1] !== '-') {
+        for (let j = 1; j < a.length; j++) {
+          const f = a[j];
+          if (f === 'n') quiet = true;
+          else if (f === 'E' || f === 'r') ere = true;
+          else if (f === 'i') { inPlace = true; suffix = a.slice(j + 1); break; }
+          else if (f === 's') { /* 各ファイル個別: 既定で近似 */ }
+          else if (f === 'e') { const v = a.slice(j + 1) || args[++k]; if (v == null) { ctx.err('sed: -e にはスクリプトが必要です\n'); return 1; } scripts.push(v); break; }
+          else throw new OptError(`invalid option -- '${f}'`);
         }
-        if (flags.includes('p') && opts.n) outLines = lines.map(l => l.replace(re, repl)).filter((_, i) => re.test(lines[i]));
-      } else if (/^\d+d$/.test(script)) {
-        const n = parseInt(script, 10); outLines = lines.filter((_, i) => i + 1 !== n);
-      } else if (/d$/.test(script) && script.startsWith('/')) {
-        const re = new RegExp(script.slice(1, script.lastIndexOf('/')));
-        outLines = lines.filter(l => !re.test(l));
-      } else if (/^\d+p$/.test(script) && opts.n) {
-        const n = parseInt(script, 10); if (lines[n - 1] != null) outLines = [lines[n - 1]];
-      } else { ctx.err(`sed: このシミュレーターでは一部のスクリプトのみ対応しています (${script})\n`); return 1; }
-    } catch (e) { ctx.err(`sed: -e 式 #1 の解釈に失敗: ${e.message}\n`); return 1; }
-    const result = outLines.map(l => l + '\n').join('');
-    if (opts.i && ops.length) { try { ctx.sh.vfs.writeFile(ops[0], ctx.sh.cwd, ctx.sh.user, result); } catch (e) { ctx.err(`sed: ${fsMsg(e)}\n`); return 1; } }
-    else ctx.out(result);
-    return 0;
+      }
+      else operands.push(a);
+    }
+    if (!scripts.length) { if (!operands.length) { ctx.err("usage: sed [-n] [-E] [-i[SUFFIX]] script [file ...]\n"); return 1; } scripts.push(operands.shift()); }
+    let cmds;
+    try { cmds = parseSed(scripts.join('\n'), ere); }
+    catch (e) { if (e instanceof SedError) { ctx.err(`sed: -e 式 #1: ${e.message}\n`); return 1; } throw e; }
+    const toLines = (text) => { const l = text.split('\n'); if (l[l.length - 1] === '') l.pop(); return l; };
+    try {
+      if (inPlace) {
+        if (!operands.length) { ctx.err('sed: -i にはファイルが必要です\n'); return 1; }
+        let code = 0;
+        for (const f of operands) {
+          const text = safeRead(ctx, f, 'sed'); if (text == null) { code = 1; continue; }
+          const out = runSedLines(cmds, toLines(text), { quiet });
+          try {
+            if (suffix) ctx.sh.vfs.writeFile(suffix.includes('*') ? suffix.replace('*', f) : f + suffix, ctx.sh.cwd, ctx.sh.user, text);
+            ctx.sh.vfs.writeFile(f, ctx.sh.cwd, ctx.sh.user, out.length ? out.join('\n') + '\n' : '');
+          } catch (e) { ctx.err(`sed: ${f}: ${fsMsg(e)}\n`); code = 1; }
+        }
+        return code;
+      }
+      let lines = [];
+      if (!operands.length) lines = toLines(ctx.stdin);
+      else for (const f of operands) { const t = f === '-' ? ctx.stdin : safeRead(ctx, f, 'sed'); if (t == null) return 1; lines.push(...toLines(t)); }
+      const out = runSedLines(cmds, lines, { quiet });
+      if (out.length) ctx.out(out.join('\n') + '\n');
+      return 0;
+    } catch (e) { if (e instanceof SedError) { ctx.err(`sed: ${e.message}\n`); return 1; } throw e; }
   };
 
   C.awk = (args, ctx) => {
-    const { opts, operands } = parseOpts(args, { F: 'val' });
-    const prog = operands.shift();
-    let data = operands.length ? safeRead(ctx, operands[0], 'awk') : ctx.stdin;
-    if (data == null) return 1;
-    const FS = opts.F || /\s+/;
-    const lines = data.split('\n');
-    if (lines[lines.length - 1] === '') lines.pop();
-    // 対応: '{print $N}', '{print $N, $M}', '/re/{print...}', 'NR==N', '{print}'
-    const bodyMatch = prog.match(/^\s*(?:\/([^/]*)\/)?\s*(?:\{(.*)\})?\s*$/);
-    let reFilter = null, body = 'print';
-    if (bodyMatch) { if (bodyMatch[1]) reFilter = new RegExp(bodyMatch[1]); if (bodyMatch[2] != null) body = bodyMatch[2].trim(); }
-    const condMatch = prog.match(/^\s*(NR|NF)\s*(==|>|<|>=|<=)\s*(\d+)\s*(?:\{(.*)\})?\s*$/);
-    lines.forEach((line, idx) => {
-      const trimmed = opts.F ? line : line.trim();
-      const fields = opts.F ? line.split(FS) : (line.trim() === '' ? [] : line.trim().split(FS));
-      const NR = idx + 1, NF = fields.length;
-      let pass = true;
-      if (reFilter) pass = reFilter.test(line);
-      if (condMatch) {
-        const lhs = condMatch[1] === 'NR' ? NR : NF;
-        const rhs = parseInt(condMatch[3], 10);
-        const op = condMatch[2];
-        pass = op === '==' ? lhs === rhs : op === '>' ? lhs > rhs : op === '<' ? lhs < rhs : op === '>=' ? lhs >= rhs : lhs <= rhs;
-        if (condMatch[4] != null) body = condMatch[4].trim();
-        else body = 'print';
+    // 手動でオプションを解析（-F fs / -v var=val(複数可) / -f progfile / --）
+    let FS = null; const vars = {}; let progFile = null; let i = 0;
+    const unesc = (v) => v.replace(/\\t/g, '\t').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+    for (; i < args.length; i++) {
+      const a = args[i];
+      if (a === '--') { i++; break; }
+      if (a.startsWith('-F')) { const v = a.length > 2 ? a.slice(2) : args[++i]; if (v == null) { ctx.err('awk: -F には区切り文字が必要です\n'); return 2; } FS = v === 't' ? '\t' : unesc(v); }
+      else if (a.startsWith('-v')) {
+        const v = a.length > 2 ? a.slice(2) : args[++i];
+        const m = (v || '').match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s);
+        if (!m) { ctx.err('awk: -v には var=value の形式が必要です\n'); return 2; }
+        vars[m[1]] = unesc(m[2]);
       }
-      if (!pass) return;
-      const printMatch = body.match(/^print\s*(.*)$/);
-      if (printMatch != null) {
-        const arg = printMatch[1].trim();
-        if (!arg) { ctx.out(line + '\n'); return; }
-        const parts = arg.split(',').map(tok => {
-          tok = tok.trim();
-          if (tok === '$0') return line;
-          if (tok === '$NF') return fields[NF - 1] ?? '';
-          if (tok === '$(NF-1)') return fields[NF - 2] ?? '';
-          const fm = tok.match(/^\$(\d+)$/);
-          if (fm) return fields[parseInt(fm[1], 10) - 1] ?? '';
-          if (tok === 'NR') return String(NR);
-          if (tok === 'NF') return String(NF);
-          return tok.replace(/^"|"$/g, '');
-        });
-        ctx.out(parts.join(' ') + '\n');
+      else if (a === '-f') { progFile = args[++i]; if (progFile == null) { ctx.err('awk: -f にはファイル名が必要です\n'); return 2; } }
+      else if (a.startsWith('-') && a.length > 1) { ctx.err(`awk: 未対応のオプション ${a}\n`); return 2; }
+      else break;
+    }
+    let program;
+    if (progFile != null) {
+      program = safeRead(ctx, progFile, 'awk'); if (program == null) return 2;
+    } else {
+      program = args[i++];
+      if (program == null) { ctx.err('usage: awk [-F fs] [-v var=value] \'prog\' [file ...]\n'); return 2; }
+    }
+    const files = args.slice(i);
+    const inputs = [];
+    if (!files.length) inputs.push({ name: '', text: ctx.stdin });
+    else {
+      for (const f of files) {
+        if (f === '-') { inputs.push({ name: '-', text: ctx.stdin }); continue; }
+        const text = safeRead(ctx, f, 'awk');
+        if (text == null) return 2;
+        inputs.push({ name: f, text });
       }
-    });
-    return 0;
+    }
+    try {
+      return runAwk({ program, inputs, vars, FS, out: (t) => ctx.out(t) });
+    } catch (e) {
+      if (e instanceof AwkError) { ctx.err(`awk: ${e.message}\n`); return 2; }
+      throw e;
+    }
   };
 
   C.tee = (args, ctx) => {
@@ -2105,6 +3031,42 @@ function makeCommands(getCmds) {
   return C;
 }
 
+
+// POSIX 正規表現(BRE/ERE) → JavaScript RegExp ソース変換。
+// BRE(既定): \| \( \) \{ \} \+ \? が特殊、素の | ( ) { } + ? はリテラル。ERE(-E): 逆。
+const POSIX_CLASS = { alpha: 'A-Za-z', digit: '0-9', alnum: 'A-Za-z0-9', upper: 'A-Z', lower: 'a-z', space: ' \\t\\n\\r\\f\\v', blank: ' \\t', punct: '!-\\/:-@\\[-`{-~', xdigit: '0-9A-Fa-f' };
+function posixToJs(pat, ere) {
+  let out = ''; let i = 0; let inBr = false;
+  const SPECIAL = '|(){}+?';
+  while (i < pat.length) {
+    const c = pat[i];
+    if (inBr) {
+      if (c === ']') { inBr = false; out += ']'; i++; continue; }
+      if (c === '[' && pat[i + 1] === ':') {
+        const end = pat.indexOf(':]', i + 2);
+        if (end > 0) { out += POSIX_CLASS[pat.slice(i + 2, end)] ?? ''; i = end + 2; continue; }
+      }
+      out += c === '\\' ? '\\\\' : c; i++; continue;
+    }
+    if (c === '[') {
+      inBr = true; out += '['; i++;
+      if (pat[i] === '^') { out += '^'; i++; }
+      if (pat[i] === ']') { out += '\\]'; i++; }
+      continue;
+    }
+    if (c === '\\') {
+      const n = pat[i + 1]; i += 2;
+      if (n === undefined) { out += '\\\\'; break; }
+      if (SPECIAL.includes(n)) { out += ere ? '\\' + n : n; continue; }
+      if (n === '<' || n === '>') { out += '\\b'; continue; }
+      out += '\\' + n; continue;
+    }
+    if (!ere && SPECIAL.includes(c)) { out += '\\' + c; i++; continue; }
+    out += c; i++;
+  }
+  return out;
+}
+
 // ---------- jq (簡易版) ----------
 // 対応: . / .key / .a.b / .[] / .key[] / .key[0] / .["k"] / | / keys / length
 function applyJq(filter, data) {
@@ -2290,7 +3252,7 @@ function b64decode(str) {
 }
 
 
-Object.assign(exports, { makeCommands, simpleHash, b64encode });
+Object.assign(exports, { makeCommands, posixToJs, OptError, simpleHash, b64encode });
 
 };
 __mods["js/netcommands.js"] = function (module, exports, __require) {

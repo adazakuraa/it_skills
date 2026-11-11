@@ -182,6 +182,63 @@ function structureTests() {
   }
 }
 
+
+// ---------- エンジン(awk/sed/grep/find/head)の回帰テスト ----------
+function engineTests() {
+  const env = { user: 't', files: [
+    { path: '/home/t/log.txt', owner: 't', content: '10.0.0.1 GET /a 200 120\n10.0.0.2 GET /b 404 0\n10.0.0.1 POST /login 401 15\n10.0.0.3 GET /a 200 300\n10.0.0.1 POST /login 401 15\n' },
+    { path: '/home/t/c.ini', owner: 't', content: '# comment\ndebug=true\nhost=localhost\nport=8080\n\n# end\nname=app\n' },
+    { path: '/home/t/m.txt', owner: 't', content: 'alpha 1\nTODO fix\nbeta 2\nINTERNAL x\ngamma 3\ndelta 4\nTODO again\n' },
+    { path: '/home/t/d/a.log', owner: 't', content: 'x\n' }, { path: '/home/t/d/b.txt', owner: 't', content: 'y\n' }, { path: '/home/t/d/c.conf', owner: 't', content: 'z\n' },
+  ] };
+  const { shell: s } = buildEnvironment({ env });
+  const run = (l) => s.run(l).map(c => (c.fd === 2 ? '[E]' : '') + c.text).join('');
+  run('cd /home/t');
+  const eq = (name, cmd, want) => { const got = run(cmd); ok(got === want, `${name}: ${cmd} → ${JSON.stringify(got)} (期待 ${JSON.stringify(want)})`); };
+
+  // awk: 条件のみ・条件+アクション（条件を無視して全行出力していた旧バグの回帰）
+  eq('awk cond', "awk '$4==401' log.txt", '10.0.0.1 POST /login 401 15\n10.0.0.1 POST /login 401 15\n');
+  eq('awk cond+print', "awk '$4>=400 {print $1, $3}' log.txt", '10.0.0.2 /b\n10.0.0.1 /login\n10.0.0.1 /login\n');
+  eq('awk passwd uid0', "awk -F: '$3==0' /etc/passwd", 'root:x:0:0:root:/root:/bin/bash\n');
+  eq('awk str cmp', "awk -F: '$7==\"/bin/bash\" {print $1}' /etc/passwd | head -1", 'root\n');
+  eq('awk array', "awk '{c[$1]++} END{for(k in c) print k, c[k]}' log.txt", '10.0.0.1 3\n10.0.0.2 1\n10.0.0.3 1\n');
+  eq('awk sum', "awk '{s+=$5} END{print s}' log.txt", '450\n');
+  eq('awk printf', "awk '{s+=$5;n++} END{printf \"%.2f\\n\", s/n}' log.txt", '90.00\n');
+  eq('awk range', "awk 'NR==2,NR==3{print NR\":\"$3}' log.txt", '2:/b\n3:/login\n');
+  eq('awk -v', "awk -v t=400 '$4>=t{n++} END{print n}' log.txt", '3\n');
+  eq('awk BEGIN', "awk 'BEGIN{print 1+2*3, 7%4, 2^10}'", '7 3 1024\n');
+  eq('awk gsub', "echo 'a.b.c' | awk '{gsub(/\\./,\"-\"); print}'", 'a-b-c\n');
+  ok(run("awk '{print $1'").startsWith('[E]awk: syntax error'), 'awk 構文エラーを報告する');
+  ok(run("awk 'BEGIN{system(\"id\")}'").includes('未対応'), 'awk system() は拒否される');
+  // sed
+  eq('sed s', "sed 's/true/false/' c.ini | sed -n 2p", 'debug=false\n');
+  eq('sed backref', "echo 'john smith' | sed -E 's/(\\w+) (\\w+)/\\2, \\1/'", 'smith, john\n');
+  eq('sed multi', "echo hi | sed 's/^/> /; s/$/ </'", '> hi <\n');
+  eq('sed BRE alt', "echo 'cat dog' | sed 's/cat\\|dog/X/g'", 'X X\n');
+  eq('sed range', "sed -n '2,4p' c.ini", 'debug=true\nhost=localhost\nport=8080\n');
+  eq('sed $d', "sed '$d' c.ini | tail -1", '# end\n');
+  eq('sed -e x2', "sed -e 's/true/1/' -e 's/localhost/127.0.0.1/' c.ini | sed -n '2,3p'", 'debug=1\nhost=127.0.0.1\n');
+  eq('sed nth', "echo aaa | sed 's/a/b/2'", 'aba\n');
+  eq('sed -i.bak', "sed -i.bak 's/8080/9090/' c.ini; grep port c.ini", 'port=9090\n');
+  // grep
+  eq('grep BRE |', "grep -i 'todo\\|internal' m.txt", 'TODO fix\nINTERNAL x\nTODO again\n');
+  eq('grep ERE', "grep -E 'TODO|beta' m.txt", 'TODO fix\nbeta 2\nTODO again\n');
+  eq('grep -A', 'grep -A1 TODO m.txt', 'TODO fix\nbeta 2\n--\nTODO again\n');
+  eq('grep -n -C', 'grep -n -C1 beta m.txt', '2-TODO fix\n3:beta 2\n4-INTERNAL x\n');
+  eq('grep posix', 'grep -c "[[:digit:]]" m.txt', '4\n');
+  // find
+  eq('find rel', 'cd d; find . -type f', './a.log\n./b.txt\n./c.conf\n');
+  eq('find -o', 'find . -name "*.log" -o -name "*.txt"', './a.log\n./b.txt\n');
+  eq('find !', 'find . -type f ! -name "*.log"', './b.txt\n./c.conf\n');
+  eq('find paren', 'find . -type f \\( -name "*.log" -o -name "*.conf" \\)', './a.log\n./c.conf\n');
+  eq('find -exec', 'find . -name "*.txt" -exec cat {} \\;', 'y\n');
+  ok(run('find . -bogus').startsWith('[E]find: unknown predicate'), 'find 不明述語はエラー');
+  // head/tail 旧式
+  eq('head -N', 'cd /home/t; head -3 m.txt', 'alpha 1\nTODO fix\nbeta 2\n');
+  eq('tail -N', 'tail -2 m.txt', 'delta 4\nTODO again\n');
+  ok(run('ls --bogus').includes("Try 'man ls'"), '不明オプションは GNU 形式のエラー');
+}
+
 // ---------- バンドルが最新か検証（node build.mjs の実行忘れを検出） ----------
 function bundleTests() {
   const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -192,6 +249,7 @@ function bundleTests() {
 }
 
 cmdTests();
+engineTests();
 structureTests();
 missionTests();
 bundleTests();

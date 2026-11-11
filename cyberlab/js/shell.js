@@ -409,6 +409,7 @@ export class Shell {
       return typeof r === 'number' ? r : 0;
     } catch (e) {
       if (e instanceof FsError) { ctx.err(`${name}: ${e.path}: ${ERRMSG[e.code] || e.code}\n`); return 1; }
+      if (e && e.name === 'OptError') { ctx.err(`${name}: ${e.message}\nTry 'man ${name}' for more information.\n`); return 2; }
       ctx.err(`${name}: 内部エラー: ${e.message}\n`);
       return 1;
     }
