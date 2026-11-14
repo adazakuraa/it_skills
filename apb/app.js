@@ -172,6 +172,7 @@
         <span class="ex">${esc(examLabel(q.exam))}　問${q.no}${showField && f ? `・${esc(f.short)}` : ''}</span>
         <span class="tt">${esc(q.title || '（要約準備中）')}</span>
         ${q.tags && q.tags.length ? `<span class="tg">${q.tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</span>` : ''}
+        ${p.ck && Object.keys(p.ck).length ? `<span class="ckline"><b class="ok">✓${Object.values(p.ck).filter(v => v === 1).length}</b> <b class="ng">✕${Object.values(p.ck).filter(v => v === 2).length}</b>${p.ckTotal ? ` / ${p.ckTotal}問` : ''}</span>` : ''}
       </span>
       ${p.star ? `<span class="star">${I.starF}</span>` : ''}
     </a>`;
@@ -256,16 +257,46 @@
   }
 
   function summaryBlocks(c, q) {
-    const aim = q && q.aim ? `<div class="card"><h3><span class="dot" style="background:var(--text-3)"></span>出題のねらい（IPA）</h3><p style="font-size:14px;color:var(--text-2)">${rich(q.aim)}</p></div>` : '';
-    if (!c || !c.summary) return aim + '<div class="card"><p>この問題の要約はまだ準備中です。「問題＋解答」タブで原本を確認できます。</p></div>';
+    if (!c || !c.summary) return '<div class="card"><p>この問題の要約はまだ準備中です。「問題＋解答」タブで原本を確認できます。</p></div>';
     const s = c.summary;
+    const story = s.story && s.story.length
+      ? `<div class="card story"><h3><span class="dot"></span>問題の中身</h3>${s.scene ? `<p class="lead">${rich(s.scene)}</p>` : ''}${s.story.map(x => `<section>${x.h ? `<h4>${rich(x.h)}</h4>` : ''}<p>${rich(x.p)}</p></section>`).join('')}</div>`
+      : `${s.scene ? `<div class="card"><h3><span class="dot"></span>どんな問題？</h3><p>${rich(s.scene)}</p></div>` : ''}${s.flow && s.flow.length ? `<div class="card"><h3><span class="dot"></span>本文の流れ</h3><ol class="flow">${s.flow.map(x => `<li>${rich(x)}</li>`).join('')}</ol></div>` : ''}`;
     return `
-      ${s.scene ? `<div class="card"><h3><span class="dot"></span>どんな問題？</h3><p>${rich(s.scene)}</p></div>` : ''}
-      ${aim}
-      ${s.flow && s.flow.length ? `<div class="card"><h3><span class="dot"></span>本文の流れ</h3><ol class="flow">${s.flow.map(x => `<li>${rich(x)}</li>`).join('')}</ol></div>` : ''}
+      ${story}
       ${s.knowledge && s.knowledge.length ? `<div class="card know"><h3><span class="dot"></span>問われる知識</h3><ul>${s.knowledge.map(x => `<li>${rich(x)}</li>`).join('')}</ul></div>` : ''}
       ${s.thinking && s.thinking.length ? `<div class="card think"><h3><span class="dot"></span>頭の使い方・解き方</h3><ul>${s.thinking.map(x => `<li>${rich(x)}</li>`).join('')}</ul></div>` : ''}
       ${s.trap ? `<div class="card trap"><h3><span class="dot" style="background:var(--warn)"></span>つまずきポイント</h3><p>${rich(s.trap)}</p></div>` : ''}`;
+  }
+
+  // テキスト版問題文の簡易マークアップ
+  //   ## 見出し / ［a］=空欄 / __①…__=下線部 / | a | b | =表 / > =図の説明
+  function fmtText(t) {
+    const inline = x => esc(x)
+      .replace(/__(.+?)__/g, '<u class="ul">$1</u>')
+      .replace(/［([^］]{1,4})］/g, '<span class="blank">$1</span>');
+    const out = []; let tbl = [];
+    const flush = () => {
+      if (!tbl.length) return;
+      out.push(`<div class="qt-table"><table>${tbl.map((r, i) => `<tr>${r.map(cl => i === 0 ? `<th>${inline(cl)}</th>` : `<td>${inline(cl)}</td>`).join('')}</tr>`).join('')}</table></div>`);
+      tbl = [];
+    };
+    for (const raw of t.split('\n')) {
+      const line = raw.trimEnd();
+      if (/^\|/.test(line)) {
+        if (/^\|[\s:|-]+\|$/.test(line)) continue;
+        tbl.push(line.replace(/^\||\|$/g, '').split('|').map(x => x.trim()));
+        continue;
+      }
+      flush();
+      if (!line.trim()) continue;
+      if (line.startsWith('## ')) out.push(`<h4>${inline(line.slice(3))}</h4>`);
+      else if (line.startsWith('> ')) out.push(`<div class="qt-fig">${inline(line.slice(2))}</div>`);
+      else if (line.startsWith('- ')) out.push(`<p class="qt-li">${inline(line.slice(2))}</p>`);
+      else out.push(`<p>${inline(line)}</p>`);
+    }
+    flush();
+    return out.join('');
   }
 
   function renderSummary(body, q, c, prev, next) {
@@ -320,7 +351,7 @@
           <div class="mini"><button data-r="30">解答を広く</button><button data-sheet>要約</button></div>
         </div>
         <section class="pane pane-a" id="paneA" aria-label="設問と解答">
-          ${answerList(c)}
+          ${answerList(c, q.id)}
         </section>
       </div>`;
 
@@ -364,7 +395,7 @@
     });
     div.querySelector('[data-sheet]').onclick = () => openSheet(q, c);
 
-    bindAnswers(body, paneQ, st);
+    bindAnswers(body, paneQ, st, q.id);
 
     // 画像がない回は、テキスト版の問題文を表示する（図表は崩れている）
     if (!st && q.text) {
@@ -372,17 +403,18 @@
         const box = body.querySelector('#noimg');
         if (!box) return;
         box.className = 'qtext';
-        box.innerHTML = `<p class="qtext-note">画像版は未収録のため、テキスト版を表示しています（図表は崩れています）。</p>${esc(t)}`;
+        box.innerHTML = `<p class="qtext-note">原本画像が未収録のため、問題文を書き起こしたテキストを表示しています。図は文章で説明しています。四角の枠は空欄、下線は下線部です。</p>${fmtText(t)}`;
       }).catch(() => {});
     }
   }
 
-  function answerList(c) {
+  function answerList(c, id) {
+    const ck = getQ(id).ck || {};
     if (!c || !c.answers || !c.answers.length) {
       return `<div class="alist"><div class="empty">この問題の解答・解説はまだ準備中です</div></div>`;
     }
     return `<div class="alist">
-      <div class="atool"><span class="lab">設問と解答例</span>
+      <div class="atool"><span class="lab">設問と解答例</span><span class="ck-sum" id="cksum"></span>
         <button class="toggle ${pref.hide ? 'on' : ''}" id="hide"><span>答えを隠す</span><span class="sw"></span></button>
       </div>
       ${c.answers.map((sq, si) => `
@@ -390,11 +422,14 @@
           <h4>${esc(sq.q)}${sq.note ? `<span class="note">${esc(sq.note)}</span>` : ''}</h4>
           ${(sq.sub || []).map((a, ai) => `
             <div class="ans ${pref.hide ? 'hide' : ''}" data-k="${si}-${ai}">
+              <div class="ans-row">
+              <button class="ck s${ck[si + '-' + ai] || 0}" data-ck="${si}-${ai}" aria-label="自己採点（未・正解・不正解を切り替え）"></button>
               <button class="ans-h">
                 <span class="lb">${esc(a.label || '')}</span>
                 <span class="ask">${rich(a.ask || '')}</span>
                 ${a.page ? `<span class="pg" data-page="${a.page}">p${a.page}</span>` : ''}
               </button>
+              </div>
               <div class="ans-b">
                 <div class="a">${rich(a.ans)}</div>
                 ${a.why ? `<div class="why">${rich(a.why)}</div>` : ''}
@@ -405,7 +440,25 @@
     </div>`;
   }
 
-  function bindAnswers(root, paneQ, st) {
+  function bindAnswers(root, paneQ, st, id) {
+    const sum = root.querySelector('#cksum');
+    const total = root.querySelectorAll('.ck').length;
+    const showSum = () => {
+      if (!sum) return;
+      const ck = getQ(id).ck || {};
+      const ok = Object.values(ck).filter(v => v === 1).length, ng = Object.values(ck).filter(v => v === 2).length;
+      sum.innerHTML = ok || ng ? `<b class="ok">✓${ok}</b> <b class="ng">✕${ng}</b> / ${total}` : '';
+    };
+    showSum();
+    root.querySelectorAll('.ck').forEach(b => b.onclick = () => {
+      const p = qp(id); p.ck ||= {};
+      const v = ((p.ck[b.dataset.ck] || 0) + 1) % 3;
+      if (v) p.ck[b.dataset.ck] = v; else delete p.ck[b.dataset.ck];
+      p.ckTotal = total;
+      commit();
+      b.className = `ck s${v}`;
+      showSum();
+    });
     const hideBtn = root.querySelector('#hide');
     if (hideBtn) hideBtn.onclick = () => {
       setPref('hide', !pref.hide);

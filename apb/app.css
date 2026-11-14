@@ -209,7 +209,7 @@ svg.i { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-widt
 .paper img { display: block; width: 100%; height: auto; filter: var(--paper-filter); }
 .paper figcaption { position: absolute; top: 6px; left: 6px; font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 6px; background: rgba(30,33,38,.6); color: #fff; font-family: var(--mono); }
 .paper:has(.qtext) { width: 100%; }
-.paper .qtext { background: var(--surface); color: var(--text); padding: 14px; border-radius: 6px; white-space: pre-wrap; font-size: calc(13px * var(--zoom, 1)); line-height: 1.75; }
+.paper .qtext { background: var(--surface); color: var(--text); padding: 14px; border-radius: 6px; font-size: calc(13px * var(--zoom, 1)); line-height: 1.75; }
 .paper .qtext-note { margin: 0 0 10px; font-size: 12px; color: var(--warn); white-space: normal; }
 .paper .noimg { padding: 30px 16px; text-align: center; color: var(--text-3); font-size: 13px; }
 .qwrap { position: relative; min-height: 0; display: flex; flex: 0 0 var(--ratio, 55%); }
@@ -263,3 +263,36 @@ svg.i { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-widt
   .divider .mini button { padding: 4px 0; height: auto; writing-mode: vertical-rl; }
   .fields { grid-template-columns: repeat(3, 1fr); }
 }
+
+/* 設問ごとの自己採点 */
+.ans-row { display: flex; align-items: flex-start; }
+.ans-row .ans-h { flex: 1; min-width: 0; padding-left: 4px; }
+.ck { flex: none; width: 30px; height: 30px; margin: 8px 0 0 8px; border-radius: 50%; border: 2px solid var(--line-strong); display: grid; place-items: center; font-weight: 800; font-size: 15px; color: transparent; }
+.ck::after { content: "✓"; }
+.ck.s1 { background: var(--ok); border-color: var(--ok); color: #fff; }
+.ck.s2 { background: var(--red); border-color: var(--red); color: #fff; }
+.ck.s2::after { content: "✕"; }
+.ck:focus-visible, .ans-h:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.ans-b { padding-left: 50px; }
+.ck-sum { font-size: 12px; color: var(--text-3); }
+.ck-sum b, .ckline b { font-weight: 800; }
+.ok { color: var(--ok); } .ng { color: var(--red); }
+.ckline { display: block; margin-top: 4px; font-size: 12px; color: var(--text-3); }
+
+/* 問題の中身 */
+.story .lead { font-weight: 600; margin-bottom: 4px; }
+.story section { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.story h4 { margin: 0 0 4px; font-size: 13.5px; color: var(--ink); font-weight: 800; }
+.story p { font-size: 14.5px; line-height: 1.85; }
+
+/* テキスト版問題文 */
+.paper .qtext p { margin: 0 0 .7em; }
+.paper .qtext h4 { margin: 1.2em 0 .5em; font-size: 1em; font-weight: 800; }
+.paper .qtext .qt-li { padding-left: 1em; text-indent: -1em; }
+.paper .qtext .blank { display: inline-block; min-width: 2.2em; padding: 0 .4em; margin: 0 .15em; border: 1.5px solid var(--text); text-align: center; font-weight: 700; line-height: 1.4; }
+.paper .qtext .ul { text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 3px; }
+.paper .qtext .qt-fig { margin: .4em 0 .9em; padding: 10px 12px; border-radius: 6px; background: var(--surface-2); font-size: .92em; color: var(--text-2); }
+.paper .qtext .qt-table { overflow-x: auto; margin: .4em 0 1em; }
+.paper .qtext table { border-collapse: collapse; font-size: .9em; }
+.paper .qtext th, .paper .qtext td { border: 1px solid var(--line-strong); padding: 4px 8px; vertical-align: top; text-align: left; }
+.paper .qtext th { background: var(--surface-2); }
