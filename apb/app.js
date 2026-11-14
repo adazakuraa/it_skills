@@ -305,7 +305,7 @@
         <div class="qwrap"><section class="pane pane-q" id="paneQ" aria-label="問題文">
           <div class="paper" id="paper" style="--zoom:${zoomLv[z]}">
             ${pages.length ? pages.map((pg, i) => `<figure id="pg${i + 1}"><img src="${esc(pg.src)}" width="${pg.w}" height="${pg.h}" loading="${i < 2 ? 'eager' : 'lazy'}" alt="問題 ${i + 1}ページ目"><figcaption>p${i + 1}/${pages.length}</figcaption></figure>`).join('')
-              : '<div class="noimg">問題文の画像がありません</div>'}
+              : `<div class="noimg" id="noimg">${q.text ? '問題文（テキスト版）を読み込み中…' : 'この回の問題冊子の画像は未収録です。IPAの過去問題ページで原本PDFを確認してください。<br><a href="https://www.ipa.go.jp/shiken/mondai-kaiotu/index.html" target="_blank" rel="noopener">IPA 過去問題ページ</a>'}</div>`}
           </div>
         </section>
         <div class="zoom">
@@ -364,6 +364,16 @@
     div.querySelector('[data-sheet]').onclick = () => openSheet(q, c);
 
     bindAnswers(body, paneQ);
+
+    // 画像がない回は、テキスト版の問題文を表示する（図表は崩れている）
+    if (!pages.length && q.text) {
+      fetch(`data/text/${q.id}.txt`).then(r => r.ok ? r.text() : Promise.reject()).then(t => {
+        const box = body.querySelector('#noimg');
+        if (!box) return;
+        box.className = 'qtext';
+        box.innerHTML = `<p class="qtext-note">画像版は未収録のため、テキスト版を表示しています（図表は崩れています）。</p>${esc(t)}`;
+      }).catch(() => {});
+    }
   }
 
   function answerList(c) {

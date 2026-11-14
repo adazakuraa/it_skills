@@ -18,6 +18,8 @@ def main():
         exam, no = qid.split("-q")
         item = {"id": qid, "exam": exam, "no": int(no), "title": "", "tags": [], "pages": pages.get(qid, []),
                 "aim": aims.get(qid, "")}
+        if (DATA / "text" / f"{qid}.txt").exists():
+            item["text"] = True
         f = DATA / "q" / f"{qid}.json"
         if f.exists():
             c = json.loads(f.read_text())
