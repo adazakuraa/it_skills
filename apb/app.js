@@ -473,7 +473,7 @@
         if (fig && st && st.cuts[k] !== undefined) paneQ.scrollTo({ top: fig.offsetTop + fig.offsetHeight * st.cuts[k] / st.h - 8, behavior: 'smooth' });
         return;
       }
-      h.parentElement.classList.toggle('hide');
+      h.closest('.ans').classList.toggle('hide');
     });
   }
 
