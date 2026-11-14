@@ -5,7 +5,7 @@
 
   python3 -I apb/tools/pack.py && python3 -I apb/tools/catalog.py
 """
-import json
+import json, sys
 from pathlib import Path
 from PIL import Image
 
@@ -16,7 +16,9 @@ W, GAP, MAXH = 1400, 24, 16000
 
 def main():
     pages = json.loads((DATA / "pages.json").read_text())
-    stacks = {}
+    if "--bundle-only" in sys.argv:  # ページ画像なしで解説・本文だけ詰め直す
+        pages = {}
+    stacks = json.loads((DATA / "stacks.json").read_text()) if not pages else {}
     out = ROOT / "img" / "stack"
     out.mkdir(parents=True, exist_ok=True)
     for qid, ps in sorted(pages.items()):
@@ -35,7 +37,8 @@ def main():
             cuts = [round(c * r) for c in cuts]
         canvas.save(out / f"{qid}.webp", "WEBP", quality=70, method=6)
         stacks[qid] = {"src": f"img/stack/{qid}.webp", "w": canvas.width, "h": canvas.height, "cuts": cuts}
-    (DATA / "stacks.json").write_text(json.dumps(stacks, ensure_ascii=False, separators=(",", ":")))
+    if pages:
+        (DATA / "stacks.json").write_text(json.dumps(stacks, ensure_ascii=False, separators=(",", ":")))
     bundle = {"content": {}, "text": {}}
     for f in sorted((DATA / "q").glob("*.json")):
         bundle["content"][f.stem] = json.loads(f.read_text())
