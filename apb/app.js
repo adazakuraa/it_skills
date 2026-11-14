@@ -254,15 +254,17 @@
     else renderSummary(body, q, c, prev, next);
   }
 
-  function summaryBlocks(c) {
-    if (!c || !c.summary) return '<div class="card"><p>この問題の要約はまだ準備中です。「問題＋解答」タブで原本を確認できます。</p></div>';
+  function summaryBlocks(c, q) {
+    const aim = q && q.aim ? `<div class="card"><h3><span class="dot" style="background:var(--text-3)"></span>出題のねらい（IPA）</h3><p style="font-size:14px;color:var(--text-2)">${rich(q.aim)}</p></div>` : '';
+    if (!c || !c.summary) return aim + '<div class="card"><p>この問題の要約はまだ準備中です。「問題＋解答」タブで原本を確認できます。</p></div>';
     const s = c.summary;
     return `
       ${s.scene ? `<div class="card"><h3><span class="dot"></span>どんな問題？</h3><p>${rich(s.scene)}</p></div>` : ''}
+      ${aim}
       ${s.flow && s.flow.length ? `<div class="card"><h3><span class="dot"></span>本文の流れ</h3><ol class="flow">${s.flow.map(x => `<li>${rich(x)}</li>`).join('')}</ol></div>` : ''}
       ${s.knowledge && s.knowledge.length ? `<div class="card know"><h3><span class="dot"></span>問われる知識</h3><ul>${s.knowledge.map(x => `<li>${rich(x)}</li>`).join('')}</ul></div>` : ''}
       ${s.thinking && s.thinking.length ? `<div class="card think"><h3><span class="dot"></span>頭の使い方・解き方</h3><ul>${s.thinking.map(x => `<li>${rich(x)}</li>`).join('')}</ul></div>` : ''}
-      ${s.trap ? `<div class="card trap"><h3><span class="dot" style="background:var(--warn)"></span>採点講評より：つまずきポイント</h3><p>${rich(s.trap)}</p></div>` : ''}`;
+      ${s.trap ? `<div class="card trap"><h3><span class="dot" style="background:var(--warn)"></span>つまずきポイント</h3><p>${rich(s.trap)}</p></div>` : ''}`;
   }
 
   function renderSummary(body, q, c, prev, next) {
@@ -271,7 +273,7 @@
       <div class="sumview"><div class="wrap">
         <h2 class="sum-title">${esc(q.title || '（要約準備中）')}</h2>
         ${q.tags && q.tags.length ? `<div class="sum-meta">${q.tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
-        ${summaryBlocks(c)}
+        ${summaryBlocks(c, q)}
         <button class="cta" id="go">問題と解答を並べて見る ${I.next}</button>
         <div class="card">
           <h3><span class="dot" style="background:var(--text-3)"></span>理解度</h3>
@@ -413,7 +415,7 @@
   function openSheet(q, c) {
     const bg = document.createElement('div'); bg.className = 'sheet-bg';
     const sh = document.createElement('div'); sh.className = 'sheet';
-    sh.innerHTML = `<div class="handle"></div><h2 class="sum-title" style="font-size:16px">${esc(q.title || '')}</h2>${summaryBlocks(c)}`;
+    sh.innerHTML = `<div class="handle"></div><h2 class="sum-title" style="font-size:16px">${esc(q.title || '')}</h2>${summaryBlocks(c, q)}`;
     const close = () => { bg.remove(); sh.remove(); };
     bg.onclick = close;
     let y0 = null;
