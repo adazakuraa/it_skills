@@ -11,12 +11,13 @@ DATA = Path(__file__).resolve().parents[1] / "data"
 
 def main():
     pages = json.loads((DATA / "pages.json").read_text()) if (DATA / "pages.json").exists() else {}
+    stacks = json.loads((DATA / "stacks.json").read_text()) if (DATA / "stacks.json").exists() else {}
     aims = json.loads((DATA / "aims.json").read_text()) if (DATA / "aims.json").exists() else {}
     ids = set(pages) | set(aims) | {p.stem for p in (DATA / "q").glob("*.json")}
     cat = []
     for qid in sorted(ids):
         exam, no = qid.split("-q")
-        item = {"id": qid, "exam": exam, "no": int(no), "title": "", "tags": [], "pages": pages.get(qid, []),
+        item = {"id": qid, "exam": exam, "no": int(no), "title": "", "tags": [], "stack": stacks.get(qid),
                 "aim": aims.get(qid, "")}
         if (DATA / "text" / f"{qid}.txt").exists():
             item["text"] = True

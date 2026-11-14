@@ -46,11 +46,11 @@
   const examLabel = id => (DB.exams.find(e => e.id === id) || { label: id }).label;
   const fieldOf = no => DB.fields.find(f => f.no === no);
   const inField = no => DB.cat.filter(q => q.no === no);
+  let bundleP = null;
+  const bundle = () => (bundleP ||= getJSON('data/bundle.json').catch(() => ({ content: {}, text: {} })));
   async function content(id) {
-    if (DB.content[id] !== undefined) return DB.content[id];
-    const c = await getJSON(`data/q/${id}.json`).catch(() => null);
-    DB.content[id] = c;
-    return c;
+    const b = await bundle();
+    return b.content[id] || null;
   }
 
   // ---------- helpers ----------
@@ -91,13 +91,14 @@
   let cleanup = null;
   function route() {
     if (cleanup) { cleanup(); cleanup = null; }
-    const h = location.hash.replace(/^#\/?/, '');
-    const [a, b, c] = h.split('/');
+    // ルート例: #f-3 / #e-r06a / #q-r06a-q01 / #q-r06a-q01-split / #prefs
+    const h = decodeURIComponent(location.hash.replace(/^#/, ''));
     document.body.style.overflow = '';
-    if (a === 'f' && b) return viewField(+b);
-    if (a === 'e' && b) return viewExam(b);
-    if (a === 'q' && b) return viewQuestion(b, c || 'sum');
-    if (a === 'settings') return viewSettings();
+    let m;
+    if ((m = h.match(/^f-(\d+)$/))) return viewField(+m[1]);
+    if ((m = h.match(/^e-([a-z0-9]+)$/))) return viewExam(m[1]);
+    if ((m = h.match(/^q-([a-z0-9]+-q\d+)(-split)?$/))) return viewQuestion(m[1], m[2] ? 'split' : 'sum');
+    if (h === 'prefs') return viewSettings();
     return viewHome();
   }
 
@@ -108,7 +109,7 @@
     const tab = pref.homeTab;
     const fieldsHtml = DB.fields.map(f => {
       const st = stats(inField(f.no));
-      return `<a class="fcard" href="#/f/${f.no}">
+      return `<a class="fcard" href="#f-${f.no}">
         <span class="no">問${f.no}${f.required ? '<em>必須</em>' : ''}</span>
         <span class="nm">${esc(f.name)}</span>
         <span class="ct">${st.ok}/${st.n} 理解${st.re ? ` ・ 復習${st.re}` : ''}</span>
@@ -117,13 +118,13 @@
     }).join('');
     const examsHtml = DB.exams.map(e => {
       const st = stats(DB.cat.filter(q => q.exam === e.id));
-      return `<a class="erow" href="#/e/${e.id}"><b>${esc(e.label)}</b><small>${st.ok}/${st.n}</small>${I.next}</a>`;
+      return `<a class="erow" href="#e-${e.id}"><b>${esc(e.label)}</b><small>${st.ok}/${st.n}</small>${I.next}</a>`;
     }).join('') || '<div class="empty">まだ過去問データがありません</div>';
     const stars = DB.cat.filter(q => getQ(q.id).star);
     const reviews = DB.cat.filter(q => getQ(q.id).s === 1);
 
     $app.innerHTML = `
-      ${bar('AP科目B 過去問ノート', '', '', `<a class="icon-btn" href="#/settings" aria-label="設定">${I.gear}</a>`)}
+      ${bar('AP科目B 過去問ノート', '', '', `<a class="icon-btn" href="#prefs" aria-label="設定">${I.gear}</a>`)}
       <main class="wrap">
         <section class="hero">
           <div class="kicker">応用情報技術者 科目B（午後）</div>
@@ -135,7 +136,7 @@
           ${track(all)}
           <div class="legend"><span style="--c:var(--ok)">理解した ${all.ok}</span><span style="--c:var(--warn)">要復習 ${all.re}</span></div>
         </div>
-        ${last ? `<a class="resume" href="#/q/${last.id}">
+        ${last ? `<a class="resume" href="#q-${last.id}">
           <div><div class="lab">続きから</div><div class="t">${esc(examLabel(last.exam))} 問${last.no}　${esc(last.title)}</div></div>${I.next}</a>` : ''}
 
         <div class="sec-h">
@@ -165,7 +166,7 @@
   function qRow(q, showField = true) {
     const p = getQ(q.id);
     const f = fieldOf(q.no);
-    return `<a class="qrow" href="#/q/${q.id}">
+    return `<a class="qrow" href="#q-${q.id}">
       <span class="st s${p.s}" aria-label="${STATUS[p.s]}"></span>
       <span class="mid">
         <span class="ex">${esc(examLabel(q.exam))}　問${q.no}${showField && f ? `・${esc(f.short)}` : ''}</span>
@@ -190,7 +191,7 @@
     });
     const fl = [['all', `すべて ${list.length}`], ['todo', '未学習'], ['re', '要復習'], ['ok', '理解した'], ['star', '★']];
     $app.innerHTML = `
-      ${bar(`問${f.no} ${f.name}`, `${st.ok}/${st.n} 理解した`, '#/')}
+      ${bar(`問${f.no} ${f.name}`, `${st.ok}/${st.n} 理解した`, '#home')}
       <main class="wrap">
         <section class="fhead">
           <div class="no">問${f.no}${f.required ? '・必須' : '・選択'}</div>
@@ -214,7 +215,7 @@
   function viewExam(eid) {
     const list = DB.cat.filter(q => q.exam === eid);
     $app.innerHTML = `
-      ${bar(examLabel(eid), `${list.length}問`, '#/')}
+      ${bar(examLabel(eid), `${list.length}問`, '#home')}
       <main class="wrap" style="padding-top:14px"><div class="qlist">${list.map(q => qRow(q)).join('')}</div></main>`;
     window.scrollTo(0, 0);
   }
@@ -234,7 +235,7 @@
     document.body.style.overflow = 'hidden';
     $app.innerHTML = `
       <div class="qpage">
-        ${bar(`${examLabel(q.exam)} 問${q.no}`, f ? f.name : '', `#/f/${q.no}`,
+        ${bar(`${examLabel(q.exam)} 問${q.no}`, f ? f.name : '', `#f-${q.no}`,
           `<button class="icon-btn ${p.star ? 'on' : ''}" id="star" aria-label="お気に入り">${p.star ? I.starF : I.star}</button>`)}
         <nav class="tabs">
           <button data-m="sum" class="${mode === 'sum' ? 'on' : ''}">① 要約</button>
@@ -248,7 +249,7 @@
       e.currentTarget.innerHTML = s.star ? I.starF : I.star;
       toast(s.star ? '★ に追加しました' : '★ を外しました');
     };
-    $app.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { history.replaceState(null, '', `#/q/${id}/${b.dataset.m}`); route(); });
+    $app.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { history.replaceState(null, '', `#q-${id}${b.dataset.m === 'split' ? '-split' : ''}`); route(); });
     const body = $app.querySelector('#qbody');
     if (mode === 'split') renderSplit(body, q, c);
     else renderSummary(body, q, c, prev, next);
@@ -282,12 +283,12 @@
           <textarea class="memo" id="memo" placeholder="間違えた理由、覚えておきたい用語など">${esc(p.memo)}</textarea>
         </div>
         <div class="pager">
-          ${prev ? `<a href="#/q/${prev.id}"><small>← 新しい回</small>${esc(examLabel(prev.exam))}</a>` : '<span class="ph"></span>'}
-          ${next ? `<a class="next" href="#/q/${next.id}"><small>古い回 →</small>${esc(examLabel(next.exam))}</a>` : '<span class="ph"></span>'}
+          ${prev ? `<a href="#q-${prev.id}"><small>← 新しい回</small>${esc(examLabel(prev.exam))}</a>` : '<span class="ph"></span>'}
+          ${next ? `<a class="next" href="#q-${next.id}"><small>古い回 →</small>${esc(examLabel(next.exam))}</a>` : '<span class="ph"></span>'}
         </div>
         <p class="src">出典：IPA ${esc(examLabel(q.exam))} 応用情報技術者試験 午後 問${q.no}</p>
       </div></div>`;
-    body.querySelector('#go').onclick = () => { history.replaceState(null, '', `#/q/${q.id}/split`); route(); };
+    body.querySelector('#go').onclick = () => { history.replaceState(null, '', `#q-${q.id}-split`); route(); };
     body.querySelectorAll('[data-s]').forEach(b => b.onclick = () => {
       qp(q.id).s = +b.dataset.s; commit();
       body.querySelectorAll('[data-s]').forEach(x => x.classList.toggle('on', x === b));
@@ -297,14 +298,14 @@
   }
 
   function renderSplit(body, q, c) {
-    const pages = q.pages || [];
+    const st = q.stack;
     const zoomLv = [1, 1.35, 1.7, 2.2];
     let z = Math.max(0, zoomLv.indexOf(pref.zoom));
     body.innerHTML = `
       <div class="split" id="split" style="--ratio:${pref.ratio}%">
         <div class="qwrap"><section class="pane pane-q" id="paneQ" aria-label="問題文">
           <div class="paper" id="paper" style="--zoom:${zoomLv[z]}">
-            ${pages.length ? pages.map((pg, i) => `<figure id="pg${i + 1}"><img src="${esc(pg.src)}" width="${pg.w}" height="${pg.h}" loading="${i < 2 ? 'eager' : 'lazy'}" alt="問題 ${i + 1}ページ目"><figcaption>p${i + 1}/${pages.length}</figcaption></figure>`).join('')
+            ${st ? `<figure id="stackfig"><img src="${esc(st.src)}" width="${st.w}" height="${st.h}" alt="問題文（全${st.cuts.length}ページ）">${st.cuts.map((c, i) => `<figcaption style="top:calc(${(c / st.h * 100).toFixed(3)}% + 6px)">p${i + 1}/${st.cuts.length}</figcaption>`).join('')}</figure>`
               : `<div class="noimg" id="noimg">${q.text ? '問題文（テキスト版）を読み込み中…' : 'この回の問題冊子の画像は未収録です。IPAの過去問題ページで原本PDFを確認してください。<br><a href="https://www.ipa.go.jp/shiken/mondai-kaiotu/index.html" target="_blank" rel="noopener">IPA 過去問題ページ</a>'}</div>`}
           </div>
         </section>
@@ -363,11 +364,11 @@
     });
     div.querySelector('[data-sheet]').onclick = () => openSheet(q, c);
 
-    bindAnswers(body, paneQ);
+    bindAnswers(body, paneQ, st);
 
     // 画像がない回は、テキスト版の問題文を表示する（図表は崩れている）
-    if (!pages.length && q.text) {
-      fetch(`data/text/${q.id}.txt`).then(r => r.ok ? r.text() : Promise.reject()).then(t => {
+    if (!st && q.text) {
+      bundle().then(b => b.text[q.id] || Promise.reject()).then(t => {
         const box = body.querySelector('#noimg');
         if (!box) return;
         box.className = 'qtext';
@@ -404,7 +405,7 @@
     </div>`;
   }
 
-  function bindAnswers(root, paneQ) {
+  function bindAnswers(root, paneQ, st) {
     const hideBtn = root.querySelector('#hide');
     if (hideBtn) hideBtn.onclick = () => {
       setPref('hide', !pref.hide);
@@ -414,8 +415,9 @@
     root.querySelectorAll('.ans-h').forEach(h => h.onclick = e => {
       const pg = e.target.closest('[data-page]');
       if (pg && paneQ) {
-        const fig = paneQ.querySelector(`#pg${pg.dataset.page}`);
-        if (fig) paneQ.scrollTo({ top: fig.offsetTop - 8, behavior: 'smooth' });
+        const fig = paneQ.querySelector('#stackfig');
+        const k = +pg.dataset.page - 1;
+        if (fig && st && st.cuts[k] !== undefined) paneQ.scrollTo({ top: fig.offsetTop + fig.offsetHeight * st.cuts[k] / st.h - 8, behavior: 'smooth' });
         return;
       }
       h.parentElement.classList.toggle('hide');
@@ -439,7 +441,7 @@
   function viewSettings() {
     const opt = (k, v, l) => `<button data-k="${k}" data-v="${v}" class="${pref[k] === v ? 'on' : ''}">${l}</button>`;
     $app.innerHTML = `
-      ${bar('設定', '', '#/')}
+      ${bar('設定', '', '#home')}
       <main class="wrap">
         <div class="card"><h3>表示テーマ</h3>
           <div class="seg">${opt('theme', 'auto', '自動')}${opt('theme', 'light', 'ライト')}${opt('theme', 'dark', 'ダーク')}</div>
@@ -450,29 +452,34 @@
         <div class="card"><h3>学習データ</h3>
           <p style="font-size:13px;color:var(--text-2)">進捗・メモはこの端末のブラウザに保存されています。機種変更やブラウザのデータ削除の前にバックアップしてください。</p>
           <div class="foot" style="border:0;margin:10px 0 0;padding:0"><div class="btns">
-            <button class="chip-btn" id="exp">バックアップを保存</button>
-            <label class="chip-btn">バックアップから復元<input type="file" id="imp" accept="application/json" hidden></label>
+            <button class="chip-btn" id="exp">バックアップをコピー</button>
+            <button class="chip-btn" id="impBtn">貼り付けて復元</button>
             <button class="chip-btn" id="reset" style="color:var(--red)">進捗をリセット</button>
           </div></div>
+          <textarea class="memo" id="bk" placeholder="ここにバックアップのテキストが表示されます。復元するときは、保存しておいたテキストを貼り付けて「貼り付けて復元」を押してください。"></textarea>
         </div>
       </main>`;
     $app.querySelectorAll('[data-k]').forEach(b => b.onclick = () => { setPref(b.dataset.k, b.dataset.v); applyTheme(); viewSettings(); });
+    const bk = $app.querySelector('#bk');
     $app.querySelector('#exp').onclick = () => {
-      const blob = new Blob([JSON.stringify(prog, null, 1)], { type: 'application/json' });
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-      a.download = `apb-progress-${new Date().toISOString().slice(0, 10)}.json`; a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    };
-    $app.querySelector('#imp').onchange = async e => {
-      const file = e.target.files[0]; if (!file) return;
+      bk.value = JSON.stringify(prog);
+      bk.select();
       try {
-        const d = JSON.parse(await file.text());
+        navigator.clipboard.writeText(bk.value).then(() => toast('コピーしました。メモアプリなどに保存してください'), () => toast('テキストを選択しました。長押しでコピーしてください'));
+      } catch { toast('テキストを選択しました。長押しでコピーしてください'); }
+    };
+    $app.querySelector('#impBtn').onclick = () => {
+      try {
+        const d = JSON.parse(bk.value);
         if (!d || typeof d.q !== 'object') throw 0;
         prog = d; commit(); toast('復元しました');
-      } catch { toast('ファイルを読み込めませんでした'); }
+      } catch { toast('復元できませんでした。バックアップのテキストを全部貼り付けてください'); }
     };
-    $app.querySelector('#reset').onclick = () => {
-      if (confirm('すべての進捗とメモを消去します。よろしいですか？')) { prog = { q: {}, last: null }; commit(); toast('リセットしました'); }
+    let armed = false;
+    const rs = $app.querySelector('#reset');
+    rs.onclick = () => {
+      if (!armed) { armed = true; rs.textContent = 'もう一度押すと全て消去'; setTimeout(() => { armed = false; rs.textContent = '進捗をリセット'; }, 4000); return; }
+      prog = { q: {}, last: null }; commit(); toast('リセットしました'); armed = false; rs.textContent = '進捗をリセット';
     };
     window.scrollTo(0, 0);
   }
