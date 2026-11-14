@@ -11,8 +11,12 @@
 - apb/data/pages.json に「問ID → 画像パス一覧」を書き出す
 """
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -24,7 +28,7 @@ DATA = ROOT / "data"
 
 NAME_RE = re.compile(r"(\d{4})([hr]\d{2})([hao])_ap_pm_(qs|ans|cmnt)\.pdf$", re.I)
 SEASON = {"h": "春期", "a": "秋期", "o": "10月"}
-START_RE = re.compile(r"^\s*問\s*([1-9]|1[01])\s*[　 ]*(次の|[^\d\s])")
+START_RE = re.compile(r"^\s*[問間門閑]\s*([1-9]|1[01])\s+\S.{0,80}?(次の記述|設問に答え|読んで)")
 TARGET_W = 1400  # 画像の横幅(px)。拡大表示しても文字が潰れない程度
 
 
@@ -43,33 +47,54 @@ def exam_label(m):
     return f"{name} {SEASON[m.group(3).lower()]}"
 
 
-def page_texts(pdf):
-    out = []
-    for i in range(len(pdf)):
-        tp = pdf[i].get_textpage()
-        out.append(tp.get_text_range())
+def ocr_page(pdf_path, i):
+    """テキストを持たないページ(IPAの問題冊子は画像のみ)をtesseractで読み取る。"""
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["pdftoppm", "-f", str(i + 1), "-l", str(i + 1), "-r", "300", "-gray",
+                        "-png", "-singlefile", str(pdf_path), f"{d}/p"], check=True)
+        try:
+            r = subprocess.run(["tesseract", f"{d}/p.png", "-", "-l", "jpn", "--psm", "6"],
+                               capture_output=True, text=True, timeout=45,
+                               env={**os.environ, "OMP_THREAD_LIMIT": "1"})
+            return r.stdout
+        except subprocess.TimeoutExpired:
+            return ""
+
+
+def page_texts(pdf, pdf_path, cache):
+    out = [pdf[i].get_textpage().get_text_range() for i in range(len(pdf))]
+    if sum(len(t.strip()) for t in out) > 200 * len(out) / 10:
+        return out
+    if cache.exists():
+        return json.loads(cache.read_text())
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
+        out = list(ex.map(lambda i: ocr_page(pdf_path, i), range(len(pdf))))
+    cache.write_text(json.dumps(out, ensure_ascii=False))
     return out
 
 
+HEAD_RE = re.compile(r"^\s*[問間門閑]\s*[0-9Il|]{1,2}\s*\S.{0,60}?(に関する|次の記述|読んで)")
+SELECT_RE = re.compile(r"囲んで解答して|4\s*問を選択|問\s*2\s*[~〜ー-]")
+
+
 def split_questions(texts):
-    """各ページの先頭付近にある「問N 次の…」を探して、問ごとのページ範囲を返す。"""
-    starts = {}
+    """各ページの先頭数行から「問N …に関する次の記述を読んで」を探して問ごとのページ範囲を返す。
+    OCRで番号が化けることがあるので、見つかった開始ページを順番に問1〜問11へ割り当てる。"""
+    cands = []
     for i, t in enumerate(texts):
-        head = "\n".join(t.splitlines()[:6])
-        for line in head.splitlines():
-            m = START_RE.match(line)
-            if m:
-                n = int(m.group(1))
-                if n not in starts:
-                    starts[n] = i
-                break
+        lines = [l for l in t.splitlines() if l.strip()][:3]
+        joined = [lines[j] + "".join(lines[j + 1:j + 2]) for j in range(len(lines))]
+        if any(HEAD_RE.match(l) for l in joined):
+            cands.append(i)
+        elif i > 3 and any(SELECT_RE.search(l) for l in lines[:2]) and not any("[問題一" in l for l in lines):
+            cands.append(i)  # 「次の問2〜問11については4問を選択し…」で始まる問2のページ
+    cands = sorted(set(cands))
+    if len(cands) != 11:
+        print("  !! 開始ページ候補が11個ではありません:", [c + 1 for c in cands])
     ranges = {}
-    nums = sorted(starts)
-    for k, n in enumerate(nums):
-        a = starts[n]
-        b = starts[nums[k + 1]] if k + 1 < len(nums) else len(texts)
-        pages = [p for p in range(a, b) if is_content(texts[p])]
-        ranges[n] = pages
+    for k, a in enumerate(cands[:11]):
+        b = cands[k + 1] if k + 1 < len(cands) else len(texts)
+        ranges[k + 1] = [p for p in range(a, b) if is_content(texts[p])]
     return ranges
 
 
@@ -77,8 +102,8 @@ def is_content(t):
     s = re.sub(r"\s+", "", t)
     if len(s) < 40:
         return False
-    for ng in ("メモ用紙", "このページは白紙", "〔問題一覧〕", "試験時間", "注意事項"):
-        if ng in s and len(s) < 1500:
+    for ng in ("メモ用紙", "メモ用", "モ用紙", "このページは白紙", "問題一覧", "試験時間", "注意事項", "退室可能時間"):
+        if ng in s[:40] or (ng in s and len(s) < 300):
             return False
     return True
 
@@ -87,8 +112,27 @@ def render(pdf, idx, dest):
     page = pdf[idx]
     scale = TARGET_W / page.get_width() * 1.15
     img = page.render(scale=scale).to_pil().convert("L")
-    # 余白をトリミング(薄いグレーまで白とみなす)
+    # スキャン時に端にできる黒い帯を白で塗りつぶしてから、余白をトリミングする
     inv = ImageOps.invert(img).point(lambda v: 255 if v > 30 else 0)
+    w, h = inv.size
+    cols = inv.resize((w, 1), Image.BOX).load()
+    rows = inv.resize((1, h), Image.BOX).load()
+    l = 0
+    while l < w // 10 and cols[l, 0] > 100:
+        l += 1
+    r = w
+    while r > w - w // 10 and cols[r - 1, 0] > 100:
+        r -= 1
+    t = 0
+    while t < h // 10 and rows[0, t] > 100:
+        t += 1
+    b = h
+    while b > h - h // 10 and rows[0, b - 1] > 100:
+        b -= 1
+    # 帯の内側に残る薄い縁も避けるため数px余分に削る
+    m = 6
+    inv = inv.crop((l + (m if l else 0), t + (m if t else 0), r - (m if r < w else 0), b - (m if b < h else 0)))
+    img = img.crop((l + (m if l else 0), t + (m if t else 0), r - (m if r < w else 0), b - (m if b < h else 0)))
     box = inv.getbbox()
     if box:
         pad = 24
@@ -121,7 +165,7 @@ def main():
         exams[eid] = {"id": eid, "label": exam_label(m), "year": int(m.group(1)),
                       "order": int(m.group(1)) * 10 + {"h": 1, "o": 2, "a": 3}[m.group(3).lower()]}
         pdf = pdfium.PdfDocument(str(pdf_path))
-        texts = page_texts(pdf)
+        texts = page_texts(pdf, pdf_path, txt_out / f"{eid}_{kind}.ocr.json")
         (txt_out / f"{eid}_{kind}.txt").write_text(
             "".join(f"\n\n===== PAGE {i + 1} =====\n{t}" for i, t in enumerate(texts)))
         if kind != "qs":
