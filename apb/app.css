@@ -296,3 +296,5 @@ svg.i { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-widt
 .paper .qtext table { border-collapse: collapse; font-size: .9em; }
 .paper .qtext th, .paper .qtext td { border: 1px solid var(--line-strong); padding: 4px 8px; vertical-align: top; text-align: left; }
 .paper .qtext th { background: var(--surface-2); }
+.ans:not(.hide) .ans-h::after { content: "閉じる"; flex: none; align-self: center; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--text-3); }
+.ans-h { cursor: pointer; }
