@@ -5,7 +5,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { buildEnvironment } from '../js/env.js';
 import { evaluate, needsAnswer } from '../js/checker.js';
-import { STAGES, allMissions } from '../js/missions/index.js';
+import { STAGES, ALL_STAGES, allMissions } from '../js/missions/index.js';
+import { createSession } from '../js/vb/session.js';
 import { bundle } from '../build.mjs';
 
 let pass = 0, fail = 0;
@@ -138,19 +139,28 @@ function cmdTests() {
 // ---------- ミッション solution テスト ----------
 function missionTests() {
   for (const m of allMissions()) {
-    const { shell } = buildEnvironment(m);
-    // solution を順に実行
-    for (const line of (m.solution || [])) shell.run(line);
+    let shell = null, dev = null;
+    if (m.browser) {
+      dev = createSession(m.browser);
+      for (const step of (m.solution || [])) {
+        if (typeof step === 'string') dev.runConsole(step);
+        else dev[step.do](...(step.args || []));
+      }
+    } else {
+      ({ shell } = buildEnvironment(m));
+      for (const line of (m.solution || [])) shell.run(line);
+    }
+    const rt = { vfs: shell ? shell.vfs : null, shell, dev };
     // 各タスクを判定。answer系は solution 実行後の環境では直接評価できないので、
     // answerの正解をチェッカーで照合（any/equals の先頭を使って自己整合性を確認）
     m.tasks.forEach((task, ti) => {
       if (needsAnswer(task) && !task.noInput) {
         // 代表解を取り出して評価
         const probe = pickAnswer(task.check);
-        const r = evaluate(task.check, probe, { vfs: shell.vfs, shell });
+        const r = evaluate(task.check, probe, rt);
         ok(r.ok, `[${m.id}] task${ti + 1} answer "${probe}" should validate (${r.detail || ''})`);
       } else {
-        const r = evaluate(task.check, null, { vfs: shell.vfs, shell });
+        const r = evaluate(task.check, null, rt);
         ok(r.ok, `[${m.id}] task${ti + 1} state check after solution failed: ${r.detail || ''}`);
       }
     });
@@ -167,7 +177,7 @@ function pickAnswer(check) {
 // ---------- 構造検証 ----------
 function structureTests() {
   const ids = new Set();
-  for (const st of STAGES) {
+  for (const st of ALL_STAGES) {
     ok(st.id && st.title && Array.isArray(st.missions), `stage ${st.id} shape`);
     for (const m of st.missions) {
       ok(!ids.has(m.id), `duplicate mission id ${m.id}`); ids.add(m.id);

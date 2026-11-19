@@ -2,7 +2,7 @@
 // 機械的に検出できる品質問題を一覧化する。テスト(run.mjs)と違い失敗で終了しない。
 import { buildEnvironment } from '../js/env.js';
 import { needsAnswer } from '../js/checker.js';
-import { STAGES, allMissions, getMission } from '../js/missions/index.js';
+import { STAGES, ALL_STAGES, allMissions, getMission } from '../js/missions/index.js';
 
 const issues = [];
 const add = (sev, id, msg) => issues.push({ sev, id, msg });
@@ -35,6 +35,7 @@ for (const m of allMissions()) {
   });
 
   // --- 模範解答の実行検査 ---
+  if (m.browser) { if (!m.learned || !m.learned.length) add('LOW', m.id, 'learned が空'); continue; }
   const { shell } = buildEnvironment(m);
   for (const line of (m.solution || [])) {
     const chunks = shell.run(line);
@@ -68,6 +69,7 @@ function collectAnswers(check, acc = []) {
 const norm = (x) => String(x).toLowerCase().replace(/\s+/g, '');
 
 for (const m of allMissions()) {
+  if (m.browser) continue; // ブラウザ型は run.mjs で solution を検証
   const { shell, vfs } = buildEnvironment(m);
   let corpus = '';
   const lineCounts = new Set();

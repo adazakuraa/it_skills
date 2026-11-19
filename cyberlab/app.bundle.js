@@ -4996,6 +4996,41 @@ function evaluate(check, answer, runtime) {
       if (check.notMember != null && g.members.includes(check.notMember)) return { ok: false, detail: `${check.notMember} がまだ ${check.name} のメンバーです` };
       return { ok: true };
     }
+    case 'dev': {
+      // 仮想ブラウザ(DevTools)上の操作・状態で判定する。runtime.dev は vb/session.js のセッション。
+      const d = runtime.dev;
+      if (!d) return { ok: false, detail: 'DevTools が起動していません' };
+      const st = d.state;
+      if (check.consoleRan != null) {
+        let re; try { re = new RegExp(check.consoleRan, 'i'); } catch { return { ok: false, detail: '判定定義が不正です' }; }
+        if (!d.replHistory.some(x => re.test(x))) return { ok: false, detail: 'Console で該当の式をまだ実行していません' };
+      }
+      if (check.breakpoint) { if (!st.breakpoints.some(b => b.file === check.breakpoint.file && b.line === check.breakpoint.line)) return { ok: false, detail: `${check.breakpoint.file} の ${check.breakpoint.line} 行目にブレークポイントがありません` }; }
+      if (check.pausedAt) { if (!st.pausedOnce.some(b => b.file === check.pausedAt.file && b.line === check.pausedAt.line)) return { ok: false, detail: 'その行でまだ実行を止めていません' }; }
+      if (check.tab != null && !st.visited.has(check.tab)) return { ok: false, detail: `${check.tab} タブをまだ開いていません` };
+      if (check.viewedRequest != null && !st.viewedRequests.has(check.viewedRequest)) return { ok: false, detail: '該当のリクエストの詳細をまだ開いていません' };
+      if (check.filterUsed != null && !st.filtersUsed.has(check.filterUsed)) return { ok: false, detail: `Network の「${check.filterUsed}」フィルタをまだ使っていません` };
+      if (check.throttle != null && st.throttle !== check.throttle) return { ok: false, detail: `スロットリングが ${check.throttle} になっていません` };
+      if (check.searched != null) { let re; try { re = new RegExp(check.searched, 'i'); } catch { return { ok: false, detail: '判定定義が不正です' }; } if (!st.searches.some(q => re.test(q))) return { ok: false, detail: 'Sources でその語をまだ検索していません' }; }
+      if (check.prettyPrinted != null && !st.prettyPrinted.has(check.prettyPrinted)) return { ok: false, detail: `${check.prettyPrinted} をまだ整形表示していません` };
+      if (check.dom) {
+        const n = d.querySelector(check.dom.sel);
+        if (check.dom.exists === false) { if (n) return { ok: false, detail: `${check.dom.sel} がまだ存在します` }; }
+        else {
+          if (!n) return { ok: false, detail: `${check.dom.sel} が見つかりません` };
+          if (check.dom.visible != null && (!d.isHidden(n)) !== check.dom.visible) return { ok: false, detail: `${check.dom.sel} の表示状態が目標と違います` };
+          if (check.dom.attr) for (const [k, v] of Object.entries(check.dom.attr)) { const cur = n.attrs[k]; if (v === null ? cur !== undefined : cur !== v) return { ok: false, detail: `${check.dom.sel} の ${k} 属性が目標と違います` }; }
+        }
+      }
+      if (check.storage) {
+        for (const kind of ['local', 'session']) for (const [k, v] of Object.entries(check.storage[kind] || {})) {
+          const cur = Object.prototype.hasOwnProperty.call(d[kind], k) ? d[kind][k] : null;
+          if (cur !== v) return { ok: false, detail: `${kind === 'local' ? 'localStorage' : 'sessionStorage'} の ${k} が目標と違います` };
+        }
+        for (const [k, want] of Object.entries(check.storage.cookie || {})) if (d.cookies.some(c => c.name === k) !== want) return { ok: false, detail: `Cookie ${k} の有無が目標と違います` };
+      }
+      return { ok: true };
+    }
     case 'env': {
       const v = shell.env[check.name];
       if (check.equals != null) return norm(v) === norm(check.equals) ? { ok: true } : { ok: false, detail: `環境変数 ${check.name} が目標と違います` };
@@ -10802,6 +10837,136 @@ const stageAISec = {
 Object.assign(exports, { stageAISec });
 
 };
+__mods["js/missions/dt/d01-console.js"] = function (module, exports, __require) {
+// DevTools 1: Console を読む・使う
+const HTML = `<!DOCTYPE html>
+<html><head><title>ミニショップ</title></head>
+<body>
+<header><h1>ミニショップ</h1></header>
+<div id="app">
+  <p class="lead">今日のおすすめ商品</p>
+  <ul id="items"><li class="item">キーボード</li><li class="item">マウス</li><li class="item">モニター</li></ul>
+  <button id="buy">購入する</button>
+</div>
+<script src="/js/app.js"></script>
+</body></html>`;
+
+const APP_JS = `// ミニショップ アプリ本体
+const items = document.querySelectorAll('.item');
+const user = null;
+
+function showWelcome() {
+  // ユーザー名を表示する
+  const label = 'ようこそ、' + user.name + ' さん';
+  document.title = label;
+}
+
+document.getElementById('buy').addEventListener('click', () => {
+  fetch('/api/cart/add', { method: 'POST' });
+});
+
+showWelcome();`;
+
+const d01 = {
+  id: 'dv-01-console',
+  title: 'Console でエラーを読み、式を試す',
+  minutes: 12,
+  objectives: ['Console のエラー・警告メッセージを読む', 'エラー文から原因の場所（ファイルと行）をたどる', 'Console で式を実行してページの状態を調べる'],
+  prereq: [],
+  briefing: '同僚が作った「ミニショップ」のページで、ボタンが反応しない。画面を見ても原因は分からない。そこで開発者ツールの Console を開く。エラーが赤く出ていれば、そこに「何が」「どこで」起きたかが書かれている。まずは読み方から覚えよう。',
+  concepts: [{
+    title: 'Console の役割',
+    why: '画面に表示されない「内部の失敗」は、まず Console に出る。ブラウザは問題が起きるたびに、種類・内容・発生場所を Console に記録している。',
+    problem: 'ページが動かないとき、画面を眺めても原因は分からない。どこで何が失敗したかを知る手がかりが必要になる。',
+    how: 'メッセージは重要度で色分けされる: エラー(赤)=処理が止まった、警告(黄)=問題の可能性、ログ(白)=開発者が出した情報。エラー文は「種類: 内容」の形(例: TypeError: Cannot read properties of null)で、右端の「ファイル名:行番号」を押すと該当のソースを開ける。入力欄(›)に式を書けば、そのページの中身をその場で調べられる。',
+    example: "Uncaught TypeError: Cannot read properties of null (reading 'name')  app.js:7\n> document.title\n'ミニショップ'",
+    relation: 'エラー文を読んで原因の行を特定し、Console の式でページの状態を確かめる。',
+  }],
+  browser: {
+    url: 'https://minishop.example.com/',
+    html: HTML,
+    tabs: ['console', 'elements', 'sources'],
+    console: [
+      { level: 'warn', text: "[Deprecation] 'DOMNodeInserted' イベントは非推奨です。MutationObserver を使ってください。", source: 'legacy.js:12' },
+      { level: 'log', text: 'ミニショップを初期化しています…', source: 'app.js:1' },
+      { level: 'error', text: "Uncaught TypeError: Cannot read properties of null (reading 'name')", source: 'app.js:7' },
+      { level: 'error', text: 'Failed to load resource: the server responded with a status of 404 ()  /img/banner.png', source: 'minishop.example.com/:1' },
+    ],
+    sources: { 'app.js': APP_JS },
+    globals: { shopConfig: { name: 'ミニショップ', currency: 'JPY', tax: 0.1, version: '2.4.1' } },
+    quick: ['document.title', "document.querySelectorAll('.item').length", 'shopConfig.version', 'shopConfig', "document.querySelector('#buy').textContent"],
+  },
+  tasks: [
+    {
+      q: 'Console には赤いエラーが2件あります。そのうち、JavaScript の実行が失敗したエラー（Uncaught で始まるもの）の「エラーの種類」を答えてください（例: ○○Error）。',
+      narration: 'Console を開き、赤いメッセージを探す。エラー文は「種類: 内容」の形で書かれていて、コロンの前が種類にあたる。',
+      check: { type: 'answer', any: ['TypeError'], ci: true },
+      answerHint: '○○Error の形式',
+      hints: ['Console タブの赤いメッセージ（⛔）を読む', '「Uncaught」で始まる方のエラー。コロンの前に種類が書かれている', 'Uncaught TypeError: … の「TypeError」'],
+      explain: 'TypeError は「値の型が合わない操作をした」エラー。今回は null（値が無い）に対して .name を読もうとして失敗している。エラーの種類を見るだけで、原因の見当がつく: TypeError=値の型・存在の問題、ReferenceError=存在しない変数の参照、SyntaxError=文法ミス。',
+    },
+    {
+      q: 'そのエラーが発生しているファイル名と行番号が、メッセージの右端にリンクで表示されています。エラーが起きている行番号を答えてください。',
+      narration: 'メッセージ右端の「ファイル名:行番号」はボタンになっていて、押すと Sources タブで該当ソースが開く。原因の行を直接見に行ける。',
+      check: { type: 'answer', any: ['7'] },
+      answerHint: '数字',
+      hints: ['エラー文の右端にある「app.js:◯」のリンクを見る', 'リンクをタップすると該当行が開く（Sources タブ）', 'app.js:7 → 7行目'],
+      explain: 'エラーの発生場所（app.js の7行目）が分かった。実際に開くと `user.name` を読む行で、直前で `const user = null;` と定義されている。「エラー文の種類＋発生場所」の2つが分かれば、原因はほぼ特定できる。これがデバッグの基本の動き。',
+    },
+    {
+      q: 'Console の入力欄に式を入力して、ページのタイトル（document.title）の値を調べてください。表示された文字列（引用符は除く）を答えてください。',
+      narration: 'Console の入力欄（›）は、そのページの中身を直接調べる道具。document はページ全体を表す特別な名前で、document.title でタイトルが取れる。',
+      check: { type: 'answer', any: ['ミニショップ'] },
+      answerHint: 'タイトルの文字列',
+      hints: ['Console タブ下部の入力欄に式を入力して「実行」', '入力するのは document.title', "結果は 'ミニショップ' （引用符は文字列であることを示す記号）"],
+      explain: 'Console では、ページの状態を式で直接確認できる。document.title の結果が引用符付きで表示されるのは「文字列」という印。画面を見て分かることも、式なら確実に取れる。デバッグでは「いま変数や画面の状態がどうなっているか」を式で確かめながら原因を絞る。',
+    },
+    {
+      q: 'このページは .item というクラスの要素が商品リストになっています。Console で document.querySelectorAll(\'.item\').length を実行して、商品の数を答えてください。',
+      narration: 'querySelectorAll はセレクタ（CSSと同じ書き方）に一致する要素をすべて取り出す。.length で個数が分かる。Elements タブでも確認できるが、式なら一瞬で数えられる。',
+      check: { type: 'answer', any: ['3'] },
+      hints: ["document.querySelectorAll('.item') は要素の一覧を返す", '一覧の個数は .length で取れる', "document.querySelectorAll('.item').length → 3"],
+      explain: '3件。セレクタ（#id、.class、タグ名）で要素を取り出す書き方は、Elements タブでの検索やスクレイピング、テストコードでもそのまま使える共通の知識。Console は「ページに対する電卓」のように使えるのがポイント。',
+    },
+    {
+      q: 'このページは設定オブジェクト shopConfig を持っています。Console で shopConfig.version を実行して、バージョン番号を答えてください。',
+      narration: '開発者はアプリの設定や状態を、グローバル変数（どこからでも見える変数）に置くことがある。Console からは、その中身を直接読める。',
+      check: { type: 'answer', any: ['2.4.1'] },
+      answerHint: 'x.y.z 形式',
+      hints: ['Console では、ページが持つ変数の名前をそのまま入力すると値が見られる', 'shopConfig と入力すると設定全体、.version でその中の1項目が読める', "shopConfig.version → '2.4.1'"],
+      explain: 'グローバル変数の中身は、誰でも Console から読めてしまう。便利な反面、設定にAPIキーや内部URLを入れておくと筒抜けになる、というセキュリティ上の落とし穴にもなる。「ブラウザに渡したものは、ユーザーに見られる前提」で設計することが大切。',
+    },
+  ],
+  review: {
+    steps: ['Console の赤いエラー（⛔）を見つける', 'エラーの種類（TypeError など）と内容を読む', '右端の ファイル名:行番号 で発生場所を特定する', '入力欄の式で、ページの状態を確かめる'],
+    commands: [{ cmd: 'document.title', meaning: 'ページのタイトルを調べる' }, { cmd: "document.querySelectorAll('.item').length", meaning: 'セレクタに一致する要素の数' }, { cmd: 'shopConfig.version', meaning: 'ページが持つ変数の中身を読む' }],
+    why: 'Console は、画面に出ない失敗の最初の手がかり。エラーの種類と場所を読めれば、原因の切り分けが一気に早くなる。',
+    practice: '不具合報告を受けたら、まず Console のエラーを確認する。スマホ実機でのデバッグやサポート対応でも、エラー文を共有してもらえば原因の見当がつく。',
+    related: ['Elements', 'Sources', 'Network', 'エラーの種類（TypeError/ReferenceError）'],
+  },
+  learned: ['devtools-console', 'console-errors', 'js-error-types', 'console-eval', 'document-queryselector'],
+  solution: ["document.title", "document.querySelectorAll('.item').length", 'shopConfig.version'],
+};
+
+Object.assign(exports, { d01 });
+
+};
+__mods["js/missions/stage-devtools1.js"] = function (module, exports, __require) {
+// DevTools コース I — 画面の裏側を見る
+const { d01 } = __require("js/missions/dt/d01-console.js");
+
+const stageDevtools1 = {
+  id: 'dt-basics',
+  track: 'devtools',
+  title: 'DevTools I — 画面の裏側を見る',
+  subtitle: 'Console・Elements・Network で、ブラウザが裏でやっていることを読む',
+  intro: 'ブラウザの開発者ツール(DevTools)は、画面の「裏側」を見るための道具。スマホでは直接開けないので、ここでは架空のWebページを使った疑似DevToolsで練習する。画面の見え方は同じなので、PCで本物を開いたときにそのまま使える。',
+  missions: [d01],
+};
+
+Object.assign(exports, { stageDevtools1 });
+
+};
 __mods["js/missions/stage-packet.js"] = function (module, exports, __require) {
 // パケット解析（tcpdump でキャプチャファイルを読む）
 // キャプチャはすべてゲーム内の仮想データ。実在のネットワークからは一切取得しない。
@@ -11181,6 +11346,7 @@ const { stageApiSec } = __require("js/missions/stage-apisec.js");
 const { stageCloud } = __require("js/missions/stage-cloud.js");
 const { stageDetect } = __require("js/missions/stage-detect.js");
 const { stageAISec } = __require("js/missions/stage-aisec.js");
+const { stageDevtools1 } = __require("js/missions/stage-devtools1.js");
 const { stagePacket } = __require("js/missions/stage-packet.js");
 
 const STAGES = [
@@ -11215,28 +11381,51 @@ const STAGES = [
 // 今後のステージはここに追加する:
 //   フォレンジック / 暗号 / Active Directory / クラウド・コンテナ など
 
-// 索引を構築
+// ---------- コース(トラック) ----------
+// main    : 既存のメインコース（一本道）
+// devtools: ブラウザ開発者ツールの読み方を学ぶ並行コース。メインの進行状況とは独立して進められる。
+const DEV_STAGES = [stageDevtools1];
+
+const TRACKS = [
+  { id: 'main', title: 'メインコース', stages: STAGES },
+  { id: 'devtools', title: 'DevTools コース', stages: DEV_STAGES },
+];
+const ALL_STAGES = [...STAGES, ...DEV_STAGES];
+
+// 索引を構築（コースごとに一本道の順序を持つ）
 const missionById = {};
 const stageOfMission = {};
-let order = [];
-for (const st of STAGES) {
-  for (const m of st.missions) {
-    missionById[m.id] = m;
-    stageOfMission[m.id] = st.id;
-    order.push(m.id);
+const trackOfMission = {};
+const orderByTrack = {};
+const order = [];
+for (const tr of TRACKS) {
+  orderByTrack[tr.id] = [];
+  for (const st of tr.stages) {
+    for (const m of st.missions) {
+      missionById[m.id] = m;
+      stageOfMission[m.id] = st.id;
+      trackOfMission[m.id] = tr.id;
+      orderByTrack[tr.id].push(m.id);
+      order.push(m.id);
+    }
   }
 }
 
 function getMission(id) { return missionById[id]; }
 function getStageOf(id) { return stageOfMission[id]; }
+function trackOf(id) { return trackOfMission[id]; }
+function trackOfStage(stageId) { return TRACKS.find(t => t.stages.some(s => s.id === stageId)); }
+function getStage(stageId) { return ALL_STAGES.find(s => s.id === stageId); }
 function missionOrder() { return order.slice(); }
 function allMissions() { return order.map(id => missionById[id]); }
+function missionsOfTrack(trackId) { return (orderByTrack[trackId] || []).map(id => missionById[id]); }
 
-/** 直前のミッションが完了していれば解放（一本道） */
+/** 同じコース内で、直前のミッションが完了していれば解放（コースごとに一本道） */
 function isMissionUnlocked(id, isDone) {
-  const idx = order.indexOf(id);
+  const list = orderByTrack[trackOfMission[id]] || [];
+  const idx = list.indexOf(id);
   if (idx <= 0) return true;
-  return isDone(order[idx - 1]);
+  return isDone(list[idx - 1]);
 }
 
 /** ステージ内の最初の未クリアミッション、なければ null */
@@ -11245,7 +11434,1790 @@ function nextMissionInStage(stage, isDone) {
   return null;
 }
 
-Object.assign(exports, { STAGES, getMission, getStageOf, missionOrder, allMissions, isMissionUnlocked, nextMissionInStage });
+Object.assign(exports, { STAGES, DEV_STAGES, TRACKS, ALL_STAGES, getMission, getStageOf, trackOf, trackOfStage, getStage, missionOrder, allMissions, missionsOfTrack, isMissionUnlocked, nextMissionInStage });
+
+};
+__mods["js/vb/html.js"] = function (module, exports, __require) {
+// ============================================================
+// 仮想ブラウザ: HTMLパーサ・DOM・セレクタ・可視判定・シリアライズ
+// ゲーム内の架空ページを表現するためのもの。実ブラウザのDOMや innerHTML は使わない。
+// ノード: { t:'el', tag, attrs:{}, children:[], parent, uid } /
+//         { t:'text', text, parent, uid } / { t:'comment', text, parent, uid }
+// ============================================================
+
+const VOID = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+const RAW = new Set(['script', 'style', 'textarea', 'title']);
+const MAX_NODES = 3000;
+let uidSeq = 1;
+
+const nextUid = () => uidSeq++;
+
+function mk(t, props) { return Object.assign({ t, parent: null, uid: nextUid() }, props); }
+
+function parseHtml(src) {
+  const root = mk('el', { tag: '#document', attrs: {}, children: [] });
+  const stack = [root];
+  let i = 0, count = 0;
+  const top = () => stack[stack.length - 1];
+  const add = (n) => { if (++count > MAX_NODES) throw new Error('HTMLが大きすぎます'); n.parent = top(); top().children.push(n); return n; };
+  const pushText = (s) => { if (s) add(mk('text', { text: decodeEntities(s) })); };
+  while (i < src.length) {
+    if (src.startsWith('<!--', i)) {
+      const end = src.indexOf('-->', i + 4);
+      const e = end < 0 ? src.length : end;
+      add(mk('comment', { text: src.slice(i + 4, e) }));
+      i = end < 0 ? src.length : end + 3; continue;
+    }
+    if (src.startsWith('<!', i)) { const end = src.indexOf('>', i); i = end < 0 ? src.length : end + 1; continue; }
+    if (src.startsWith('</', i)) {
+      const end = src.indexOf('>', i);
+      const name = src.slice(i + 2, end < 0 ? src.length : end).trim().toLowerCase();
+      for (let k = stack.length - 1; k > 0; k--) if (stack[k].tag === name) { stack.length = k; break; }
+      i = end < 0 ? src.length : end + 1; continue;
+    }
+    if (src[i] === '<' && /[A-Za-z]/.test(src[i + 1] || '')) {
+      let j = i + 1;
+      while (j < src.length && /[^\s/>]/.test(src[j])) j++;
+      const tag = src.slice(i + 1, j).toLowerCase();
+      const attrs = {};
+      let selfClose = false;
+      for (;;) {
+        while (j < src.length && /\s/.test(src[j])) j++;
+        if (j >= src.length) break;
+        if (src[j] === '>') { j++; break; }
+        if (src[j] === '/' && src[j + 1] === '>') { selfClose = true; j += 2; break; }
+        if (src[j] === '/') { j++; continue; }
+        let k = j;
+        while (k < src.length && /[^\s=/>]/.test(src[k])) k++;
+        const name = src.slice(j, k).toLowerCase();
+        j = k;
+        while (j < src.length && /\s/.test(src[j])) j++;
+        let val = '';
+        if (src[j] === '=') {
+          j++;
+          while (j < src.length && /\s/.test(src[j])) j++;
+          if (src[j] === '"' || src[j] === "'") { const q = src[j]; const e = src.indexOf(q, j + 1); val = src.slice(j + 1, e < 0 ? src.length : e); j = e < 0 ? src.length : e + 1; }
+          else { let e = j; while (e < src.length && /[^\s>]/.test(src[e])) e++; val = src.slice(j, e); j = e; }
+        }
+        if (name) attrs[name] = decodeEntities(val);
+      }
+      const el = add(mk('el', { tag, attrs, children: [] }));
+      i = j;
+      if (VOID.has(tag) || selfClose) continue;
+      if (RAW.has(tag)) {
+        const close = src.toLowerCase().indexOf('</' + tag, i);
+        const e = close < 0 ? src.length : close;
+        if (e > i) { const tn = mk('text', { text: src.slice(i, e), raw: true }); tn.parent = el; el.children.push(tn); count++; }
+        const gt = src.indexOf('>', e);
+        i = close < 0 ? src.length : (gt < 0 ? src.length : gt + 1);
+        continue;
+      }
+      stack.push(el);
+      continue;
+    }
+    const next = src.indexOf('<', i + 1);
+    const e = next < 0 ? src.length : next;
+    pushText(src.slice(i, e));
+    i = e;
+  }
+  return root;
+}
+
+const ENT = { '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"', '&#39;': "'", '&nbsp;': ' ', '&copy;': '©', '&yen;': '¥' };
+function decodeEntities(s) { return s.replace(/&(?:lt|gt|amp|quot|#39|nbsp|copy|yen);/g, m => ENT[m]); }
+const escText = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const escAttr = (s) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+
+// ---------- シリアライズ ----------
+function openTag(n) {
+  const a = Object.entries(n.attrs).map(([k, v]) => (v === '' ? ` ${k}` : ` ${k}="${escAttr(v)}"`)).join('');
+  return `<${n.tag}${a}>`;
+}
+function outerHTML(n) {
+  if (n.t === 'text') return n.raw ? n.text : escText(n.text);
+  if (n.t === 'comment') return `<!--${n.text}-->`;
+  if (VOID.has(n.tag)) return openTag(n);
+  return openTag(n) + n.children.map(outerHTML).join('') + `</${n.tag}>`;
+}
+const innerHTML = (n) => n.children.map(outerHTML).join('');
+
+// ---------- テキスト ----------
+function textContent(n) {
+  if (n.t === 'text') return n.text;
+  if (n.t === 'comment') return '';
+  return n.children.map(textContent).join('');
+}
+const BLOCK = new Set(['div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'ul', 'ol', 'form', 'section', 'article', 'header', 'footer', 'nav', 'main', 'table', 'tr', 'br', 'pre', 'label']);
+function innerText(n) {
+  const parts = [];
+  const walk = (x) => {
+    if (x.t === 'text') { const t = x.text.replace(/\s+/g, ' ').trim(); if (t && !(x.parent && ['script', 'style'].includes(x.parent.tag))) parts.push(t); return; }
+    if (x.t !== 'el' || isHidden(x) || ['script', 'style', 'head'].includes(x.tag)) return;
+    const blk = BLOCK.has(x.tag);
+    if (blk) parts.push('\n');
+    x.children.forEach(walk);
+    if (blk) parts.push('\n');
+  };
+  walk(n);
+  return parts.join(' ').replace(/ ?\n ?/g, '\n').replace(/\n{2,}/g, '\n').trim();
+}
+
+// ---------- 可視判定 ----------
+function styleOf(n) {
+  const out = {};
+  for (const decl of (n.attrs && n.attrs.style ? n.attrs.style : '').split(';')) {
+    const i = decl.indexOf(':'); if (i < 0) continue;
+    out[decl.slice(0, i).trim().toLowerCase()] = decl.slice(i + 1).trim().toLowerCase();
+  }
+  return out;
+}
+function selfHidden(n) {
+  if (n.t !== 'el') return false;
+  if (n.attrs.hidden !== undefined) return true;
+  if (n.tag === 'input' && (n.attrs.type || '').toLowerCase() === 'hidden') return true;
+  const s = styleOf(n);
+  if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return true;
+  if (/^-\d{3,}/.test(s.left || '') || /^-\d{3,}/.test(s['margin-left'] || '') || /^-\d{3,}/.test(s['text-indent'] || '')) return true; // 画面外へ追い出す手口
+  if ((s.width === '0' || s.width === '0px') && (s.height === '0' || s.height === '0px')) return true;
+  return false;
+}
+function isHidden(n) { for (let x = n; x && x.t === 'el'; x = x.parent) if (selfHidden(x)) return true; return false; }
+
+// ---------- セレクタ ----------
+function parseCompound(s) {
+  const c = { tag: null, id: null, classes: [], attrs: [] };
+  const re = /^(\*|[A-Za-z][A-Za-z0-9-]*)|#([A-Za-z0-9_-]+)|\.([A-Za-z0-9_-]+)|\[\s*([A-Za-z_:][\w:-]*)\s*(?:([~^$*|]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]*)))?\s*\]/y;
+  let pos = 0;
+  while (pos < s.length) {
+    re.lastIndex = pos;
+    const m = re.exec(s);
+    if (!m || m[0] === '') throw new Error(`SyntaxError: '${s}' is not a valid selector`);
+    if (m[1]) c.tag = m[1].toLowerCase();
+    else if (m[2]) c.id = m[2];
+    else if (m[3]) c.classes.push(m[3]);
+    else if (m[4]) c.attrs.push({ name: m[4].toLowerCase(), op: m[5] || null, val: m[6] ?? m[7] ?? m[8] ?? '' });
+    pos = re.lastIndex;
+  }
+  return c;
+}
+function parseSelector(sel) {
+  return sel.split(',').map(part => {
+    const toks = part.trim().replace(/\s*>\s*/g, ' > ').split(/\s+/).filter(Boolean);
+    const chain = []; let comb = ' ';
+    for (const t of toks) { if (t === '>') { comb = '>'; continue; } chain.push({ comb, c: parseCompound(t) }); comb = ' '; }
+    if (!chain.length) throw new Error(`SyntaxError: '${sel}' is not a valid selector`);
+    return chain;
+  });
+}
+function matchCompound(n, c) {
+  if (n.t !== 'el') return false;
+  if (c.tag && c.tag !== '*' && c.tag !== n.tag) return false;
+  if (c.id && n.attrs.id !== c.id) return false;
+  if (c.classes.length) { const cl = (n.attrs.class || '').split(/\s+/); if (!c.classes.every(x => cl.includes(x))) return false; }
+  for (const a of c.attrs) {
+    const v = n.attrs[a.name];
+    if (v === undefined) return false;
+    if (!a.op) continue;
+    if (a.op === '=' && v !== a.val) return false;
+    if (a.op === '^=' && !v.startsWith(a.val)) return false;
+    if (a.op === '$=' && !v.endsWith(a.val)) return false;
+    if (a.op === '*=' && !v.includes(a.val)) return false;
+    if (a.op === '~=' && !v.split(/\s+/).includes(a.val)) return false;
+  }
+  return true;
+}
+function matchChain(n, chain, idx) {
+  const link = chain[idx];
+  if (!matchCompound(n, link.c)) return false;
+  if (idx === 0) return true;
+  if (link.comb === '>') return !!n.parent && matchChain(n.parent, chain, idx - 1);
+  for (let p = n.parent; p; p = p.parent) if (matchChain(p, chain, idx - 1)) return true;
+  return false;
+}
+function matches(n, sel) { return parseSelector(sel).some(ch => matchChain(n, ch, ch.length - 1)); }
+function descendants(root) {
+  const out = [];
+  const walk = (x) => { for (const c of x.children || []) { if (c.t === 'el') { out.push(c); walk(c); } } };
+  walk(root);
+  return out;
+}
+function querySelectorAll(root, sel) {
+  const chains = parseSelector(sel);
+  return descendants(root).filter(n => chains.some(ch => matchChain(n, ch, ch.length - 1)));
+}
+function querySelector(root, sel) { return querySelectorAll(root, sel)[0] || null; }
+function closest(n, sel) { for (let x = n; x && x.t === 'el'; x = x.parent) if (matches(x, sel)) return x; return null; }
+function allNodes(root) {
+  const out = [];
+  const walk = (x) => { for (const c of x.children || []) { out.push(c); walk(c); } };
+  walk(root);
+  return out;
+}
+function removeNode(n) { if (n.parent) n.parent.children = n.parent.children.filter(c => c !== n); n.parent = null; }
+
+Object.assign(exports, { nextUid, parseHtml, decodeEntities, openTag, outerHTML, innerHTML, textContent, innerText, styleOf, selfHidden, isHidden, matches, descendants, querySelectorAll, querySelector, closest, allNodes, removeNode });
+
+};
+__mods["js/vb/jsparse.js"] = function (module, exports, __require) {
+// ============================================================
+// Console 用 JavaScript 風式のパーサ（eval / Function は使わない）。
+// 対応: リテラル(数値/文字列/テンプレート/配列/オブジェクト/true/false/null/undefined)、
+//       メンバー(. [] ?.)、呼び出し、アロー関数(式本体)、単項(! - + typeof)、
+//       二項(+ - * / % < > <= >= == != === !== && || ??)、三項、代入(= += -=)、
+//       const/let/var 宣言、; 区切り
+// 非対応(明示エラー): new, function, class, ブロック文, 制御構文, 正規表現リテラル, ++/--
+// ============================================================
+
+class ParseError extends Error { constructor(msg) { super(msg); this.errName = 'SyntaxError'; } }
+
+const KEYWORDS_UNSUPPORTED = new Set(['new', 'function', 'class', 'if', 'for', 'while', 'do', 'switch', 'try', 'return', 'throw', 'delete', 'void', 'await', 'async', 'import', 'export', 'this', 'in', 'of', 'instanceof']);
+const OPS3 = ['===', '!==', '...'];
+const OPS2 = ['=>', '==', '!=', '<=', '>=', '&&', '||', '??', '?.', '+=', '-=', '++', '--'];
+
+function tokenize(src) {
+  const toks = [];
+  let i = 0;
+  const err = (m) => { throw new ParseError(m); };
+  while (i < src.length) {
+    const c = src[i];
+    if (/\s/.test(c)) { i++; continue; }
+    const start = i;
+    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(src[i + 1] || ''))) {
+      const m = src.slice(i).match(/^(0[xX][0-9a-fA-F]+|\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+)/);
+      toks.push({ t: 'num', v: Number(m[0]), s: start, e: i + m[0].length }); i += m[0].length; continue;
+    }
+    if (c === '"' || c === "'") {
+      let j = i + 1, out = '';
+      while (j < src.length && src[j] !== c) {
+        if (src[j] === '\n') err('Invalid or unexpected token');
+        if (src[j] === '\\') {
+          const n = src[j + 1];
+          if (n === 'u' && /^[0-9a-fA-F]{4}/.test(src.slice(j + 2, j + 6))) { out += String.fromCharCode(parseInt(src.slice(j + 2, j + 6), 16)); j += 6; continue; }
+          out += n === 'n' ? '\n' : n === 't' ? '\t' : n === 'r' ? '\r' : n === '0' ? '\0' : n; j += 2; continue;
+        }
+        out += src[j]; j++;
+      }
+      if (j >= src.length) err('Invalid or unexpected token');
+      toks.push({ t: 'str', v: out, s: start, e: j + 1 }); i = j + 1; continue;
+    }
+    if (c === '`') {
+      const quasis = [], exprs = [];
+      let j = i + 1, cur = '';
+      while (j < src.length && src[j] !== '`') {
+        if (src[j] === '\\') { const n = src[j + 1]; cur += n === 'n' ? '\n' : n === 't' ? '\t' : n; j += 2; continue; }
+        if (src[j] === '$' && src[j + 1] === '{') {
+          let depth = 1, k = j + 2;
+          while (k < src.length && depth > 0) { if (src[k] === '{') depth++; else if (src[k] === '}') depth--; k++; }
+          if (depth) err('Unexpected end of input');
+          quasis.push(cur); cur = '';
+          exprs.push(src.slice(j + 2, k - 1)); j = k; continue;
+        }
+        cur += src[j]; j++;
+      }
+      if (j >= src.length) err('Invalid or unexpected token');
+      quasis.push(cur);
+      toks.push({ t: 'tpl', quasis, exprs, s: start, e: j + 1 }); i = j + 1; continue;
+    }
+    if (/[A-Za-z_$]/.test(c)) {
+      let j = i; while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+      toks.push({ t: 'id', v: src.slice(i, j), s: start, e: j }); i = j; continue;
+    }
+    let op = OPS3.find(o => src.startsWith(o, i)) || OPS2.find(o => src.startsWith(o, i));
+    if (op === '?.' && /[0-9]/.test(src[i + 2] || '')) op = null; // 三項演算子 a?.5:1
+    if (!op && '+-*/%<>=!?:.,;()[]{}'.includes(c)) op = c;
+    if (!op) err('Invalid or unexpected token');
+    if (op === '/' ) err('正規表現リテラルや除算以外の / はこのシミュレーターでは未対応です');
+    toks.push({ t: 'op', v: op, s: start, e: i + op.length }); i += op.length;
+  }
+  return toks;
+}
+
+function parse(src) {
+  const toks = tokenize(src);
+  let p = 0;
+  const peek = (o = 0) => toks[p + o];
+  const isOp = (v, o = 0) => { const t = toks[p + o]; return t && t.t === 'op' && t.v === v; };
+  const fail = (t) => {
+    if (!t) throw new ParseError('Unexpected end of input');
+    if (t.t === 'str') throw new ParseError('Unexpected string');
+    if (t.t === 'num') throw new ParseError('Unexpected number');
+    if (t.t === 'id') throw new ParseError(`Unexpected identifier '${t.v}'`);
+    throw new ParseError(`Unexpected token '${t.v ?? t.t}'`);
+  };
+  const expect = (v) => { if (!isOp(v)) fail(peek()); p++; };
+  const span = (a, b) => src.slice(a, b);
+  const lastEnd = () => toks[p - 1].e;
+
+  function parseProgram() {
+    const stmts = [];
+    while (p < toks.length) {
+      if (isOp(';')) { p++; continue; }
+      stmts.push(parseStatement());
+      if (p < toks.length && !isOp(';')) fail(peek());
+    }
+    return stmts;
+  }
+  function parseStatement() {
+    const t = peek();
+    if (t.t === 'id' && ['const', 'let', 'var'].includes(t.v)) {
+      p++;
+      const id = peek(); if (!id || id.t !== 'id') fail(id);
+      p++;
+      let init = null;
+      if (isOp('=')) { p++; init = parseAssign(); }
+      else if (t.v === 'const') throw new ParseError('Missing initializer in const declaration');
+      return { k: 'decl', kind: t.v, name: id.v, init };
+    }
+    if (t.t === 'id' && KEYWORDS_UNSUPPORTED.has(t.v) && !(peek(1) && peek(1).t === 'op' && peek(1).v === '=>')) throw new ParseError(`'${t.v}' はこのシミュレーターのConsoleでは未対応です`);
+    if (isOp('{')) throw new ParseError('ブロック文はこのシミュレーターのConsoleでは未対応です（式を1つずつ実行してください）');
+    return { k: 'expr', e: parseAssign() };
+  }
+  function parseAssign() {
+    const start = peek() ? peek().s : 0;
+    // アロー関数: id => expr / (a, b) => expr
+    if (peek() && peek().t === 'id' && isOp('=>', 1) && !KEYWORDS_UNSUPPORTED.has(peek().v)) {
+      const name = peek().v; p += 2; return arrowBody([name], start);
+    }
+    if (isOp('(')) {
+      const params = tryArrowParams();
+      if (params) return arrowBody(params, start);
+    }
+    const left = parseCond();
+    const t = peek();
+    if (t && t.t === 'op' && ['=', '+=', '-='].includes(t.v)) {
+      if (!['id', 'member', 'index'].includes(left.k)) throw new ParseError('Invalid left-hand side in assignment');
+      p++;
+      return { k: 'assign', op: t.v, target: left, value: parseAssign(), s: start, e: lastEnd() };
+    }
+    return left;
+  }
+  function tryArrowParams() {
+    // ( id (, id)* ) =>
+    let q = p + 1; const names = [];
+    if (toks[q] && toks[q].t === 'op' && toks[q].v === ')') { q++; }
+    else {
+      for (;;) {
+        const t = toks[q]; if (!t || t.t !== 'id') return null;
+        names.push(t.v); q++;
+        if (toks[q] && toks[q].t === 'op' && toks[q].v === ',') { q++; continue; }
+        break;
+      }
+      if (!(toks[q] && toks[q].t === 'op' && toks[q].v === ')')) return null;
+      q++;
+    }
+    if (!(toks[q] && toks[q].t === 'op' && toks[q].v === '=>')) return null;
+    p = q + 1; return names;
+  }
+  function arrowBody(params, start) {
+    if (isOp('{')) throw new ParseError('アロー関数の本体は式のみ対応です（{ } のブロックは未対応）');
+    const body = parseAssign();
+    return { k: 'arrow', params, body, s: start, e: lastEnd() };
+  }
+  function parseCond() {
+    const c = parseBin(0);
+    if (isOp('?')) { p++; const a = parseAssign(); expect(':'); const b = parseAssign(); return { k: 'cond', c, a, b }; }
+    return c;
+  }
+  const LEVELS = [['??'], ['||'], ['&&'], ['==', '!=', '===', '!=='], ['<', '>', '<=', '>='], ['+', '-'], ['*', '%']];
+  function parseBin(level) {
+    if (level >= LEVELS.length) return parseUnary();
+    let left = parseBin(level + 1);
+    for (;;) {
+      const t = peek();
+      if (t && t.t === 'op' && LEVELS[level].includes(t.v)) { p++; left = { k: 'bin', op: t.v, l: left, r: parseBin(level + 1) }; }
+      else return left;
+    }
+  }
+  function parseUnary() {
+    const t = peek();
+    if (t && t.t === 'op' && ['!', '-', '+'].includes(t.v)) { p++; return { k: 'unary', op: t.v, e: parseUnary() }; }
+    if (t && t.t === 'op' && (t.v === '++' || t.v === '--')) throw new ParseError('++/-- はこのシミュレーターでは未対応です');
+    if (t && t.t === 'id' && t.v === 'typeof') { p++; return { k: 'unary', op: 'typeof', e: parseUnary() }; }
+    return parsePostfix();
+  }
+  function parsePostfix() {
+    const startTok = peek();
+    let e = parsePrimary();
+    for (;;) {
+      if (isOp('.') || isOp('?.')) {
+        const optional = isOp('?.'); p++;
+        if (optional && (isOp('(') || isOp('['))) {
+          if (isOp('[')) { p++; const idx = parseAssign(); expect(']'); e = { k: 'index', obj: e, idx, optional: true }; }
+          else { e = { k: 'call', callee: e, args: parseArgs(), optional: true, s: startTok.s, e: lastEnd() }; }
+          continue;
+        }
+        const n = peek(); if (!n || n.t !== 'id') fail(n);
+        p++; e = { k: 'member', obj: e, name: n.v, optional, s: startTok.s, e: lastEnd() };
+      } else if (isOp('[')) {
+        p++; const idx = parseAssign(); expect(']'); e = { k: 'index', obj: e, idx, optional: false, s: startTok.s, e: lastEnd() };
+      } else if (isOp('(')) {
+        e = { k: 'call', callee: e, args: parseArgs(), optional: false, s: startTok.s, e: lastEnd() };
+      } else return e;
+    }
+  }
+  function parseArgs() {
+    expect('('); const args = [];
+    if (!isOp(')')) { for (;;) { args.push(parseAssign()); if (isOp(',')) { p++; if (isOp(')')) break; continue; } break; } }
+    expect(')'); return args;
+  }
+  function parsePrimary() {
+    const t = peek();
+    if (!t) fail(null);
+    if (t.t === 'num') { p++; return { k: 'num', v: t.v }; }
+    if (t.t === 'str') { p++; return { k: 'str', v: t.v }; }
+    if (t.t === 'tpl') { p++; return { k: 'tpl', quasis: t.quasis, exprs: t.exprs.map(s => { const sub = parse(s); if (sub.length !== 1 || sub[0].k !== 'expr') throw new ParseError('テンプレート内は式のみ対応です'); return sub[0].e; }) }; }
+    if (t.t === 'id') {
+      if (['true', 'false', 'null', 'undefined'].includes(t.v)) { p++; return { k: 'lit', v: t.v === 'true' ? true : t.v === 'false' ? false : t.v === 'null' ? null : undefined }; }
+      if (KEYWORDS_UNSUPPORTED.has(t.v)) throw new ParseError(`'${t.v}' はこのシミュレーターのConsoleでは未対応です`);
+      p++; return { k: 'id', name: t.v };
+    }
+    if (isOp('(')) { p++; const e = parseAssign(); expect(')'); return { k: 'group', e }; }
+    if (isOp('[')) {
+      p++; const items = [];
+      while (!isOp(']')) { if (!peek()) fail(null); items.push(parseAssign()); if (isOp(',')) p++; else break; }
+      expect(']'); return { k: 'array', items };
+    }
+    if (isOp('{')) {
+      p++; const props = [];
+      while (!isOp('}')) {
+        const kt = peek(); if (!kt) fail(null);
+        let key;
+        if (kt.t === 'id' || kt.t === 'str') key = kt.v; else if (kt.t === 'num') key = String(kt.v); else fail(kt);
+        p++;
+        if (isOp(':')) { p++; props.push({ key, value: parseAssign() }); }
+        else if (kt.t === 'id') props.push({ key, value: { k: 'id', name: key } }); // 省略記法 {a}
+        else fail(peek());
+        if (isOp(',')) p++; else break;
+      }
+      expect('}'); return { k: 'object', props };
+    }
+    fail(t);
+  }
+  const prog = parseProgram();
+  prog.src = src;
+  return prog;
+}
+
+Object.assign(exports, { ParseError, tokenize, parse });
+
+};
+__mods["js/vb/jsrepl.js"] = function (module, exports, __require) {
+// ============================================================
+// Console 用の安全な実行系。実ブラウザの eval/Function は使わず、
+// 許可したオブジェクト(document / localStorage / location など)だけを操作できる。
+// プロトタイプ経由の脱出(__proto__ / constructor / prototype)は遮断する。
+// ============================================================
+const H = __require("js/vb/html.js");
+const { parse, ParseError } = __require("js/vb/jsparse.js");
+
+class ReplError extends Error { constructor(name, msg) { super(msg); this.errName = name; } }
+const E = (name, msg) => new ReplError(name, msg);
+const BLOCKED = new Set(['__proto__', 'constructor', 'prototype', '__defineGetter__', '__defineSetter__', '__lookupGetter__']);
+const MAX_STEPS = 60000, MAX_DEPTH = 40;
+
+// ---------- 値クラス ----------
+class El { constructor(node) { this.node = node; } }
+class NodeListV extends Array {}
+class Host { get() { return undefined; } set(k) { throw E('TypeError', `Cannot set property '${k}' of ${this.label()}`); } keys() { return []; } label() { return 'Object'; } }
+class HostFn { constructor(name, fn) { this.name = name; this.fn = fn; } }
+class Arrow { constructor(params, body, scope, src) { this.params = params; this.body = body; this.scope = scope; this.src = src; } }
+
+const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v) && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
+
+// ---------- 文字列化・整形 ----------
+function toStr(v) {
+  if (typeof v === 'string') return v;
+  if (v === null) return 'null';
+  if (v === undefined) return 'undefined';
+  if (Array.isArray(v)) return v.map(x => (x === null || x === undefined ? '' : toStr(x))).join(',');
+  if (v instanceof El) return `[object HTML${v.node.tag === 'a' ? 'Anchor' : 'Unknown'}Element]`;
+  if (v instanceof Arrow) return v.src;
+  if (v instanceof HostFn) return `function ${v.name}() { [native code] }`;
+  if (v instanceof Host) return `[object ${v.label().split(' ')[0]}]`;
+  if (isPlain(v)) return '[object Object]';
+  return String(v);
+}
+const toNum = (v) => (typeof v === 'number' ? v : v instanceof El || v instanceof Host || isPlain(v) ? NaN : Number(v));
+const truthy = (v) => !!v && !(typeof v === 'number' && Number.isNaN(v));
+
+function quote(s) {
+  const q = s.includes("'") && !s.includes('"') ? '"' : "'";
+  return q + s.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(q === "'" ? /'/g : /"/g, '\\' + q) + q;
+}
+function elLabel(n) {
+  const a = Object.entries(n.attrs).map(([k, v]) => (v === '' ? ` ${k}` : ` ${k}="${v.length > 40 ? v.slice(0, 40) + '…' : v}"`)).join('');
+  const kids = n.children.length;
+  return `<${n.tag}${a}>${kids ? '…' : ''}${['img', 'input', 'br', 'meta', 'link', 'hr'].includes(n.tag) ? '' : `</${n.tag}>`}`;
+}
+function fmt(v, depth = 0) {
+  let s;
+  if (v === undefined) s = 'undefined';
+  else if (v === null) s = 'null';
+  else if (typeof v === 'string') s = quote(v);
+  else if (typeof v === 'number' || typeof v === 'boolean') s = String(v);
+  else if (v instanceof El) s = elLabel(v.node);
+  else if (v instanceof NodeListV) s = `NodeList(${v.length}) [${v.slice(0, 6).map(x => fmt(x, depth + 1)).join(', ')}${v.length > 6 ? ', …' : ''}]`;
+  else if (Array.isArray(v)) s = depth > 1 ? `Array(${v.length})` : `(${v.length}) [${v.slice(0, 20).map(x => fmt(x, depth + 1)).join(', ')}${v.length > 20 ? ', …' : ''}]`;
+  else if (v instanceof Arrow) s = v.src;
+  else if (v instanceof HostFn) s = `ƒ ${v.name}() { [native code] }`;
+  else if (v instanceof Host) s = v.format ? v.format(depth, fmt) : v.label();
+  else if (isPlain(v)) {
+    const ks = Object.keys(v);
+    s = depth > 1 ? 'Object' : ks.length ? `{${ks.slice(0, 20).map(k => `${/^[A-Za-z_$][\w$]*$/.test(k) ? k : quote(k)}: ${fmt(v[k], depth + 1)}`).join(', ')}${ks.length > 20 ? ', …' : ''}}` : '{}';
+  } else s = String(v);
+  return s.length > 600 ? s.slice(0, 600) + '…' : s;
+}
+const fmtLog = (args) => args.map(a => (typeof a === 'string' ? a : fmt(a))).join(' ');
+
+// ---------- cookie ----------
+function cookieString(cookies) { return cookies.filter(c => !c.httpOnly).map(c => `${c.name}=${c.value}`).join('; '); }
+
+// ---------- atob / btoa（実ブラウザと同じくバイナリ文字列） ----------
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function btoaImpl(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i += 3) {
+    const a = s.charCodeAt(i), b = s.charCodeAt(i + 1), c = s.charCodeAt(i + 2);
+    if (a > 255 || b > 255 || c > 255) throw E('InvalidCharacterError', "Failed to execute 'btoa': The string to be encoded contains characters outside of the Latin1 range.");
+    out += B64[a >> 2] + B64[((a & 3) << 4) | ((b || 0) >> 4)] + (Number.isNaN(b) ? '=' : B64[((b & 15) << 2) | ((c || 0) >> 6)]) + (Number.isNaN(c) ? '=' : B64[c & 63]);
+  }
+  return out;
+}
+function atobImpl(s) {
+  s = s.replace(/[\t\n\f\r ]/g, '');
+  if (s.length % 4 === 1 || /[^A-Za-z0-9+/=]/.test(s)) throw E('InvalidCharacterError', "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.");
+  s = s.replace(/=+$/, '');
+  let out = '';
+  for (let i = 0; i < s.length; i += 4) {
+    const n = [0, 1, 2, 3].map(k => (i + k < s.length ? B64.indexOf(s[i + k]) : -1));
+    out += String.fromCharCode((n[0] << 2) | (n[1] >> 4));
+    if (n[2] >= 0) out += String.fromCharCode(((n[1] & 15) << 4) | (n[2] >> 2));
+    if (n[3] >= 0) out += String.fromCharCode(((n[2] & 3) << 6) | n[3]);
+  }
+  return out;
+}
+
+const ATTR_PROPS = { href: 'href', src: 'src', action: 'action', method: 'method', name: 'name', type: 'type', value: 'value', placeholder: 'placeholder', alt: 'alt', title: 'title', target: 'target', rel: 'rel', content: 'content', charset: 'charset', htmlFor: 'for', id: 'id', lang: 'lang', className: 'class' };
+const BOOL_PROPS = { checked: 'checked', disabled: 'disabled', hidden: 'hidden', required: 'required', readOnly: 'readonly', selected: 'selected', async: 'async', defer: 'defer' };
+const camel = (s) => s.replace(/-([a-z])/g, (m, c) => c.toUpperCase());
+const kebab = (s) => s.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+
+/**
+ * Repl を生成する。host は仮想ブラウザのセッションが提供する:
+ *  { root(), href(), userAgent, cookies[], local{}, session{}, globals{}, log(level,text), onDom(), onStorage(), onCookie() }
+ */
+function createRepl(host) {
+  const topScope = { vars: new Map(), parent: null };
+  let steps = 0, depth = 0;
+  const elCache = new Map();
+  const wrap = (n) => { if (!n) return null; let w = elCache.get(n.uid); if (!w) { w = new El(n); elCache.set(n.uid, w); } return w; };
+  const list = (nodes) => { const l = new NodeListV(); nodes.forEach(n => l.push(wrap(n))); return l; };
+  const fn = (name, f) => new HostFn(name, f);
+  const needEl = (v, what) => { if (!(v instanceof El)) throw E('TypeError', `${what} is not an Element`); return v.node; };
+  const sel = (root, s) => { try { return H.querySelectorAll(root, toStr(s)); } catch (e) { throw E('SyntaxError', `Failed to execute 'querySelectorAll' on 'Document': ${e.message.replace('SyntaxError: ', '')}`); } };
+
+  const base = () => new URL(host.href());
+  const resolveUrl = (v) => { try { return new URL(v, base()).href; } catch { return v; } };
+
+  // ---------- Style / Storage ----------
+  class StyleHost extends Host {
+    constructor(n) { super(); this.n = n; }
+    label() { return 'CSSStyleDeclaration'; }
+    get(k) { const s = H.styleOf(this.n); return s[kebab(k)] ?? ''; }
+    set(k, v) {
+      const s = H.styleOf(this.n); s[kebab(k)] = toStr(v);
+      this.n.attrs.style = Object.entries(s).filter(([, x]) => x !== '').map(([a, b]) => `${a}: ${b}`).join('; '); host.onDom();
+    }
+    keys() { return Object.keys(H.styleOf(this.n)).map(camel); }
+  }
+  class StorageHost extends Host {
+    constructor(name, data) { super(); this.nameV = name; this.data = data; }
+    label() { return 'Storage'; }
+    get(k) {
+      if (k === 'length') return Object.keys(this.data).length;
+      if (k === 'getItem') return fn('getItem', (t, a) => (Object.prototype.hasOwnProperty.call(this.data, toStr(a[0])) ? this.data[toStr(a[0])] : null));
+      if (k === 'setItem') return fn('setItem', (t, a) => { this.data[toStr(a[0])] = toStr(a[1]); host.onStorage(); });
+      if (k === 'removeItem') return fn('removeItem', (t, a) => { delete this.data[toStr(a[0])]; host.onStorage(); });
+      if (k === 'clear') return fn('clear', () => { for (const x of Object.keys(this.data)) delete this.data[x]; host.onStorage(); });
+      if (k === 'key') return fn('key', (t, a) => Object.keys(this.data)[toNum(a[0])] ?? null);
+      return Object.prototype.hasOwnProperty.call(this.data, k) ? this.data[k] : undefined;
+    }
+    set(k, v) { this.data[k] = toStr(v); host.onStorage(); }
+    keys() { return Object.keys(this.data); }
+    format(d, f) { const ks = Object.keys(this.data); return `Storage {${ks.slice(0, 12).map(k => `${k}: ${f(this.data[k], 2)}`).join(', ')}${ks.length ? ', ' : ''}length: ${ks.length}}`; }
+  }
+
+  // ---------- Document / Location / Navigator / Window / Console ----------
+  const docQuery = (root) => ({
+    querySelector: fn('querySelector', (t, a) => wrap(H.querySelector(root, toStr(a[0])))),
+    querySelectorAll: fn('querySelectorAll', (t, a) => list(sel(root, a[0]))),
+  });
+  class DocumentHost extends Host {
+    label() { return '#document'; }
+    format() { return '#document'; }
+    get(k) {
+      const root = host.root();
+      const html = () => H.querySelector(root, 'html'), q = (s) => H.querySelector(root, s);
+      switch (k) {
+        case 'title': { const t = q('title'); return t ? H.textContent(t).trim() : ''; }
+        case 'cookie': return cookieString(host.cookies);
+        case 'URL': case 'documentURI': return host.href();
+        case 'domain': return base().hostname;
+        case 'referrer': return '';
+        case 'readyState': return 'complete';
+        case 'characterSet': case 'charset': return 'UTF-8';
+        case 'contentType': return 'text/html';
+        case 'documentElement': return wrap(html());
+        case 'body': return wrap(q('body'));
+        case 'head': return wrap(q('head'));
+        case 'forms': return list(H.querySelectorAll(root, 'form'));
+        case 'links': return list(H.querySelectorAll(root, 'a[href], area[href]'));
+        case 'scripts': return list(H.querySelectorAll(root, 'script'));
+        case 'images': return list(H.querySelectorAll(root, 'img'));
+        case 'querySelector': case 'querySelectorAll': return docQuery(root)[k];
+        case 'getElementById': return fn('getElementById', (t, a) => wrap(q('#' + toStr(a[0]).replace(/[^\w-]/g, '')) || H.allNodes(root).find(n => n.t === 'el' && n.attrs.id === toStr(a[0])) || null));
+        case 'getElementsByTagName': return fn('getElementsByTagName', (t, a) => list(H.querySelectorAll(root, toStr(a[0]) === '*' ? '*' : toStr(a[0]).replace(/[^\w-]/g, ''))));
+        case 'getElementsByClassName': return fn('getElementsByClassName', (t, a) => list(H.querySelectorAll(root, '.' + toStr(a[0]).replace(/[^\w-]/g, ''))));
+        case 'getElementsByName': return fn('getElementsByName', (t, a) => list(H.allNodes(root).filter(n => n.t === 'el' && n.attrs.name === toStr(a[0]))));
+        default: return undefined;
+      }
+    }
+    set(k, v) {
+      if (k === 'title') {
+        let t = H.querySelector(host.root(), 'title');
+        if (!t) { const h = H.querySelector(host.root(), 'head'); if (!h) return; t = { t: 'el', tag: 'title', attrs: {}, children: [], parent: h, uid: H.nextUid() }; h.children.push(t); }
+        t.children = [{ t: 'text', text: toStr(v), parent: t, uid: H.nextUid(), raw: true }]; host.onDom(); return;
+      }
+      if (k === 'cookie') {
+        const parts = toStr(v).split(';').map(s => s.trim());
+        const [name, ...rest] = parts[0].split('=');
+        if (!name) return;
+        const attrs = parts.slice(1).map(s => s.toLowerCase());
+        if (attrs.includes('httponly')) return; // JavaScriptからHttpOnly属性付きのCookieは作れない
+        const val = rest.join('=');
+        const ex = host.cookies.find(c => c.name === name.trim());
+        if (ex && ex.httpOnly) return; // HttpOnlyのCookieはJavaScriptから上書きできない
+        const exp = parts.slice(1).find(s => /^expires=/i.test(s) || /^max-age=/i.test(s));
+        if (ex) { ex.value = val; } else host.cookies.push({ name: name.trim(), value: val, domain: base().hostname, path: '/', expires: exp ? exp.split('=')[1] : 'Session', httpOnly: false, secure: attrs.includes('secure'), sameSite: (attrs.find(a => a.startsWith('samesite=')) || '').split('=')[1] || '' });
+        host.onCookie(); return;
+      }
+      super.set(k);
+    }
+  }
+  class LocationHost extends Host {
+    label() { return 'Location'; }
+    format() { return `Location {href: ${quote(host.href())}, origin: ${quote(base().origin)}, pathname: ${quote(base().pathname)}, …}`; }
+    get(k) {
+      const u = base();
+      if (k === 'href') return u.href;
+      if (['origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'].includes(k)) return u[k];
+      if (k === 'toString') return fn('toString', () => u.href);
+      return undefined;
+    }
+  }
+  class NavigatorHost extends Host {
+    label() { return 'Navigator'; }
+    get(k) {
+      return ({ userAgent: host.userAgent, language: 'ja-JP', languages: ['ja-JP', 'ja', 'en-US'], platform: 'Linux armv81', onLine: true, cookieEnabled: true, hardwareConcurrency: 8, maxTouchPoints: 5, webdriver: false, vendor: 'Google Inc.' })[k];
+    }
+  }
+  class ConsoleHost extends Host {
+    label() { return 'console'; }
+    get(k) {
+      if (['log', 'info', 'warn', 'error', 'debug'].includes(k)) return fn(k, (t, a) => { host.log(k === 'debug' ? 'log' : k, fmtLog(a)); });
+      if (k === 'clear') return fn('clear', () => host.log('clear', ''));
+      if (k === 'table') return fn('table', (t, a) => { host.log('log', fmtLog(a)); });
+      return undefined;
+    }
+  }
+  const documentH = new DocumentHost(), locationH = new LocationHost(), navigatorH = new NavigatorHost(), consoleH = new ConsoleHost();
+  const localH = new StorageHost('localStorage', host.local), sessionH = new StorageHost('sessionStorage', host.session);
+  class WindowHost extends Host {
+    label() { return 'Window'; }
+    format() { return 'Window {window: Window, self: Window, document: document, location: Location, …}'; }
+    get(k) {
+      const b = builtin(k); if (b !== undefined) return b;
+      return Object.prototype.hasOwnProperty.call(host.globals, k) ? host.globals[k] : undefined;
+    }
+    set(k, v) { if (BLOCKED.has(k)) return; host.globals[k] = v; }
+    keys() { return Object.keys(host.globals); }
+  }
+  const windowH = new WindowHost();
+
+  // ---------- 静的ビルトイン ----------
+  const ObjectNS = new (class extends Host {
+    label() { return 'Object'; }
+    get(k) {
+      const keysOf = (o) => (o instanceof Host ? o.keys() : Array.isArray(o) ? o.map((x, i) => String(i)) : isPlain(o) ? Object.keys(o) : o instanceof El ? [] : typeof o === 'string' ? [...o].map((x, i) => String(i)) : []);
+      const valOf = (o, k2) => (o instanceof Host ? o.get(k2) : o[k2]);
+      if (k === 'keys') return fn('keys', (t, a) => keysOf(a[0]));
+      if (k === 'values') return fn('values', (t, a) => keysOf(a[0]).map(x => valOf(a[0], x)));
+      if (k === 'entries') return fn('entries', (t, a) => keysOf(a[0]).map(x => [x, valOf(a[0], x)]));
+      return undefined;
+    }
+  })();
+  const ArrayNS = new (class extends Host {
+    label() { return 'Array'; }
+    get(k) {
+      if (k === 'isArray') return fn('isArray', (t, a) => Array.isArray(a[0]));
+      if (k === 'from') return fn('from', (t, a) => {
+        const v = a[0];
+        const arr = Array.isArray(v) ? [...v] : typeof v === 'string' ? [...v] : v instanceof Host ? v.keys().map(x => v.get(x)) : [];
+        return a[1] ? arr.map((x, i) => callFn(a[1], undefined, [x, i])) : arr;
+      });
+      return undefined;
+    }
+  })();
+  const JSONNS = new (class extends Host {
+    label() { return 'JSON'; }
+    get(k) {
+      if (k === 'parse') return fn('parse', (t, a) => { try { return JSON.parse(toStr(a[0])); } catch (e) { throw E('SyntaxError', e.message); } });
+      if (k === 'stringify') return fn('stringify', (t, a) => {
+        const plain = (v, d) => {
+          if (d > 8) return undefined;
+          if (v === undefined || v instanceof Arrow || v instanceof HostFn) return undefined;
+          if (v === null || typeof v !== 'object') return v;
+          if (v instanceof El || v instanceof Host) return v instanceof StorageHost ? Object.fromEntries(v.keys().map(x => [x, v.get(x)])) : {};
+          if (Array.isArray(v)) return v.map(x => plain(x, d + 1) ?? null);
+          const o = {}; for (const x of Object.keys(v)) { const p = plain(v[x], d + 1); if (p !== undefined) o[x] = p; } return o;
+        };
+        const sp = a[2] === undefined ? undefined : Math.min(8, toNum(a[2]) || 0);
+        return JSON.stringify(plain(a[0], 0), null, sp);
+      });
+      return undefined;
+    }
+  })();
+  const MathNS = new (class extends Host {
+    label() { return 'Math'; }
+    get(k) {
+      const m1 = { floor: Math.floor, ceil: Math.ceil, round: Math.round, abs: Math.abs, sqrt: Math.sqrt, trunc: Math.trunc, log: Math.log, sign: Math.sign };
+      if (m1[k]) return fn(k, (t, a) => m1[k](toNum(a[0])));
+      if (k === 'max' || k === 'min') return fn(k, (t, a) => Math[k](...a.map(toNum)));
+      if (k === 'pow') return fn('pow', (t, a) => Math.pow(toNum(a[0]), toNum(a[1])));
+      if (k === 'random') return fn('random', () => 0.5);
+      if (k === 'PI') return Math.PI;
+      return undefined;
+    }
+  })();
+  const GLOBAL_FNS = {
+    atob: (t, a) => atobImpl(toStr(a[0])), btoa: (t, a) => btoaImpl(toStr(a[0])),
+    parseInt: (t, a) => { const r = a[1] === undefined ? undefined : toNum(a[1]); return parseInt(toStr(a[0]), r); },
+    parseFloat: (t, a) => parseFloat(toStr(a[0])), isNaN: (t, a) => Number.isNaN(toNum(a[0])),
+    encodeURIComponent: (t, a) => encodeURIComponent(toStr(a[0])), decodeURIComponent: (t, a) => { try { return decodeURIComponent(toStr(a[0])); } catch { throw E('URIError', 'URI malformed'); } },
+    encodeURI: (t, a) => encodeURI(toStr(a[0])), String: (t, a) => toStr(a[0]), Number: (t, a) => toNum(a[0]), Boolean: (t, a) => truthy(a[0]),
+    $: (t, a) => wrap(H.querySelector(host.root(), toStr(a[0]))), $$: (t, a) => list(sel(host.root(), a[0])),
+  };
+  const builtins = {
+    document: documentH, window: windowH, self: windowH, globalThis: windowH, location: locationH, navigator: navigatorH, console: consoleH,
+    localStorage: localH, sessionStorage: sessionH, Object: ObjectNS, Array: ArrayNS, JSON: JSONNS, Math: MathNS, NaN, Infinity,
+  };
+  for (const [n, f] of Object.entries(GLOBAL_FNS)) builtins[n] = fn(n, f);
+  function builtin(name) { return Object.prototype.hasOwnProperty.call(builtins, name) ? builtins[name] : undefined; }
+
+  // ---------- 文字列/配列/数値メソッド ----------
+  const argN = (a, i, d) => (a[i] === undefined ? d : toNum(a[i]));
+  const STR = {
+    split: (s, a) => (a[0] === undefined ? [s] : s.split(toStr(a[0]), a[1] === undefined ? undefined : toNum(a[1]))),
+    slice: (s, a) => s.slice(argN(a, 0, 0), a[1] === undefined ? undefined : toNum(a[1])),
+    substring: (s, a) => s.substring(argN(a, 0, 0), a[1] === undefined ? undefined : toNum(a[1])),
+    substr: (s, a) => s.substr(argN(a, 0, 0), a[1] === undefined ? undefined : toNum(a[1])),
+    toUpperCase: (s) => s.toUpperCase(), toLowerCase: (s) => s.toLowerCase(), trim: (s) => s.trim(), trimStart: (s) => s.trimStart(), trimEnd: (s) => s.trimEnd(),
+    includes: (s, a) => s.includes(toStr(a[0])), indexOf: (s, a) => s.indexOf(toStr(a[0])), lastIndexOf: (s, a) => s.lastIndexOf(toStr(a[0])),
+    startsWith: (s, a) => s.startsWith(toStr(a[0])), endsWith: (s, a) => s.endsWith(toStr(a[0])),
+    replace: (s, a) => s.replace(toStr(a[0]), () => toStr(a[1])), replaceAll: (s, a) => s.split(toStr(a[0])).join(toStr(a[1])),
+    charAt: (s, a) => s.charAt(argN(a, 0, 0)), charCodeAt: (s, a) => s.charCodeAt(argN(a, 0, 0)), at: (s, a) => s.at(argN(a, 0, 0)),
+    padStart: (s, a) => s.padStart(Math.min(200, argN(a, 0, 0)), a[1] === undefined ? ' ' : toStr(a[1])), padEnd: (s, a) => s.padEnd(Math.min(200, argN(a, 0, 0)), a[1] === undefined ? ' ' : toStr(a[1])),
+    repeat: (s, a) => s.repeat(Math.min(500, Math.max(0, argN(a, 0, 0)))), concat: (s, a) => s + a.map(toStr).join(''), toString: (s) => s,
+  };
+  const ARR = {
+    map: (r, a) => r.map((x, i) => callFn(a[0], undefined, [x, i, r])), filter: (r, a) => r.filter((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))),
+    forEach: (r, a) => { r.forEach((x, i) => callFn(a[0], undefined, [x, i, r])); }, find: (r, a) => r.find((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))),
+    findIndex: (r, a) => r.findIndex((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))), some: (r, a) => r.some((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))),
+    every: (r, a) => r.every((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))), join: (r, a) => r.map(x => (x === null || x === undefined ? '' : toStr(x))).join(a[0] === undefined ? ',' : toStr(a[0])),
+    slice: (r, a) => r.slice(argN(a, 0, 0), a[1] === undefined ? undefined : toNum(a[1])), concat: (r, a) => r.concat(...a.map(x => (Array.isArray(x) ? [...x] : [x]))),
+    includes: (r, a) => r.includes(a[0]), indexOf: (r, a) => r.indexOf(a[0]), at: (r, a) => r.at(argN(a, 0, 0)), push: (r, a) => r.push(...a), pop: (r) => r.pop(),
+    reverse: (r) => r.reverse(), reduce: (r, a) => (a.length > 1 ? r.reduce((acc, x, i) => callFn(a[0], undefined, [acc, x, i, r]), a[1]) : r.reduce((acc, x, i) => callFn(a[0], undefined, [acc, x, i, r]))),
+    sort: (r, a) => r.sort(a[0] === undefined ? (x, y) => (toStr(x) < toStr(y) ? -1 : toStr(x) > toStr(y) ? 1 : 0) : (x, y) => toNum(callFn(a[0], undefined, [x, y]))),
+    flat: (r) => r.flat(), toString: (r) => toStr(r),
+  };
+  const NUM = { toFixed: (n, a) => n.toFixed(Math.min(20, Math.max(0, argN(a, 0, 0)))), toString: (n, a) => n.toString(a[0] === undefined ? 10 : toNum(a[0])) };
+
+  // ---------- Element ----------
+  function elGet(el, k) {
+    const n = el.node;
+    if (k === 'tagName' || k === 'nodeName') return n.tag.toUpperCase();
+    if (k === 'localName') return n.tag;
+    if (ATTR_PROPS[k]) { const a = ATTR_PROPS[k]; const v = n.attrs[a]; if (v === undefined) return ''; return (k === 'href' || k === 'src' || k === 'action') ? resolveUrl(v) : v; }
+    if (BOOL_PROPS[k]) return n.attrs[BOOL_PROPS[k]] !== undefined;
+    switch (k) {
+      case 'textContent': return H.textContent(n);
+      case 'innerText': return H.innerText(n);
+      case 'innerHTML': return H.innerHTML(n);
+      case 'outerHTML': return H.outerHTML(n);
+      case 'children': return list(n.children.filter(c => c.t === 'el'));
+      case 'childElementCount': return n.children.filter(c => c.t === 'el').length;
+      case 'firstElementChild': return wrap(n.children.find(c => c.t === 'el') || null);
+      case 'lastElementChild': return wrap([...n.children].reverse().find(c => c.t === 'el') || null);
+      case 'parentElement': case 'parentNode': return n.parent && n.parent.tag !== '#document' ? wrap(n.parent) : null;
+      case 'nextElementSibling': { const s = (n.parent ? n.parent.children : []).filter(c => c.t === 'el'); return wrap(s[s.indexOf(n) + 1] || null); }
+      case 'previousElementSibling': { const s = (n.parent ? n.parent.children : []).filter(c => c.t === 'el'); return wrap(s[s.indexOf(n) - 1] || null); }
+      case 'classList': return Object.assign((n.attrs.class || '').split(/\s+/).filter(Boolean), {});
+      case 'attributes': return Object.entries(n.attrs).map(([name, value]) => ({ name, value }));
+      case 'dataset': { const o = {}; for (const [a, v] of Object.entries(n.attrs)) if (a.startsWith('data-')) o[camel(a.slice(5))] = v; return o; }
+      case 'style': return new StyleHost(n);
+      case 'getAttribute': return fn('getAttribute', (t, a) => (n.attrs[toStr(a[0]).toLowerCase()] ?? null));
+      case 'setAttribute': return fn('setAttribute', (t, a) => { n.attrs[toStr(a[0]).toLowerCase()] = toStr(a[1]); host.onDom(); });
+      case 'removeAttribute': return fn('removeAttribute', (t, a) => { delete n.attrs[toStr(a[0]).toLowerCase()]; host.onDom(); });
+      case 'hasAttribute': return fn('hasAttribute', (t, a) => n.attrs[toStr(a[0]).toLowerCase()] !== undefined);
+      case 'getAttributeNames': return fn('getAttributeNames', () => Object.keys(n.attrs));
+      case 'querySelector': return fn('querySelector', (t, a) => wrap(H.querySelector(n, toStr(a[0]))));
+      case 'querySelectorAll': return fn('querySelectorAll', (t, a) => list(sel(n, a[0])));
+      case 'closest': return fn('closest', (t, a) => wrap(H.closest(n, toStr(a[0]))));
+      case 'matches': return fn('matches', (t, a) => H.matches(n, toStr(a[0])));
+      case 'remove': return fn('remove', () => { H.removeNode(n); host.onDom(); });
+      case 'click': return fn('click', () => { host.log('log', `click() → ${H.openTag(n)}`); });
+      case 'contains': return fn('contains', (t, a) => { for (let x = a[0] instanceof El ? a[0].node : null; x; x = x.parent) if (x === n) return true; return false; });
+      default: return undefined;
+    }
+  }
+  function elSet(el, k, v) {
+    const n = el.node;
+    if (ATTR_PROPS[k]) { n.attrs[ATTR_PROPS[k]] = toStr(v); host.onDom(); return; }
+    if (BOOL_PROPS[k]) { if (truthy(v)) n.attrs[BOOL_PROPS[k]] = ''; else delete n.attrs[BOOL_PROPS[k]]; host.onDom(); return; }
+    if (k === 'textContent' || k === 'innerText') { n.children = [{ t: 'text', text: toStr(v), parent: n, uid: H.nextUid() }]; host.onDom(); return; }
+    if (k === 'innerHTML') {
+      const frag = H.parseHtml(toStr(v));
+      n.children = frag.children; n.children.forEach(c => { c.parent = n; }); host.onDom(); return;
+    }
+    throw E('TypeError', `Cannot set property '${k}' of ${elLabel(n)}`);
+  }
+
+  // ---------- プロパティ取得/設定/呼び出し ----------
+  function getProp(obj, key, describe) {
+    if (obj === null || obj === undefined) throw E('TypeError', `Cannot read properties of ${obj === null ? 'null' : 'undefined'} (reading '${String(key)}')`);
+    key = typeof key === 'number' ? String(key) : key;
+    if (typeof key !== 'string') key = toStr(key);
+    if (BLOCKED.has(key)) return undefined;
+    if (typeof obj === 'string') {
+      if (key === 'length') return obj.length;
+      if (/^\d+$/.test(key)) return obj[Number(key)];
+      return STR[key] ? fn(key, (t, a) => STR[key](obj, a)) : undefined;
+    }
+    if (typeof obj === 'number') return NUM[key] ? fn(key, (t, a) => NUM[key](obj, a)) : undefined;
+    if (typeof obj === 'boolean') return undefined;
+    if (obj instanceof El) return elGet(obj, key);
+    if (obj instanceof Host) return obj.get(key);
+    if (Array.isArray(obj)) {
+      if (key === 'length') return obj.length;
+      if (/^\d+$/.test(key)) return obj[Number(key)];
+      if (obj.__classList && key === 'contains') return undefined;
+      if (key === 'item' && obj instanceof NodeListV) return fn('item', (t, a) => obj[toNum(a[0])] ?? null);
+      if (key === 'contains' && !ARR.contains) return fn('contains', (t, a) => obj.includes(toStr(a[0])));
+      return ARR[key] ? fn(key, (t, a) => ARR[key](obj, a)) : undefined;
+    }
+    if (isPlain(obj)) return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+    return undefined;
+  }
+  function setProp(obj, key, val) {
+    if (obj === null || obj === undefined) throw E('TypeError', `Cannot set properties of ${obj === null ? 'null' : 'undefined'} (setting '${String(key)}')`);
+    key = typeof key === 'string' ? key : toStr(key);
+    if (BLOCKED.has(key)) return;
+    if (obj instanceof El) return elSet(obj, key, val);
+    if (obj instanceof Host) return obj.set(key, val);
+    if (Array.isArray(obj)) { if (/^\d+$/.test(key)) obj[Number(key)] = val; return; }
+    if (isPlain(obj)) { obj[key] = val; }
+  }
+  function callFn(f, thisVal, args, text) {
+    if (f instanceof HostFn) return f.fn(thisVal, args);
+    if (f instanceof Arrow) {
+      if (++depth > MAX_DEPTH) { depth = 0; throw E('RangeError', 'Maximum call stack size exceeded'); }
+      try {
+        const scope = { vars: new Map(), parent: f.scope };
+        f.params.forEach((p, i) => scope.vars.set(p, { v: args[i], c: false }));
+        return ev(f.body, scope);
+      } finally { depth--; }
+    }
+    throw E('TypeError', `${text || toStr(f)} is not a function`);
+  }
+
+  // ---------- 評価 ----------
+  const lookup = (name, scope) => {
+    for (let s = scope; s; s = s.parent) if (s.vars.has(name)) return s.vars.get(name).v;
+    const b = builtin(name); if (b !== undefined) return b;
+    if (Object.prototype.hasOwnProperty.call(host.globals, name)) return host.globals[name];
+    throw E('ReferenceError', `${name} is not defined`);
+  };
+  const looseEq = (a, b) => {
+    const prim = (x) => x === null || x === undefined || typeof x !== 'object' && typeof x !== 'function';
+    if (prim(a) && prim(b)) return a == b; // eslint-disable-line eqeqeq
+    return a === b;
+  };
+  function ev(n, scope) {
+    if (++steps > MAX_STEPS) throw E('RangeError', '実行ステップ数の上限を超えました');
+    switch (n.k) {
+      case 'num': case 'str': return n.v;
+      case 'lit': return n.v;
+      case 'group': return ev(n.e, scope);
+      case 'tpl': return n.quasis.reduce((acc, q, i) => acc + q + (i < n.exprs.length ? toStr(ev(n.exprs[i], scope)) : ''), '');
+      case 'array': return n.items.map(x => ev(x, scope));
+      case 'object': { const o = {}; for (const p of n.props) if (!BLOCKED.has(p.key)) o[p.key] = ev(p.value, scope); return o; }
+      case 'id': return lookup(n.name, scope);
+      case 'member': { const o = ev(n.obj, scope); if (n.optional && (o === null || o === undefined)) return undefined; return getProp(o, n.name); }
+      case 'index': { const o = ev(n.obj, scope); if (n.optional && (o === null || o === undefined)) return undefined; return getProp(o, ev(n.idx, scope)); }
+      case 'call': {
+        let thisVal, f;
+        if (n.callee.k === 'member' || n.callee.k === 'index') {
+          thisVal = ev(n.callee.obj, scope);
+          if (n.callee.optional && (thisVal === null || thisVal === undefined)) return undefined;
+          f = getProp(thisVal, n.callee.k === 'member' ? n.callee.name : ev(n.callee.idx, scope));
+        } else f = ev(n.callee, scope);
+        if (n.optional && (f === null || f === undefined)) return undefined;
+        const text = n.src ? n.src : undefined;
+        return callFn(f, thisVal, n.args.map(a => ev(a, scope)), calleeText(n.callee));
+      }
+      case 'arrow': return new Arrow(n.params, n.body, scope, srcSlice(n));
+      case 'unary': {
+        if (n.op === 'typeof') { let v; try { v = ev(n.e, scope); } catch (e) { if (e instanceof ReplError && e.errName === 'ReferenceError') return 'undefined'; throw e; } return v === null ? 'object' : (v instanceof Arrow || v instanceof HostFn) ? 'function' : typeof v === 'object' || v instanceof Host ? 'object' : typeof v; }
+        const v = ev(n.e, scope);
+        return n.op === '!' ? !truthy(v) : n.op === '-' ? -toNum(v) : toNum(v);
+      }
+      case 'bin': {
+        if (n.op === '&&') { const l = ev(n.l, scope); return truthy(l) ? ev(n.r, scope) : l; }
+        if (n.op === '||') { const l = ev(n.l, scope); return truthy(l) ? l : ev(n.r, scope); }
+        if (n.op === '??') { const l = ev(n.l, scope); return l === null || l === undefined ? ev(n.r, scope) : l; }
+        const l = ev(n.l, scope), r = ev(n.r, scope);
+        switch (n.op) {
+          case '+': return typeof l === 'string' || typeof r === 'string' || typeof l === 'object' && l !== null || typeof r === 'object' && r !== null ? toStr(l) + toStr(r) : toNum(l) + toNum(r);
+          case '-': return toNum(l) - toNum(r);
+          case '*': return toNum(l) * toNum(r);
+          case '%': return toNum(l) % toNum(r);
+          case '===': return l === r;
+          case '!==': return l !== r;
+          case '==': return looseEq(l, r);
+          case '!=': return !looseEq(l, r);
+          case '<': return (typeof l === 'string' && typeof r === 'string') ? l < r : toNum(l) < toNum(r);
+          case '>': return (typeof l === 'string' && typeof r === 'string') ? l > r : toNum(l) > toNum(r);
+          case '<=': return (typeof l === 'string' && typeof r === 'string') ? l <= r : toNum(l) <= toNum(r);
+          default: return (typeof l === 'string' && typeof r === 'string') ? l >= r : toNum(l) >= toNum(r);
+        }
+      }
+      case 'cond': return truthy(ev(n.c, scope)) ? ev(n.a, scope) : ev(n.b, scope);
+      case 'assign': return assign(n, scope);
+      default: throw E('SyntaxError', `未対応の式: ${n.k}`);
+    }
+  }
+  let curSrc = '';
+  const srcSlice = (n) => (n.s !== undefined && n.e !== undefined ? curSrc.slice(n.s, n.e) : 'ƒ');
+  function calleeText(c) { return srcSlice(c) !== 'ƒ' ? srcSlice(c) : c.k === 'id' ? c.name : 'expression'; }
+  function assign(n, scope) {
+    const t = n.target;
+    let val;
+    const cur = () => (t.k === 'id' ? lookup(t.name, scope) : t.k === 'member' ? getProp(ev(t.obj, scope), t.name) : getProp(ev(t.obj, scope), ev(t.idx, scope)));
+    if (n.op === '=') val = ev(n.value, scope);
+    else { const a = cur(), b = ev(n.value, scope); val = n.op === '+=' ? (typeof a === 'string' || typeof b === 'string' ? toStr(a) + toStr(b) : toNum(a) + toNum(b)) : toNum(a) - toNum(b); }
+    if (t.k === 'id') {
+      for (let s = scope; s; s = s.parent) if (s.vars.has(t.name)) { const e = s.vars.get(t.name); if (e.c) throw E('TypeError', 'Assignment to constant variable.'); e.v = val; return val; }
+      topScope.vars.set(t.name, { v: val, c: false }); return val;
+    }
+    const obj = ev(t.obj, scope);
+    setProp(obj, t.k === 'member' ? t.name : ev(t.idx, scope), val);
+    return val;
+  }
+  function execStmt(st) {
+    if (st.k === 'decl') {
+      if (topScope.vars.has(st.name) && topScope.vars.get(st.name).kind !== 'var' && st.kind !== 'var') { /* 再宣言はREPLでは許容 */ }
+      topScope.vars.set(st.name, { v: st.init ? ev(st.init, topScope) : undefined, c: st.kind === 'const', kind: st.kind });
+      return undefined;
+    }
+    return ev(st.e, topScope);
+  }
+
+  return {
+    vars: topScope.vars,
+    /** 1行(複数文可)を実行。{ ok, text, value } / { ok:false, name, message, text } */
+    run(text) {
+      steps = 0; depth = 0; curSrc = text;
+      try {
+        const prog = parse(text);
+        let val;
+        for (const st of prog) val = execStmt(st);
+        return { ok: true, value: val, text: fmt(val) };
+      } catch (e) {
+        if (e instanceof ParseError || e instanceof ReplError) return { ok: false, name: e.errName, message: e.message, text: `Uncaught ${e.errName}: ${e.message}` };
+        throw e;
+      }
+    },
+    fmt, wrap,
+  };
+}
+
+Object.assign(exports, { ReplError, El, toStr, elLabel, fmt, cookieString, createRepl });
+
+};
+__mods["js/vb/session.js"] = function (module, exports, __require) {
+// ============================================================
+// 仮想ブラウザのセッション: 1ミッション分の「架空ページ」と DevTools の状態を保持する。
+// 実際のネットワークには一切アクセスしない（すべてミッション定義のデータ）。
+// def = { url, userAgent?, html, console[], network[], storage{local,session,cookies[]},
+//         sources{path:text}, breakpoints{"file:line":{scope,stack}}, globals{}, security{}, issues[], perf{}, tabs[] }
+// ============================================================
+const H = __require("js/vb/html.js");
+const { createRepl, cookieString } = __require("js/vb/jsrepl.js");
+
+const DEFAULT_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+const ALL_TABS = ['elements', 'console', 'network', 'sources', 'application', 'security', 'performance'];
+const TAB_LABEL = { elements: 'Elements', console: 'Console', network: 'Network', sources: 'Sources', application: 'Application', security: 'Security', performance: 'Performance' };
+
+const STATUS_TEXT = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed', 429: 'Too Many Requests', 500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable' };
+const THROTTLES = { none: { label: 'No throttling', f: 1 }, fast4g: { label: 'Fast 4G', f: 2 }, slow4g: { label: 'Slow 4G', f: 5 }, offline: { label: 'Offline', f: null } };
+
+const clone = (o) => JSON.parse(JSON.stringify(o));
+
+function formatBytes(n) {
+  if (n == null) return '-';
+  if (n < 1000) return `${n} B`;
+  if (n < 1e6) return `${(n / 1000).toFixed(n < 1e4 ? 1 : 0)} kB`;
+  return `${(n / 1e6).toFixed(1)} MB`;
+}
+function formatMs(ms) { return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`; }
+
+function guessType(r) {
+  if (r.type) return r.type;
+  const m = (r.mime || '').toLowerCase(), u = r.url.split('?')[0].toLowerCase();
+  if (/html/.test(m) || /\.html?$/.test(u)) return 'document';
+  if (/javascript/.test(m) || /\.m?js$/.test(u)) return 'script';
+  if (/css/.test(m) || /\.css$/.test(u)) return 'stylesheet';
+  if (/^image\//.test(m) || /\.(png|jpe?g|gif|webp|svg|ico)$/.test(u)) return 'img';
+  if (/font/.test(m) || /\.(woff2?|ttf)$/.test(u)) return 'font';
+  if (/json/.test(m)) return 'fetch';
+  return 'other';
+}
+
+function createSession(def) {
+  const root = H.parseHtml(def.html || '<html><body></body></html>');
+  const page = new URL(def.url);
+  const ses = {
+    def, root, page,
+    tabs: def.tabs && def.tabs.length ? def.tabs : ALL_TABS,
+    cookies: clone((def.storage && def.storage.cookies) || []),
+    local: clone((def.storage && def.storage.local) || {}),
+    session: clone((def.storage && def.storage.session) || {}),
+    globals: clone(def.globals || {}),
+    consoleLog: [],          // { level, text, source?, nav? }
+    replHistory: [],         // 実行した式（デバッグ状態の判定に使う）
+    state: { visited: new Set(['elements']), breakpoints: [], paused: null, pausedOnce: [], filtersUsed: new Set(), viewedRequests: new Set(), searches: [], throttle: 'none', domEdits: 0, storageEdits: 0, sourcesOpened: new Set(), prettyPrinted: new Set(), networkFilter: 'all' },
+    listeners: new Set(),
+    userAgent: def.userAgent || DEFAULT_UA,
+    domVersion: 0,
+  };
+  const notify = (what) => { ses.domVersion++; for (const f of ses.listeners) f(what); };
+  for (const m of (def.console || [])) ses.consoleLog.push({ level: m.level || 'log', text: m.text, source: m.source || null, nav: m.nav || null });
+
+  // ---- ネットワーク: 正規化 ----
+  ses.requests = (def.network || []).map((r, i) => {
+    const u = new URL(r.url, page);
+    const type = guessType(r);
+    const name = (u.pathname.split('/').filter(Boolean).pop() || u.hostname) + (u.search && type === 'fetch' ? '' : '');
+    return {
+      id: r.id || `r${i + 1}`, idx: i, method: r.method || 'GET', url: u.href, host: u.host, path: u.pathname + u.search, name, type,
+      status: r.failed ? 0 : (r.status ?? 200), statusText: r.failed ? '(failed)' : (r.statusText || STATUS_TEXT[r.status ?? 200] || ''),
+      failed: r.failed || null, blocked: r.blocked || null, mime: r.mime || '', initiator: r.initiator || '', protocol: r.protocol || 'h2', remote: r.remote || '',
+      size: r.size ?? 0, resourceSize: r.resourceSize ?? r.size ?? 0, time: r.time ?? 50, start: r.start ?? 0, fromCache: !!r.fromCache,
+      reqHeaders: r.reqHeaders || {}, resHeaders: r.resHeaders || {}, reqBody: r.reqBody || '', resBody: r.resBody ?? '', note: r.note || '',
+      params: [...u.searchParams.entries()],
+      thirdParty: u.host !== page.host,
+    };
+  });
+
+  // ---- 実行系(Console) ----
+  const repl = createRepl({
+    root: () => root, href: () => page.href, userAgent: ses.userAgent, cookies: ses.cookies, local: ses.local, session: ses.session, globals: ses.globals,
+    log: (level, text) => { if (level === 'clear') ses.consoleLog.length = 0; else ses.consoleLog.push({ level, text, source: 'VM:1' }); notify('console'); },
+    onDom: () => { ses.state.domEdits++; notify('dom'); }, onStorage: () => { ses.state.storageEdits++; notify('storage'); }, onCookie: () => { ses.state.storageEdits++; notify('storage'); },
+  });
+  ses.repl = repl;
+  ses.runConsole = (text) => {
+    const t = text.trim(); if (!t) return null;
+    ses.replHistory.push(t);
+    ses.consoleLog.push({ level: 'input', text: t });
+    let r;
+    try { r = repl.run(t); } catch (e) { r = { ok: false, name: 'Error', message: String(e && e.message || e), text: `Uncaught Error: ${e && e.message}` }; }
+    ses.consoleLog.push({ level: r.ok ? 'result' : 'error', text: r.text, source: r.ok ? null : 'VM:1' });
+    notify('console');
+    return r;
+  };
+
+  // ---- Elements ----
+  ses.isHidden = H.isHidden;
+  ses.querySelector = (s) => { try { return H.querySelector(root, s); } catch { return null; } };
+  ses.querySelectorAll = (s) => { try { return H.querySelectorAll(root, s); } catch { return []; } };
+  ses.editAttr = (node, name, value) => { if (value === null) delete node.attrs[name]; else node.attrs[name] = value; ses.state.domEdits++; notify('dom'); };
+  ses.setTitle = () => {};
+
+  // ---- Cookie / Storage ----
+  ses.documentCookie = () => cookieString(ses.cookies);
+  ses.removeCookie = (name) => { ses.cookies = ses.cookies.filter(c => c.name !== name); ses.state.storageEdits++; notify('storage'); };
+  ses.removeStorage = (kind, key) => { delete ses[kind][key]; ses.state.storageEdits++; notify('storage'); };
+
+  // ---- Sources ----
+  ses.sourceFiles = () => Object.keys(def.sources || {});
+  ses.sourceText = (f) => (def.sources || {})[f] ?? '';
+  ses.searchSources = (q, { regex = false, caseSensitive = false } = {}) => {
+    const out = [];
+    if (!q) return out;
+    let re = null;
+    if (regex) { if (q.length > 80) return out; try { re = new RegExp(q, caseSensitive ? '' : 'i'); } catch { return out; } }
+    for (const f of ses.sourceFiles()) {
+      const lines = ses.sourceText(f).split('\n');
+      lines.forEach((l, i) => { const hit = re ? re.test(l) : (caseSensitive ? l.includes(q) : l.toLowerCase().includes(q.toLowerCase())); if (hit) out.push({ file: f, line: i + 1, text: l.trim().slice(0, 160) }); });
+    }
+    ses.state.searches.push(q);
+    return out;
+  };
+  ses.toggleBreakpoint = (file, line) => {
+    const i = ses.state.breakpoints.findIndex(b => b.file === file && b.line === line);
+    if (i >= 0) { ses.state.breakpoints.splice(i, 1); if (ses.state.paused && ses.state.paused.file === file && ses.state.paused.line === line) ses.state.paused = null; notify('bp'); return null; }
+    ses.state.breakpoints.push({ file, line });
+    const hit = (def.breakpoints || {})[`${file}:${line}`];
+    ses.state.paused = hit ? { file, line, scope: hit.scope || {}, stack: hit.stack || [], note: hit.note || '' } : null;
+    if (hit) ses.state.pausedOnce.push({ file, line });
+    notify('bp');
+    return hit ? 'paused' : 'set';
+  };
+  ses.resume = () => { ses.state.paused = null; notify('bp'); };
+
+  // ---- Network ----
+  ses.throttledTime = (r) => { const f = THROTTLES[ses.state.throttle].f; return f == null ? null : r.time * f; };
+  ses.networkSummary = () => {
+    const f = THROTTLES[ses.state.throttle].f;
+    if (f == null) return { count: ses.requests.length, transferred: 0, resources: 0, finish: null };
+    let finish = 0, transferred = 0, resources = 0;
+    for (const r of ses.requests) { finish = Math.max(finish, (r.start + r.time) * f); transferred += r.fromCache ? 0 : r.size; resources += r.resourceSize; }
+    return { count: ses.requests.length, transferred, resources, finish };
+  };
+
+  // ---- Issues / Security / Performance ----
+  ses.issues = () => {
+    const list = [];
+    const https = page.protocol === 'https:';
+    for (const r of ses.requests) {
+      if (https && r.url.startsWith('http://') && !r.blocked) list.push({ kind: 'mixed', severity: 'warning', title: `混在コンテンツ: HTTPSページが安全でないリソースを読み込んでいます`, detail: r.url, why: 'HTTPSのページ内にHTTPのリソースがあると、その部分は盗聴・改ざんされうる。ブラウザはスクリプトなどを自動でブロックする。' });
+      if (r.blocked) list.push({ kind: r.blocked, severity: 'error', title: r.blocked === 'csp' ? 'Content Security Policy によりブロックされました' : r.blocked === 'cors' ? 'CORS ポリシーによりブロックされました' : 'ブロックされました', detail: r.url, why: r.note || '' });
+    }
+    for (const c of ses.cookies) {
+      if (https && !c.secure) list.push({ kind: 'cookie', severity: 'warning', title: `Cookie '${c.name}' に Secure 属性がありません`, detail: c.name, why: 'Secure が無いCookieは、HTTP(暗号化されていない通信)でも送信されうる。' });
+      if (!c.httpOnly && /sess|token|auth|sid/i.test(c.name)) list.push({ kind: 'cookie', severity: 'warning', title: `認証用らしい Cookie '${c.name}' に HttpOnly 属性がありません`, detail: c.name, why: 'HttpOnly が無いと、XSSなどでJavaScriptから読み取られて盗まれる恐れがある。' });
+      if (!c.sameSite) list.push({ kind: 'cookie', severity: 'info', title: `Cookie '${c.name}' に SameSite 属性がありません`, detail: c.name, why: 'SameSite の指定が無いと、他サイトからのリクエストにCookieが付く挙動(CSRFの足がかり)になりうる。' });
+    }
+    for (const i of (def.issues || [])) list.push(i);
+    return list;
+  };
+  ses.security = () => Object.assign({ https: page.protocol === 'https:', protocol: 'TLS 1.3', cert: null }, def.security || {});
+  ses.perf = () => Object.assign({ fcp: null, lcp: null, cls: null, tbt: null, lcpElement: '' }, def.perf || {});
+
+  ses.subscribe = (f) => { ses.listeners.add(f); return () => ses.listeners.delete(f); };
+  ses.visit = (tab) => { ses.state.visited.add(tab); };
+  return ses;
+}
+
+Object.assign(exports, { DEFAULT_UA, ALL_TABS, TAB_LABEL, THROTTLES, formatBytes, formatMs, createSession });
+
+};
+__mods["js/dt/elements.js"] = function (module, exports, __require) {
+// DevTools: Elements パネル（DOMツリーの閲覧と編集）
+const { el, clear } = __require("js/util.js");
+const { elLabel } = __require("js/vb/jsrepl.js");
+const H = __require("js/vb/html.js");
+
+const VOID = new Set(['img', 'input', 'br', 'hr', 'meta', 'link']);
+
+function renderElements(host, ses, ui) {
+  clear(host);
+  const open = ui.elOpen || (ui.elOpen = new Set());
+  if (!ui.elInit) {
+    // 既定で html → head/body までを展開（深い階層は自分で開いてもらう）
+    const html = H.querySelector(ses.root, 'html');
+    if (html) { open.add(html.uid); for (const c of html.children) if (c.t === 'el') open.add(c.uid); }
+    ui.elInit = true;
+  }
+  const search = el('input', { class: 'dt-input', type: 'search', placeholder: '検索（セレクタ・テキスト・属性値）', value: ui.elSearch || '', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+  const counter = el('span', { class: 'dt-muted' });
+  const sel = ui.elSelected && ui.elSelected.parent !== null ? ui.elSelected : null;
+  const matchSet = new Set();
+  const q = (ui.elSearch || '').trim();
+  if (q) {
+    let byCss = [];
+    try { byCss = H.querySelectorAll(ses.root, q); } catch { /* セレクタではない */ }
+    const ql = q.toLowerCase();
+    for (const n of H.allNodes(ses.root)) {
+      if (byCss.includes(n)) { matchSet.add(n); continue; }
+      if (n.t === 'text' && n.text.toLowerCase().includes(ql)) matchSet.add(n);
+      else if (n.t === 'comment' && n.text.toLowerCase().includes(ql)) matchSet.add(n);
+      else if (n.t === 'el' && (n.tag.includes(ql) || Object.entries(n.attrs).some(([k, v]) => k.includes(ql) || v.toLowerCase().includes(ql)))) matchSet.add(n);
+    }
+    // 一致ノードの祖先を展開する
+    for (const n of matchSet) for (let p = n.parent; p; p = p.parent) open.add(p.uid);
+    counter.textContent = `${matchSet.size} 件`;
+  }
+  search.addEventListener('input', () => { ui.elSearch = search.value; ui.rerender('elements', true); });
+
+  const tree = el('div', { class: 'dt-tree', role: 'tree' });
+  const renderNode = (n, depth, into) => {
+    const pad = Math.min(depth, 8) * 12;
+    if (n.t === 'text') {
+      const t = n.text.replace(/\s+/g, ' ').trim();
+      if (!t) return;
+      const raw = n.parent && ['script', 'style'].includes(n.parent.tag);
+      into.appendChild(el('div', { class: 'dt-row dt-text' + (matchSet.has(n) ? ' hit' : ''), style: `padding-left:${pad + 16}px` }, [el('span', { class: 'dt-txt', text: raw ? n.text.trim().slice(0, 160) : t })]));
+      return;
+    }
+    if (n.t === 'comment') {
+      into.appendChild(el('div', { class: 'dt-row dt-comment' + (matchSet.has(n) ? ' hit' : ''), style: `padding-left:${pad + 16}px` }, [el('span', { text: `<!--${n.text}-->` })]));
+      return;
+    }
+    const kids = n.children.filter(c => !(c.t === 'text' && !c.text.trim()));
+    const expandable = kids.length > 0 && !VOID.has(n.tag);
+    const isOpen = open.has(n.uid);
+    const hidden = H.selfHidden(n);
+    const row = el('div', { class: 'dt-row dt-el' + (sel === n ? ' sel' : '') + (hidden ? ' hidden-el' : '') + (matchSet.has(n) ? ' hit' : ''), style: `padding-left:${pad}px` });
+    const arrow = el('span', { class: 'dt-arrow', text: expandable ? (isOpen ? '▾' : '▸') : '' });
+    arrow.addEventListener('click', (e) => { e.stopPropagation(); if (!expandable) return; if (open.has(n.uid)) open.delete(n.uid); else open.add(n.uid); ui.rerender('elements', true); });
+    row.appendChild(arrow);
+    const tag = el('span', { class: 'dt-tag' });
+    tag.appendChild(document.createTextNode('<'));
+    tag.appendChild(el('span', { class: 'dt-tagname', text: n.tag }));
+    for (const [k, v] of Object.entries(n.attrs)) {
+      tag.appendChild(document.createTextNode(' '));
+      tag.appendChild(el('span', { class: 'dt-attrname', text: k }));
+      if (v !== '') { tag.appendChild(document.createTextNode('="')); tag.appendChild(el('span', { class: 'dt-attrval', text: v.length > 80 ? v.slice(0, 80) + '…' : v })); tag.appendChild(document.createTextNode('"')); }
+    }
+    tag.appendChild(document.createTextNode('>'));
+    row.appendChild(tag);
+    if (expandable && !isOpen) row.appendChild(el('span', { class: 'dt-muted', text: ' …' }));
+    if (!expandable && !VOID.has(n.tag)) row.appendChild(el('span', { class: 'dt-tag', text: `</${n.tag}>` }));
+    if (hidden) row.appendChild(el('span', { class: 'dt-badge', text: '非表示' }));
+    row.addEventListener('click', () => { ui.elSelected = n; ui.rerender('elements', true); });
+    into.appendChild(row);
+    if (expandable && isOpen) {
+      for (const c of n.children) renderNode(c, depth + 1, into);
+      into.appendChild(el('div', { class: 'dt-row dt-el', style: `padding-left:${pad}px` }, [el('span', { class: 'dt-arrow' }), el('span', { class: 'dt-tag', text: `</${n.tag}>` })]));
+    }
+  };
+  for (const c of ses.root.children) renderNode(c, 0, tree);
+
+  host.appendChild(el('div', { class: 'dt-toolbar' }, [search, counter]));
+  host.appendChild(tree);
+  host.appendChild(selectedPane(ses, ui, sel));
+}
+
+function selectedPane(ses, ui, n) {
+  const box = el('div', { class: 'dt-pane' });
+  if (!n) { box.appendChild(el('div', { class: 'dt-hint', text: '行をタップして要素を選ぶと、属性の確認と編集ができます。' })); return box; }
+  box.appendChild(el('div', { class: 'dt-pane-title', text: elLabel(n) }));
+  box.appendChild(el('div', { class: 'dt-kv' }, [
+    el('span', { class: 'dt-k', text: '表示状態' }),
+    el('span', { class: 'dt-v', text: H.isHidden(n) ? '画面には表示されません（非表示）' : '画面に表示されます' }),
+  ]));
+  const attrs = Object.entries(n.attrs);
+  box.appendChild(el('div', { class: 'dt-subhead', text: `属性（${attrs.length}）— タップして編集` }));
+  if (!attrs.length) box.appendChild(el('div', { class: 'dt-muted', text: '属性はありません' }));
+  for (const [k, v] of attrs) {
+    const row = el('div', { class: 'dt-attr' });
+    const val = el('input', { class: 'dt-input small', type: 'text', value: v, 'aria-label': `${k} の値`, autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+    val.addEventListener('change', () => { ses.editAttr(n, k, val.value); });
+    row.appendChild(el('span', { class: 'dt-attrname', text: k }));
+    row.appendChild(val);
+    row.appendChild(el('button', { class: 'dt-mini danger', type: 'button', text: '削除', 'aria-label': `${k} 属性を削除`, onclick: () => ses.editAttr(n, k, null) }));
+    box.appendChild(row);
+  }
+  const add = el('div', { class: 'dt-attr' });
+  const nm = el('input', { class: 'dt-input small', type: 'text', placeholder: '属性名', autocapitalize: 'off', spellcheck: 'false' });
+  const vl = el('input', { class: 'dt-input small', type: 'text', placeholder: '値', autocapitalize: 'off', spellcheck: 'false' });
+  add.appendChild(nm); add.appendChild(vl);
+  add.appendChild(el('button', { class: 'dt-mini', type: 'button', text: '追加', onclick: () => { const k = nm.value.trim().toLowerCase(); if (/^[a-z_:][\w:-]*$/.test(k)) ses.editAttr(n, k, vl.value); } }));
+  box.appendChild(add);
+  if (n.t === 'el' && n.children.some(c => c.t === 'text' && c.text.trim()) && !['script', 'style'].includes(n.tag)) {
+    box.appendChild(el('div', { class: 'dt-subhead', text: 'テキスト内容' }));
+    box.appendChild(el('div', { class: 'dt-code', text: H.textContent(n).trim().slice(0, 400) }));
+  }
+  box.appendChild(el('div', { class: 'dt-hint', text: 'ここでの編集は、この端末のブラウザ内の「架空ページ」にだけ反映されます（元のサーバーは変わりません）。' }));
+  return box;
+}
+
+Object.assign(exports, { renderElements });
+
+};
+__mods["js/dt/console.js"] = function (module, exports, __require) {
+// DevTools: Console パネル（メッセージの閲覧と式の実行）
+const { el, clear } = __require("js/util.js");
+
+const LEVEL_LABEL = { error: 'エラー', warn: '警告', info: '情報', log: 'ログ' };
+
+function renderConsole(host, ses, ui) {
+  clear(host);
+  const filter = ui.conFilter || 'all';
+  const filters = [['all', 'すべて'], ['error', 'エラー'], ['warn', '警告'], ['log', 'ログ/情報']];
+  const bar = el('div', { class: 'dt-chips' }, filters.map(([k, l]) => el('button', { class: 'dt-chip' + (filter === k ? ' on' : ''), type: 'button', text: l, onclick: () => { ui.conFilter = k; ui.rerender('console', true); } })));
+  const counts = { error: 0, warn: 0 };
+  for (const m of ses.consoleLog) if (counts[m.level] !== undefined) counts[m.level]++;
+  host.appendChild(el('div', { class: 'dt-toolbar' }, [bar, el('span', { class: 'dt-muted', text: `エラー ${counts.error} / 警告 ${counts.warn}` })]));
+
+  const out = el('div', { class: 'dt-console', 'aria-live': 'polite' });
+  const show = (m) => {
+    if (m.level === 'input' || m.level === 'result') return true;
+    if (filter === 'all') return true;
+    if (filter === 'log') return m.level === 'log' || m.level === 'info';
+    return m.level === filter;
+  };
+  for (const m of ses.consoleLog) {
+    if (!show(m)) continue;
+    const row = el('div', { class: `dt-msg ${m.level}` });
+    if (m.level === 'input') row.appendChild(el('span', { class: 'dt-prompt', text: '›' }));
+    else if (m.level === 'result') row.appendChild(el('span', { class: 'dt-prompt', text: '‹' }));
+    else if (m.level === 'error') row.appendChild(el('span', { class: 'dt-ico', text: '⛔', title: LEVEL_LABEL.error }));
+    else if (m.level === 'warn') row.appendChild(el('span', { class: 'dt-ico', text: '⚠️', title: LEVEL_LABEL.warn }));
+    else row.appendChild(el('span', { class: 'dt-prompt', text: ' ' }));
+    row.appendChild(el('span', { class: 'dt-msg-text', text: m.text }));
+    if (m.source) {
+      const link = el('button', { class: 'dt-src', type: 'button', text: m.source, 'aria-label': `${m.source} をSourcesで開く` });
+      const mm = /^(.+?):(\d+)(?::\d+)?$/.exec(m.source);
+      if (mm && ses.sourceFiles().includes(mm[1])) link.addEventListener('click', () => ui.openSource(mm[1], Number(mm[2])));
+      else link.disabled = true;
+      row.appendChild(link);
+    }
+    if (m.nav) row.appendChild(el('button', { class: 'dt-src', type: 'button', text: '通信を見る', onclick: () => ui.openRequest(m.nav) }));
+    out.appendChild(row);
+  }
+  host.appendChild(out);
+
+  const input = el('input', { class: 'dt-input mono', type: 'text', placeholder: 'JavaScript を入力（例: document.title）', autocapitalize: 'off', autocorrect: 'off', autocomplete: 'off', spellcheck: 'false', enterkeyhint: 'go', 'aria-label': 'Console に式を入力' });
+  const hist = ses.replHistory; let hi = hist.length;
+  const run = () => {
+    const t = input.value; if (!t.trim()) return;
+    input.value = ''; ses.runConsole(t); hi = hist.length;
+    ui.rerender('console', true, true);
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); run(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); hi = Math.max(0, hi - 1); input.value = hist[hi] || ''; }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hist.length, hi + 1); input.value = hist[hi] || ''; }
+  });
+  const row = el('div', { class: 'dt-inputrow' }, [el('span', { class: 'dt-prompt', text: '›' }), input, el('button', { class: 'dt-run', type: 'button', text: '実行', onclick: run })]);
+  host.appendChild(row);
+
+  const quick = (ui.quick || []);
+  if (quick.length) {
+    host.appendChild(el('div', { class: 'dt-subhead', text: '式の例（タップで入力欄へ）' }));
+    host.appendChild(el('div', { class: 'dt-chips wrap' }, quick.map(q => el('button', { class: 'dt-chip code', type: 'button', text: q, onclick: () => { input.value = q; input.focus(); } }))));
+  }
+  host.appendChild(el('div', { class: 'dt-hint', text: 'Console では、このページの中身に対して JavaScript の式を実行できます。実行できる範囲は学習用に限定されています。' }));
+  if (ui.stickBottom) { requestAnimationFrame(() => { out.scrollTop = out.scrollHeight; }); }
+}
+
+Object.assign(exports, { renderConsole });
+
+};
+__mods["js/dt/network.js"] = function (module, exports, __require) {
+// DevTools: Network パネル（リクエスト一覧と詳細）
+const { el, clear } = __require("js/util.js");
+const { formatBytes, formatMs, THROTTLES } = __require("js/vb/session.js");
+
+const FILTERS = [['all', 'すべて'], ['fetch', 'Fetch/XHR'], ['script', 'JS'], ['stylesheet', 'CSS'], ['img', 'Img'], ['document', 'Doc'], ['other', 'その他']];
+const matchFilter = (r, f) => f === 'all' || (f === 'fetch' ? (r.type === 'fetch' || r.type === 'xhr') : f === 'other' ? !['fetch', 'xhr', 'script', 'stylesheet', 'img', 'document'].includes(r.type) : r.type === f);
+const TYPE_LABEL = { fetch: 'fetch', xhr: 'xhr', script: 'script', stylesheet: 'css', img: 'img', document: 'doc', font: 'font', other: 'other' };
+
+function renderNetwork(host, ses, ui) {
+  clear(host);
+  if (ui.netDetail) return renderDetail(host, ses, ui, ses.requests.find(r => r.id === ui.netDetail));
+  const st = ses.state;
+  const filter = st.networkFilter || 'all';
+  const sum = ses.networkSummary();
+  const tl = THROTTLES[st.throttle];
+
+  const chips = el('div', { class: 'dt-chips' }, FILTERS.map(([k, l]) => el('button', { class: 'dt-chip' + (filter === k ? ' on' : ''), type: 'button', text: l, onclick: () => { st.networkFilter = k; st.filtersUsed.add(k); ui.rerender('network', true); } })));
+  const q = el('input', { class: 'dt-input', type: 'search', placeholder: 'URL・ステータスで絞り込み', value: ui.netSearch || '', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', 'aria-label': 'Network を検索' });
+  q.addEventListener('input', () => { ui.netSearch = q.value; ui.rerender('network', true); });
+  const th = el('select', { class: 'dt-select', 'aria-label': '回線速度のスロットリング' }, Object.entries(THROTTLES).map(([k, v]) => { const o = el('option', { value: k, text: v.label }); if (k === st.throttle) o.selected = true; return o; }));
+  th.addEventListener('change', () => { st.throttle = th.value; ui.rerender('network', true); });
+  host.appendChild(el('div', { class: 'dt-toolbar col' }, [chips, el('div', { class: 'dt-row-flex' }, [q, th])]));
+
+  const needle = (ui.netSearch || '').trim().toLowerCase();
+  const rows = ses.requests.filter(r => matchFilter(r, filter) && (!needle || r.url.toLowerCase().includes(needle) || String(r.status).includes(needle) || r.method.toLowerCase().includes(needle)));
+  const list = el('div', { class: 'dt-netlist', role: 'list' });
+  const maxEnd = Math.max(1, ...ses.requests.map(r => r.start + r.time));
+  if (!rows.length) list.appendChild(el('div', { class: 'dt-hint', text: '条件に一致するリクエストはありません。' }));
+  for (const r of rows) {
+    const bad = r.failed || r.status >= 400;
+    const line1 = el('div', { class: 'dt-net-l1' }, [
+      el('span', { class: 'dt-method', text: r.method }),
+      el('span', { class: 'dt-net-name', text: r.name }),
+      el('span', { class: 'dt-status ' + (bad ? 'bad' : r.status >= 300 ? 'redir' : 'ok'), text: r.failed ? '(failed)' : r.blocked ? `(blocked:${r.blocked})` : String(r.status) }),
+    ]);
+    const t = tl.f == null ? null : r.time * tl.f;
+    const line2 = el('div', { class: 'dt-net-l2' }, [
+      el('span', { text: TYPE_LABEL[r.type] || r.type }), el('span', { text: r.fromCache ? '(キャッシュ)' : formatBytes(r.size) }),
+      el('span', { text: t == null ? '—' : formatMs(t) }), el('span', { class: 'dt-host' + (r.thirdParty ? ' third' : ''), text: r.host }),
+    ]);
+    const bar = el('div', { class: 'dt-wf' }, [el('div', { class: 'dt-wf-bar' + (bad ? ' bad' : ''), style: `left:${(r.start / maxEnd) * 100}%;width:${Math.max(1.5, (r.time / maxEnd) * 100)}%` })]);
+    const row = el('button', { class: 'dt-netrow' + (bad ? ' bad' : ''), type: 'button', role: 'listitem', onclick: () => { ui.netDetail = r.id; ui.netTab = 'headers'; st.viewedRequests.add(r.id); ui.rerender('network', true); } }, [line1, line2, bar]);
+    list.appendChild(row);
+  }
+  host.appendChild(list);
+  host.appendChild(el('div', { class: 'dt-summary' }, [
+    el('span', { text: `${rows.length}/${sum.count} 件` }),
+    el('span', { text: sum.finish == null ? 'オフライン' : `転送 ${formatBytes(sum.transferred)}` }),
+    el('span', { text: sum.finish == null ? '' : `完了 ${formatMs(sum.finish)}` }),
+    el('span', { class: 'dt-muted', text: tl.label }),
+  ]));
+  host.appendChild(el('div', { class: 'dt-hint', text: 'リクエストをタップすると、ヘッダ・送信内容・レスポンスなどの詳細を確認できます。ステータスが赤いものは失敗です。' }));
+}
+
+const kvTable = (obj) => {
+  const entries = Array.isArray(obj) ? obj : Object.entries(obj);
+  if (!entries.length) return el('div', { class: 'dt-muted', text: '（なし）' });
+  return el('div', { class: 'dt-kvlist' }, entries.map(([k, v]) => el('div', { class: 'dt-kvrow' }, [el('span', { class: 'dt-k', text: k }), el('span', { class: 'dt-v', text: String(v) })])));
+};
+
+function renderDetail(host, ses, ui, r) {
+  if (!r) { ui.netDetail = null; return renderNetwork(host, ses, ui); }
+  const tabs = [['headers', 'Headers'], ['payload', 'Payload'], ['response', 'Response'], ['timing', 'Timing']];
+  const cur = ui.netTab || 'headers';
+  host.appendChild(el('div', { class: 'dt-toolbar' }, [
+    el('button', { class: 'dt-mini', type: 'button', text: '‹ 一覧へ', onclick: () => { ui.netDetail = null; ui.rerender('network', true); } }),
+    el('span', { class: 'dt-net-name big', text: r.name }),
+  ]));
+  host.appendChild(el('div', { class: 'dt-chips' }, tabs.map(([k, l]) => el('button', { class: 'dt-chip' + (cur === k ? ' on' : ''), type: 'button', text: l, onclick: () => { ui.netTab = k; ui.rerender('network', true); } }))));
+  const body = el('div', { class: 'dt-pane' });
+  if (cur === 'headers') {
+    body.appendChild(el('div', { class: 'dt-subhead', text: '全般 (General)' }));
+    body.appendChild(kvTable([['Request URL', r.url], ['Request Method', r.method], ['Status Code', `${r.failed ? '(failed) ' + r.failed : r.status + ' ' + r.statusText}`], ['Remote Address', r.remote || '—'], ['Protocol', r.protocol]]));
+    body.appendChild(el('div', { class: 'dt-subhead', text: 'レスポンスヘッダ (Response Headers)' }));
+    body.appendChild(kvTable(r.resHeaders));
+    body.appendChild(el('div', { class: 'dt-subhead', text: 'リクエストヘッダ (Request Headers)' }));
+    body.appendChild(kvTable(r.reqHeaders));
+  } else if (cur === 'payload') {
+    body.appendChild(el('div', { class: 'dt-subhead', text: 'クエリパラメータ (Query String Parameters)' }));
+    body.appendChild(kvTable(r.params));
+    body.appendChild(el('div', { class: 'dt-subhead', text: '送信内容 (Request Payload)' }));
+    body.appendChild(r.reqBody ? el('div', { class: 'dt-code', text: r.reqBody }) : el('div', { class: 'dt-muted', text: '（なし）' }));
+  } else if (cur === 'response') {
+    body.appendChild(el('div', { class: 'dt-subhead', text: `レスポンス (${r.mime || '不明'})` }));
+    let txt = r.resBody;
+    if (/json/.test(r.mime) && txt) { try { txt = JSON.stringify(JSON.parse(txt), null, 2); } catch { /* そのまま */ } }
+    body.appendChild(txt ? el('div', { class: 'dt-code', text: txt }) : el('div', { class: 'dt-muted', text: r.failed ? '（通信に失敗したためレスポンスはありません）' : '（レスポンス本文はありません）' }));
+  } else {
+    const f = THROTTLES[ses.state.throttle].f;
+    body.appendChild(el('div', { class: 'dt-subhead', text: 'タイミング (Timing)' }));
+    body.appendChild(kvTable([['開始', formatMs(r.start * (f || 1))], ['所要時間', f == null ? '—' : formatMs(r.time * f)], ['転送サイズ', r.fromCache ? '(キャッシュ)' : formatBytes(r.size)], ['展開後サイズ', formatBytes(r.resourceSize)], ['回線', THROTTLES[ses.state.throttle].label]]));
+    if (r.initiator) { body.appendChild(el('div', { class: 'dt-subhead', text: 'このリクエストを発行したもの (Initiator)' })); body.appendChild(el('div', { class: 'dt-code', text: r.initiator })); }
+  }
+  if (r.note) body.appendChild(el('div', { class: 'dt-hint', text: r.note }));
+  host.appendChild(body);
+}
+
+Object.assign(exports, { renderNetwork });
+
+};
+__mods["js/dt/application.js"] = function (module, exports, __require) {
+// DevTools: Application パネル（Local Storage / Session Storage / Cookies）
+const { el, clear } = __require("js/util.js");
+
+function renderApplication(host, ses, ui) {
+  clear(host);
+  const cur = ui.appTab || 'local';
+  const tabs = [['local', 'Local Storage'], ['session', 'Session Storage'], ['cookies', 'Cookies']];
+  host.appendChild(el('div', { class: 'dt-chips' }, tabs.map(([k, l]) => el('button', { class: 'dt-chip' + (cur === k ? ' on' : ''), type: 'button', text: l, onclick: () => { ui.appTab = k; ui.rerender('application', true); } }))));
+  const pane = el('div', { class: 'dt-pane' });
+  if (cur === 'local' || cur === 'session') {
+    const data = ses[cur];
+    const keys = Object.keys(data);
+    pane.appendChild(el('div', { class: 'dt-subhead', text: `${cur === 'local' ? 'localStorage' : 'sessionStorage'}（${keys.length} 件）— ${ses.page.origin}` }));
+    if (!keys.length) pane.appendChild(el('div', { class: 'dt-muted', text: '（空です）' }));
+    for (const k of keys) {
+      pane.appendChild(el('div', { class: 'dt-store' }, [
+        el('div', { class: 'dt-store-key', text: k }),
+        el('div', { class: 'dt-store-val', text: data[k] }),
+        el('button', { class: 'dt-mini danger', type: 'button', text: '削除', 'aria-label': `${k} を削除`, onclick: () => ses.removeStorage(cur, k) }),
+      ]));
+    }
+    pane.appendChild(el('div', { class: 'dt-hint', text: cur === 'local' ? 'Local Storage はブラウザを閉じても残り、同じサイトのJavaScriptなら誰でも読めます。' : 'Session Storage はタブを閉じると消えます。こちらも同じタブ内のJavaScriptから読めます。' }));
+  } else {
+    pane.appendChild(el('div', { class: 'dt-subhead', text: `Cookies（${ses.cookies.length} 件）— ${ses.page.hostname}` }));
+    if (!ses.cookies.length) pane.appendChild(el('div', { class: 'dt-muted', text: '（Cookie はありません）' }));
+    for (const c of ses.cookies) {
+      const flags = el('div', { class: 'dt-flags' }, [
+        el('span', { class: 'dt-flag ' + (c.httpOnly ? 'good' : 'bad'), text: c.httpOnly ? 'HttpOnly ✓' : 'HttpOnly ✗' }),
+        el('span', { class: 'dt-flag ' + (c.secure ? 'good' : 'bad'), text: c.secure ? 'Secure ✓' : 'Secure ✗' }),
+        el('span', { class: 'dt-flag ' + (c.sameSite ? 'good' : 'bad'), text: c.sameSite ? `SameSite=${c.sameSite}` : 'SameSite ✗' }),
+      ]);
+      pane.appendChild(el('div', { class: 'dt-store' }, [
+        el('div', { class: 'dt-store-key', text: c.name }),
+        el('div', { class: 'dt-store-val', text: c.value }),
+        el('div', { class: 'dt-muted', text: `Domain: ${c.domain || ses.page.hostname} / Path: ${c.path || '/'} / Expires: ${c.expires || 'Session'}` }),
+        flags,
+        el('button', { class: 'dt-mini danger', type: 'button', text: '削除', 'aria-label': `${c.name} を削除`, onclick: () => ses.removeCookie(c.name) }),
+      ]));
+    }
+    pane.appendChild(el('div', { class: 'dt-hint', text: 'HttpOnly が ✓ の Cookie は JavaScript（document.cookie）から読めません。Secure は HTTPS でのみ送信、SameSite は他サイトからの送信の制限です。' }));
+  }
+  host.appendChild(pane);
+}
+
+Object.assign(exports, { renderApplication });
+
+};
+__mods["js/dt/sources.js"] = function (module, exports, __require) {
+// DevTools: Sources パネル（ソース閲覧・全文検索・整形表示・ブレークポイント）
+const { el, clear } = __require("js/util.js");
+
+// 簡易整形（minify されたJSを読みやすくする）。文字列・コメントは壊さない。
+function prettyPrint(code) {
+  let out = '', indent = 0, i = 0, inStr = null, paren = 0;
+  const nl = () => { out = out.replace(/[ \t]+$/, '') + '\n' + '  '.repeat(Math.max(0, indent)); };
+  while (i < code.length) {
+    const c = code[i];
+    if (inStr) { out += c; if (c === '\\') { out += code[i + 1] || ''; i += 2; continue; } if (c === inStr) inStr = null; i++; continue; }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; out += c; i++; continue; }
+    if (c === '(') paren++; else if (c === ')') paren = Math.max(0, paren - 1);
+    if (c === '{') { out += ' {'; indent++; nl(); i++; if (code[i] === '}') { indent--; out = out.replace(/\n\s*$/, '') + '}'; i++; } continue; }
+    if (c === '}') { indent--; nl(); out += '}'; i++; if (code[i] && !/[;,)\s.]/.test(code[i])) nl(); continue; }
+    if (c === ';' && paren === 0) { out += ';'; nl(); i++; continue; }
+    if (c === ',' && paren === 0 && indent > 0 && /^[\s]*["'\w$]+\s*:/.test(code.slice(i + 1, i + 60))) { out += ','; nl(); i++; continue; }
+    if (c === '\n' ) { i++; continue; }
+    out += c; i++;
+  }
+  return out.replace(/\n\s*\n/g, '\n').trim();
+}
+
+function renderSources(host, ses, ui) {
+  clear(host);
+  const files = ses.sourceFiles();
+  if (!files.length) { host.appendChild(el('div', { class: 'dt-hint', text: 'このページにはソースファイルがありません。' })); return; }
+  if (!ui.srcFile || !files.includes(ui.srcFile)) ui.srcFile = null;
+  const st = ses.state;
+
+  // 全文検索
+  const qIn = el('input', { class: 'dt-input', type: 'search', placeholder: '全ファイルを検索（例: key / token / password）', value: ui.srcQuery || '', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'search', 'aria-label': 'ソース全体を検索' });
+  const doSearch = () => { ui.srcQuery = qIn.value.trim(); ui.srcResults = ui.srcQuery ? ses.searchSources(ui.srcQuery) : null; ui.rerender('sources', true); };
+  qIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
+  host.appendChild(el('div', { class: 'dt-toolbar' }, [qIn, el('button', { class: 'dt-run', type: 'button', text: '検索', onclick: doSearch })]));
+
+  if (ui.srcResults) {
+    const res = ui.srcResults;
+    host.appendChild(el('div', { class: 'dt-subhead', text: `検索結果 ${res.length} 件（タップで該当行を開く）` }));
+    const box = el('div', { class: 'dt-results' });
+    if (!res.length) box.appendChild(el('div', { class: 'dt-muted', text: '一致なし' }));
+    for (const r of res.slice(0, 60)) box.appendChild(el('button', { class: 'dt-result', type: 'button', onclick: () => ui.openSource(r.file, r.line) }, [el('span', { class: 'dt-src', text: `${r.file}:${r.line}` }), el('span', { class: 'dt-result-text', text: r.text })]));
+    host.appendChild(box);
+  }
+
+  host.appendChild(el('div', { class: 'dt-chips wrap' }, files.map(f => el('button', { class: 'dt-chip code' + (ui.srcFile === f ? ' on' : ''), type: 'button', text: f, onclick: () => { ui.srcFile = f; ui.srcLine = null; st.sourcesOpened.add(f); ui.rerender('sources', true); } }))));
+  if (!ui.srcFile) { host.appendChild(el('div', { class: 'dt-hint', text: 'ファイル名をタップして中身を表示します。行番号をタップするとブレークポイントを設定できます。' })); return; }
+
+  const f = ui.srcFile;
+  ui.pretty = ui.pretty || {};
+  const raw = ses.sourceText(f);
+  const isMin = raw.split('\n').some(l => l.length > 200);
+  const text = ui.pretty[f] ? prettyPrint(raw) : raw;
+  const bar = el('div', { class: 'dt-toolbar' }, [el('span', { class: 'dt-muted', text: `${f}（${text.split('\n').length} 行）` })]);
+  if (isMin || ui.pretty[f]) bar.appendChild(el('button', { class: 'dt-mini' + (ui.pretty[f] ? ' on' : ''), type: 'button', text: '{} 整形表示', onclick: () => { ui.pretty[f] = !ui.pretty[f]; if (ui.pretty[f]) st.prettyPrinted.add(f); ui.rerender('sources', true); } }));
+  host.appendChild(bar);
+
+  const lines = text.split('\n');
+  const view = el('div', { class: 'dt-src-view' });
+  const pausedHere = st.paused && st.paused.file === f ? st.paused.line : null;
+  lines.forEach((l, i) => {
+    const no = i + 1;
+    const bp = !ui.pretty[f] && st.breakpoints.some(b => b.file === f && b.line === no);
+    const row = el('div', { class: 'dt-line' + (ui.srcLine === no ? ' focus' : '') + (pausedHere === no && !ui.pretty[f] ? ' paused' : '') });
+    const num = el('button', { class: 'dt-lno' + (bp ? ' bp' : ''), type: 'button', text: String(no), 'aria-label': `${no} 行目${bp ? '（ブレークポイントあり）' : ''}`, 'aria-pressed': bp ? 'true' : 'false' });
+    num.addEventListener('click', () => { if (ui.pretty[f]) { ui.flash('整形表示中はブレークポイントを設定できません。{} をもう一度押して元のソースに戻してください。'); return; } const r = ses.toggleBreakpoint(f, no); ui.flash(r === 'paused' ? `${no} 行目で実行が一時停止しました（下の Scope を確認）` : r === 'set' ? `${no} 行目にブレークポイントを設定しました` : `${no} 行目のブレークポイントを解除しました`); ui.rerender('sources', true); });
+    row.appendChild(num);
+    row.appendChild(el('span', { class: 'dt-code-line', text: l || ' ' }));
+    view.appendChild(row);
+  });
+  host.appendChild(view);
+  if (ui.srcLine) requestAnimationFrame(() => { const t = view.querySelector('.dt-line.focus'); if (t && t.scrollIntoView) t.scrollIntoView({ block: 'center' }); });
+
+  if (st.paused) {
+    const p = st.paused;
+    const box = el('div', { class: 'dt-pane paused-box' }, [el('div', { class: 'dt-pane-title', text: `⏸ 一時停止中: ${p.file}:${p.line}` })]);
+    if (p.note) box.appendChild(el('div', { class: 'dt-hint', text: p.note }));
+    if (p.stack && p.stack.length) { box.appendChild(el('div', { class: 'dt-subhead', text: 'コールスタック (Call Stack)' })); box.appendChild(el('div', { class: 'dt-code', text: p.stack.join('\n') })); }
+    box.appendChild(el('div', { class: 'dt-subhead', text: 'スコープ (Scope) — この時点の変数の値' }));
+    for (const [scope, vars] of Object.entries(p.scope)) {
+      box.appendChild(el('div', { class: 'dt-scope-name', text: scope }));
+      box.appendChild(el('div', { class: 'dt-kvlist' }, Object.entries(vars).map(([k, v]) => el('div', { class: 'dt-kvrow' }, [el('span', { class: 'dt-k', text: k }), el('span', { class: 'dt-v', text: typeof v === 'string' ? JSON.stringify(v) : JSON.stringify(v) })]))));
+    }
+    box.appendChild(el('button', { class: 'dt-mini', type: 'button', text: '▶ 再開', onclick: () => { ses.resume(); ui.rerender('sources', true); } }));
+    host.appendChild(box);
+  }
+}
+
+Object.assign(exports, { prettyPrint, renderSources });
+
+};
+__mods["js/dt/security.js"] = function (module, exports, __require) {
+// DevTools: Security / Issues パネル
+const { el, clear } = __require("js/util.js");
+
+function renderSecurity(host, ses, ui) {
+  clear(host);
+  const sec = ses.security();
+  const pane = el('div', { class: 'dt-pane' });
+  pane.appendChild(el('div', { class: 'dt-subhead', text: '接続の概要 (Overview)' }));
+  pane.appendChild(el('div', { class: 'dt-secbanner ' + (sec.https ? 'ok' : 'bad'), text: sec.https ? '🔒 このページは HTTPS で配信されています' : '⚠️ このページは安全ではありません (HTTP)' }));
+  if (sec.cert) {
+    pane.appendChild(el('div', { class: 'dt-subhead', text: '証明書 (Certificate)' }));
+    pane.appendChild(el('div', { class: 'dt-kvlist' }, [['発行先', sec.cert.subject], ['発行者', sec.cert.issuer], ['有効期間', `${sec.cert.validFrom} 〜 ${sec.cert.validTo}`], ['プロトコル', sec.protocol], ['暗号スイート', sec.cert.cipher || '—']].filter(x => x[1]).map(([k, v]) => el('div', { class: 'dt-kvrow' }, [el('span', { class: 'dt-k', text: k }), el('span', { class: 'dt-v', text: v })]))));
+  }
+  const http = ses.requests.filter(r => r.url.startsWith('http://')).length, https = ses.requests.length - http;
+  pane.appendChild(el('div', { class: 'dt-subhead', text: 'リソースの通信方式' }));
+  pane.appendChild(el('div', { class: 'dt-kvlist' }, [['HTTPS', `${https} 件`], ['HTTP（暗号化なし）', `${http} 件`]].map(([k, v]) => el('div', { class: 'dt-kvrow' }, [el('span', { class: 'dt-k', text: k }), el('span', { class: 'dt-v', text: v })]))));
+  host.appendChild(pane);
+
+  const issues = ses.issues();
+  const box = el('div', { class: 'dt-pane' }, [el('div', { class: 'dt-subhead', text: `問題 (Issues) — ${issues.length} 件` })]);
+  if (!issues.length) box.appendChild(el('div', { class: 'dt-muted', text: '検出された問題はありません。' }));
+  for (const i of issues) {
+    box.appendChild(el('div', { class: `dt-issue ${i.severity}` }, [
+      el('div', { class: 'dt-issue-title', text: `${i.severity === 'error' ? '⛔' : i.severity === 'warning' ? '⚠️' : 'ℹ️'} ${i.title}` }),
+      i.detail ? el('div', { class: 'dt-code small', text: i.detail }) : null,
+      i.why ? el('div', { class: 'dt-hint', text: i.why }) : null,
+    ]));
+  }
+  host.appendChild(box);
+}
+
+Object.assign(exports, { renderSecurity });
+
+};
+__mods["js/dt/performance.js"] = function (module, exports, __require) {
+// DevTools: Performance パネル（Core Web Vitals と読み込みの内訳）
+const { el, clear } = __require("js/util.js");
+const { formatBytes, formatMs, THROTTLES } = __require("js/vb/session.js");
+
+function renderPerformance(host, ses, ui) {
+  clear(host);
+  const p = ses.perf();
+  const f = THROTTLES[ses.state.throttle].f || 1;
+  const metric = (label, v, unit, good, bad, hint) => {
+    const val = v == null ? null : (unit === 'ms' ? v * f : v);
+    const cls = val == null ? '' : (unit === 'ms' ? (val <= good ? 'good' : val <= bad ? 'mid' : 'bad') : (val <= good ? 'good' : val <= bad ? 'mid' : 'bad'));
+    return el('div', { class: `dt-metric ${cls}` }, [el('div', { class: 'dt-metric-v', text: val == null ? '—' : (unit === 'ms' ? formatMs(val) : String(val)) }), el('div', { class: 'dt-metric-k', text: label }), el('div', { class: 'dt-metric-h', text: hint })]);
+  };
+  host.appendChild(el('div', { class: 'dt-subhead', text: `Core Web Vitals（${THROTTLES[ses.state.throttle].label}）` }));
+  host.appendChild(el('div', { class: 'dt-metrics' }, [
+    metric('FCP 最初の描画', p.fcp, 'ms', 1800, 3000, '何か表示されるまで'),
+    metric('LCP 最大要素の描画', p.lcp, 'ms', 2500, 4000, '一番大きい要素が出るまで'),
+    metric('CLS レイアウトのズレ', p.cls, 'n', 0.1, 0.25, 'ガタつきの少なさ'),
+    metric('TBT 操作できない時間', p.tbt, 'ms', 200, 600, 'JSの重さの目安'),
+  ]));
+  if (p.lcpElement) host.appendChild(el('div', { class: 'dt-pane' }, [el('div', { class: 'dt-subhead', text: 'LCP 要素' }), el('div', { class: 'dt-code', text: p.lcpElement })]));
+  const sum = ses.networkSummary();
+  const bytesByType = {};
+  for (const r of ses.requests) bytesByType[r.type] = (bytesByType[r.type] || 0) + r.size;
+  const rows = Object.entries(bytesByType).sort((a, b) => b[1] - a[1]);
+  const total = rows.reduce((s, [, n]) => s + n, 0) || 1;
+  const box = el('div', { class: 'dt-pane' }, [el('div', { class: 'dt-subhead', text: `種類別の転送サイズ（合計 ${formatBytes(total)}）` })]);
+  for (const [t, n] of rows) box.appendChild(el('div', { class: 'dt-bar-row' }, [el('span', { class: 'dt-bar-k', text: t }), el('div', { class: 'dt-bar-track' }, [el('div', { class: 'dt-bar-fill', style: `width:${Math.max(2, (n / total) * 100)}%` })]), el('span', { class: 'dt-bar-v', text: formatBytes(n) })]));
+  box.appendChild(el('div', { class: 'dt-hint', text: `全 ${sum.count} 件のリクエスト。回線を遅くするとき(Network タブの Throttling)は、表示までの時間が伸びます。` }));
+  host.appendChild(box);
+}
+
+Object.assign(exports, { renderPerformance });
+
+};
+__mods["js/devtools.js"] = function (module, exports, __require) {
+// ============================================================
+// 疑似 DevTools（スマホ向け）。ゲーム内の架空ページに対して
+// Elements / Console / Network / Sources / Application / Security / Performance を操作する。
+// 実ブラウザの DevTools や実ページには一切アクセスしない。
+// ============================================================
+const { el, clear } = __require("js/util.js");
+const { TAB_LABEL } = __require("js/vb/session.js");
+const H = __require("js/vb/html.js");
+const { renderElements } = __require("js/dt/elements.js");
+const { renderConsole } = __require("js/dt/console.js");
+const { renderNetwork } = __require("js/dt/network.js");
+const { renderApplication } = __require("js/dt/application.js");
+const { renderSources } = __require("js/dt/sources.js");
+const { renderSecurity } = __require("js/dt/security.js");
+const { renderPerformance } = __require("js/dt/performance.js");
+
+const RENDER = { elements: renderElements, console: renderConsole, network: renderNetwork, application: renderApplication, sources: renderSources, security: renderSecurity, performance: renderPerformance };
+const ERR_BADGE = (ses) => ses.consoleLog.filter(m => m.level === 'error').length;
+
+/** DevTools を container に構築する。ui オブジェクトは再描画しても状態を保持する。 */
+function mountDevtools(container, ses, ui, { onChange } = {}) {
+  ui.tab = ui.tab && ses.tabs.includes(ui.tab) ? ui.tab : ses.tabs[0];
+  ui.quick = ui.quick || [];
+  const shell = el('div', { class: 'dt' });
+  const tabbar = el('div', { class: 'dt-tabs', role: 'tablist' });
+  const toast = el('div', { class: 'dt-toast', role: 'status' });
+  const body = el('div', { class: 'dt-body' });
+  shell.appendChild(tabbar); shell.appendChild(body); shell.appendChild(toast);
+  container.appendChild(shell);
+
+  let toastTimer = null;
+  ui.flash = (msg) => { toast.textContent = msg; toast.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('show'), 2600); };
+  ui.openSource = (file, line) => { ui.srcFile = file; ui.srcLine = line || null; ses.state.sourcesOpened.add(file); setTab('sources'); };
+  ui.openRequest = (id) => { ui.netDetail = id; ui.netTab = 'headers'; ses.state.viewedRequests.add(id); setTab('network'); };
+
+  function drawTabs() {
+    clear(tabbar);
+    for (const t of ses.tabs) {
+      const badge = t === 'console' ? ERR_BADGE(ses) : 0;
+      tabbar.appendChild(el('button', { class: 'dt-tab' + (ui.tab === t ? ' active' : ''), type: 'button', role: 'tab', 'aria-selected': ui.tab === t ? 'true' : 'false', onclick: () => setTab(t) }, [TAB_LABEL[t], badge ? el('span', { class: 'dt-tab-badge', text: String(badge) }) : null]));
+    }
+  }
+  function draw(keepScroll, toBottom) {
+    const top = body.scrollTop;
+    ui.stickBottom = !!toBottom;
+    RENDER[ui.tab](body, ses, ui);
+    if (keepScroll) body.scrollTop = top;
+    if (toBottom) requestAnimationFrame(() => { const c = body.querySelector('.dt-console'); if (c) c.scrollTop = c.scrollHeight; });
+  }
+  function setTab(t) { ui.tab = t; ses.visit(t); drawTabs(); draw(false); if (onChange) onChange(); }
+  ui.rerender = (tab, keepScroll, toBottom) => { drawTabs(); if (!tab || tab === ui.tab) draw(keepScroll, toBottom); if (onChange) onChange(); };
+
+  ses.visit(ui.tab);
+  const unsub = ses.subscribe((what) => { if (!shell.isConnected) { unsub(); return; } drawTabs(); if (what === 'dom' || what === 'storage' || what === 'bp' || what === 'console') { if (ui.tab !== 'console' || what === 'console') draw(true, what === 'console'); } if (onChange) onChange(); });
+  drawTabs(); draw(false);
+  return shell;
+}
+
+/** ページの「見た目」プレビュー（表示されている要素だけを簡易描画）。DOMはtextContentで作り、innerHTMLは使わない。 */
+function renderPagePreview(container, ses) {
+  clear(container);
+  const bar = el('div', { class: 'pv-url' }, [el('span', { class: 'pv-lock', text: ses.page.protocol === 'https:' ? '🔒' : '⚠️' }), el('span', { class: 'pv-url-text', text: ses.page.href })]);
+  const page = el('div', { class: 'pv-page' });
+  const body = H.querySelector(ses.root, 'body');
+  const title = H.querySelector(ses.root, 'title');
+  const draw = (n, into) => {
+    if (n.t === 'text') { const t = n.text.replace(/\s+/g, ' ').trim(); if (t && !(n.parent && ['script', 'style', 'title'].includes(n.parent.tag))) into.appendChild(document.createTextNode(t + ' ')); return; }
+    if (n.t !== 'el' || H.selfHidden(n)) return;
+    const t = n.tag;
+    if (['script', 'style', 'head', 'meta', 'link', 'title', 'noscript'].includes(t)) return;
+    let node;
+    if (/^h[1-6]$/.test(t)) node = el('div', { class: 'pv-' + t });
+    else if (t === 'a') node = el('span', { class: 'pv-a' });
+    else if (t === 'button') node = el('span', { class: 'pv-btn' });
+    else if (t === 'input') { if (['hidden', 'submit', 'button'].includes((n.attrs.type || '').toLowerCase())) { if ((n.attrs.type || '') === 'hidden') return; node = el('span', { class: 'pv-btn', text: n.attrs.value || '送信' }); into.appendChild(node); return; } node = el('span', { class: 'pv-input', text: n.attrs.placeholder || n.attrs.value || n.attrs.name || '' }); into.appendChild(node); return; }
+    else if (t === 'img') { into.appendChild(el('span', { class: 'pv-img', text: `🖼 ${n.attrs.alt || (n.attrs.src || 'image').split('/').pop()}` })); return; }
+    else if (t === 'iframe') { into.appendChild(el('span', { class: 'pv-img', text: '▭ 埋め込みフレーム' })); return; }
+    else if (['p', 'div', 'li', 'section', 'form', 'ul', 'ol', 'nav', 'header', 'footer', 'main', 'article', 'table', 'tr', 'label', 'pre'].includes(t)) node = el('div', { class: 'pv-block pv-' + t });
+    else node = el('span', {});
+    for (const c of n.children) draw(c, node);
+    if (node.childNodes.length) into.appendChild(node);
+  };
+  if (body) for (const c of body.children) draw(c, page);
+  if (!page.childNodes.length) page.appendChild(el('div', { class: 'dt-muted', text: '（表示される内容がありません）' }));
+  container.appendChild(el('div', { class: 'pv' }, [bar, el('div', { class: 'pv-title', text: title ? H.textContent(title).trim() : '(無題)' }), page,
+    el('div', { class: 'dt-hint', text: 'これは「画面に実際に表示される内容」の簡易表示です。非表示にされた要素・コメント・通信の中身は、DevTools でないと見えません。' })]));
+}
+
+Object.assign(exports, { mountDevtools, renderPagePreview });
 
 };
 __mods["js/story.js"] = function (module, exports, __require) {
@@ -11438,7 +13410,9 @@ const { buildEnvironment } = __require("js/env.js");
 const { Terminal } = __require("js/terminal.js");
 const { evaluate, needsAnswer } = __require("js/checker.js");
 const store = __require("js/storage.js");
-const { STAGES, getMission, getStageOf, isMissionUnlocked, allMissions } = __require("js/missions/index.js");
+const { STAGES, TRACKS, getMission, getStageOf, getStage, trackOfStage, isMissionUnlocked, allMissions, missionsOfTrack } = __require("js/missions/index.js");
+const { createSession } = __require("js/vb/session.js");
+const { mountDevtools, renderPagePreview } = __require("js/devtools.js");
 const { CAST, PROLOGUE, EPILOGUE, chapterOf } = __require("js/story.js");
 
 const app = document.getElementById('app');
@@ -11545,11 +13519,26 @@ function renderHome() {
 
   const map = el('div', { class: 'stage-list' }, STAGES.map(st => stageRow(st)));
 
+  // 並行コース（DevTools）: メインの進行とは独立して、いつでも始められる
+  const devTrack = TRACKS.find(t => t.id === 'devtools');
+  const devMissions = missionsOfTrack('devtools');
+  const devSection = devMissions.length ? [
+    el('div', { class: 'section-label', text: 'DevTools コース（メインと並行して進められます）' }),
+    el('p', { class: 'track-desc', text: 'ブラウザの開発者ツールの読み方を、架空のWebページで練習するコースです。スマホでは本物の開発者ツールを開けないため、同じ画面構成の疑似DevToolsを使います。' }),
+    (() => {
+      const dn = devMissions.find(m => isMissionUnlocked(m.id, isDone) && !isDone(m.id));
+      const dd = devMissions.filter(m => isDone(m.id)).length;
+      return el('button', { class: 'btn-primary', text: dn ? (dd ? 'DevTools コースの続きへ ▸' : 'DevTools コースを始める ▸') : 'DevTools コース修了 ✓', onclick: () => dn ? go('#/mission/' + dn.id) : go('#/stage/' + devTrack.stages[0].id) });
+    })(),
+    el('div', { class: 'stage-list', style: 'margin-top:12px' }, devTrack.stages.map(st => stageRow(st))),
+  ] : [];
+
   screen([
     topbar(''),
     header, stat, cont,
-    el('div', { class: 'section-label', text: '学習ステージ' }),
+    el('div', { class: 'section-label', text: 'メインコース — 学習ステージ' }),
     map,
+    ...devSection,
     el('p', { class: 'foot-note', text: 'これは学習用シミュレーターです。実在のLinuxとは一部挙動が異なります（docs/LIMITATIONS.md）。実際のコマンド実行や外部通信は一切行いません。' }),
   ]);
 }
@@ -11573,7 +13562,7 @@ function stageRow(st) {
 
 // ---------- ステージ画面 ----------
 function renderStage(stageId) {
-  const st = STAGES.find(s => s.id === stageId);
+  const st = getStage(stageId);
   if (!st) return renderHome();
   const list = el('div', { class: 'mission-list' }, st.missions.map((m, i) => {
     const unlocked = isMissionUnlocked(m.id, isDone);
@@ -11588,13 +13577,15 @@ function renderStage(stageId) {
     ]);
   }));
   const ch = chapterOf(st.id);
-  const idx = STAGES.indexOf(st);
+  const trk = trackOfStage(st.id);
+  const idx = trk.stages.indexOf(st);
+  const chPrefix = trk.id === 'main' ? '' : trk.title.replace(' コース', '') + ' ';
   const cleared = st.missions.every(m => isDone(m.id));
   screen([
     topbar(st.title, '#/'),
     el('div', { class: 'stage-hero' }, [
       el('div', { class: 'section-label', text: st.title }),
-      ch.title ? el('div', { class: 'chapter-head', text: `第${idx + 1}章 ${ch.title}` }) : null,
+      ch.title ? el('div', { class: 'chapter-head', text: `${chPrefix}第${idx + 1}章 ${ch.title}` }) : null,
       dialogue(ch.intro),
       el('p', { class: 'stage-intro', text: st.intro }),
     ]),
@@ -11655,9 +13646,17 @@ function startPlay(id) {
   const m = getMission(id);
   if (!m) return renderHome();
   store.markStarted(id);
+  if (m.browser) {
+    // ブラウザ型: ターミナルの代わりに、架空ページ + 疑似DevTools を使う
+    const dev = createSession(m.browser);
+    play = { mission: m, shell: null, term: null, dev, devUi: { quick: m.browser.quick || [] }, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
+    dev.subscribe(() => { if (play && play.dev === dev) checkCurrentTask(true); });
+    renderPlay();
+    return;
+  }
   const { shell } = buildEnvironment(m);
   const term = new Terminal(shell, { onCommand: () => { if (play) checkCurrentTask(true); } });
-  play = { mission: m, shell, term, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
+  play = { mission: m, shell, term, dev: null, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
   renderPlay();
   // 既にクリア済みなら最初から復習として解き直せる（進捗は保持）
 }
@@ -11665,13 +13664,14 @@ function startPlay(id) {
 function renderPlay() {
   const m = play.mission;
 
-  // タブ切り替え（ミッション説明 / ターミナル）
-  const tabs = el('div', { class: 'play-tabs' }, [
-    el('button', { class: 'ptab' + (play.view === 'mission' ? ' active' : ''), text: '課題', onclick: () => { play.view = 'mission'; renderPlay(); } }),
-    el('button', { class: 'ptab' + (play.view === 'terminal' ? ' active' : ''), text: 'ターミナル', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }),
-  ]);
+  // タブ切り替え（課題 / ターミナル）。ブラウザ型は（課題 / ページ / DevTools）
+  const tabDefs = play.dev
+    ? [['mission', '課題'], ['page', 'ページ'], ['dev', 'DevTools']]
+    : [['mission', '課題'], ['terminal', 'ターミナル']];
+  const tabs = el('div', { class: 'play-tabs' }, tabDefs.map(([v, label]) =>
+    el('button', { class: 'ptab' + (play.view === v ? ' active' : ''), text: label, onclick: () => { play.view = v; renderPlay(); if (v === 'terminal') setTimeout(() => play.term.focus(), 50); } })));
 
-  const body = play.view === 'terminal' ? renderTerminalView() : renderTaskView();
+  const body = play.view === 'terminal' ? renderTerminalView() : play.view === 'dev' ? renderDevView() : play.view === 'page' ? renderPageView() : renderTaskView();
 
   screen([
     el('div', { class: 'play-top' }, [
@@ -11682,6 +13682,26 @@ function renderPlay() {
     tabs,
     body,
   ]);
+}
+
+function currentTaskMini() {
+  const task = play.mission.tasks[play.taskIdx];
+  return el('div', { class: 'cur-task-mini' }, [
+    el('span', { class: 'ctm-label', text: '現在の課題 ' + (play.taskIdx + 1) + '/' + play.mission.tasks.length }),
+    el('span', { class: 'ctm-text', text: task.q }),
+  ]);
+}
+
+function renderDevView() {
+  const box = el('div', { class: 'dt-host' });
+  mountDevtools(box, play.dev, play.devUi);
+  return el('div', {}, [currentTaskMini(), box]);
+}
+
+function renderPageView() {
+  const box = el('div', {});
+  renderPagePreview(box, play.dev);
+  return el('div', {}, [currentTaskMini(), box]);
 }
 
 function renderTerminalView() {
@@ -11732,10 +13752,10 @@ function renderTaskView() {
       input,
       el('button', { class: 'btn-answer', text: '提出', onclick: () => submitAnswer(input.value) }),
     ]));
-    blocks.push(el('div', { class: 'hint-note', text: 'ヒント: ターミナルで調べて、分かった値をここに入力します。' }));
+    blocks.push(el('div', { class: 'hint-note', text: play.dev ? 'ヒント: DevTools で調べて、分かった値をここに入力します。' : 'ヒント: ターミナルで調べて、分かった値をここに入力します。' }));
   } else {
     // 状態判定タスク：ターミナルで操作 → 判定ボタン
-    blocks.push(el('div', { class: 'hint-note', text: 'この課題はターミナルで操作して達成します。操作後、下のボタンで判定するか、コマンド実行ごとに自動で判定されます。' }));
+    blocks.push(el('div', { class: 'hint-note', text: play.dev ? 'この課題は DevTools の操作で達成します。操作後、下のボタンで判定するか、操作のたびに自動で判定されます。' : 'この課題はターミナルで操作して達成します。操作後、下のボタンで判定するか、コマンド実行ごとに自動で判定されます。' }));
     blocks.push(el('div', { class: 'answer-row' }, [
       el('button', { class: 'btn-answer wide', text: '達成を判定する', onclick: () => checkCurrentTask(false) }),
     ]));
@@ -11743,7 +13763,8 @@ function renderTaskView() {
   blocks.push(feedback);
 
   // ターミナルへ
-  blocks.push(el('button', { class: 'to-term', text: '⌨ ターミナルを開いて操作する', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }));
+  if (play.dev) blocks.push(el('div', { class: 'to-term-row' }, [el('button', { class: 'to-term', text: '🛠 DevTools を開く', onclick: () => { play.view = 'dev'; renderPlay(); } }), el('button', { class: 'to-term', text: '🌐 ページを見る', onclick: () => { play.view = 'page'; renderPlay(); } })]));
+  else blocks.push(el('button', { class: 'to-term', text: '⌨ ターミナルを開いて操作する', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }));
 
   // ヒント（段階的）
   const hintBox = el('div', { class: 'hint-box' });
@@ -11781,9 +13802,11 @@ function renderTaskView() {
   ]);
 }
 
+function runtimeOf() { return { vfs: play.shell ? play.shell.vfs : null, shell: play.shell, dev: play.dev }; }
+
 function submitAnswer(value) {
   const task = play.mission.tasks[play.taskIdx];
-  const r = evaluate(task.check, value, { vfs: play.shell.vfs, shell: play.shell });
+  const r = evaluate(task.check, value, runtimeOf());
   showFeedback(r.ok, r.ok ? '正解！' : (r.detail || 'もう一度試してみましょう'));
   if (r.ok) markSolved();
 }
@@ -11792,7 +13815,7 @@ function checkCurrentTask(silent) {
   const task = play.mission.tasks[play.taskIdx];
   if (play.solved[play.taskIdx]) return;
   if (needsAnswer(task) && !task.noInput) return; // 入力系は自動判定しない
-  const r = evaluate(task.check, null, { vfs: play.shell.vfs, shell: play.shell });
+  const r = evaluate(task.check, null, runtimeOf());
   if (r.ok) { markSolved(); if (silent) flashToast('課題達成 ✓'); }
   else if (!silent) showFeedback(false, r.detail || 'まだ条件を満たしていません');
 }
@@ -11842,16 +13865,17 @@ function renderReview(m) {
   ));
 
   const stageId = getStageOf(m.id);
-  const st = STAGES.find(s => s.id === stageId);
+  const st = getStage(stageId);
+  const trk = trackOfStage(st.id);
   const nextInStage = st.missions.find(x => !isDone(x.id));
   const ch = chapterOf(st.id);
   const stageCleared = !nextInStage;
-  const gameCleared = stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
+  const gameCleared = trk.id === 'main' && stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
   let nextBtn;
   if (nextInStage) nextBtn = el('button', { class: 'btn-primary', text: '次のミッションへ ▸', onclick: () => { play = null; go('#/mission/' + nextInStage.id); } });
   else {
-    const stIdx = STAGES.indexOf(st);
-    const nextStage = STAGES[stIdx + 1];
+    const stIdx = trk.stages.indexOf(st);
+    const nextStage = trk.stages[stIdx + 1];
     if (nextStage) nextBtn = el('button', { class: 'btn-primary', text: '次のステージへ ▸', onclick: () => { play = null; go('#/stage/' + nextStage.id); } });
     else nextBtn = el('button', { class: 'btn-primary', text: '学習進捗を見る ▸', onclick: () => { play = null; go('#/progress'); } });
   }
@@ -11869,7 +13893,7 @@ function renderReview(m) {
     rv.why ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: 'なぜこの操作が必要だったか' }), el('div', { class: 'db-text', text: rv.why })]) : null,
     rv.practice ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '実務での使いどころ' }), el('div', { class: 'db-text', text: rv.practice })]) : null,
     rv.related && rv.related.length ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '次につながる知識' }), el('div', { class: 'chips' }, rv.related.map(r => el('span', { class: 'chip', text: r })))]) : null,
-    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `第${STAGES.indexOf(st) + 1}章 クリア` }) : null,
+    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `${trk.id === 'main' ? '' : trk.title.replace(' コース', '') + ' '}第${trk.stages.indexOf(st) + 1}章 クリア` }) : null,
     stageCleared ? dialogue(ch.outro) : null,
     gameCleared ? el('div', { class: 'section-label', text: EPILOGUE.title }) : null,
     gameCleared ? dialogue(EPILOGUE.lines) : null,

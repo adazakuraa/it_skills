@@ -6,7 +6,9 @@ import { buildEnvironment } from './env.js';
 import { Terminal } from './terminal.js';
 import { evaluate, needsAnswer } from './checker.js';
 import * as store from './storage.js';
-import { STAGES, getMission, getStageOf, isMissionUnlocked, allMissions } from './missions/index.js';
+import { STAGES, TRACKS, getMission, getStageOf, getStage, trackOfStage, isMissionUnlocked, allMissions, missionsOfTrack } from './missions/index.js';
+import { createSession } from './vb/session.js';
+import { mountDevtools, renderPagePreview } from './devtools.js';
 import { CAST, PROLOGUE, EPILOGUE, chapterOf } from './story.js';
 
 const app = document.getElementById('app');
@@ -113,11 +115,26 @@ function renderHome() {
 
   const map = el('div', { class: 'stage-list' }, STAGES.map(st => stageRow(st)));
 
+  // 並行コース（DevTools）: メインの進行とは独立して、いつでも始められる
+  const devTrack = TRACKS.find(t => t.id === 'devtools');
+  const devMissions = missionsOfTrack('devtools');
+  const devSection = devMissions.length ? [
+    el('div', { class: 'section-label', text: 'DevTools コース（メインと並行して進められます）' }),
+    el('p', { class: 'track-desc', text: 'ブラウザの開発者ツールの読み方を、架空のWebページで練習するコースです。スマホでは本物の開発者ツールを開けないため、同じ画面構成の疑似DevToolsを使います。' }),
+    (() => {
+      const dn = devMissions.find(m => isMissionUnlocked(m.id, isDone) && !isDone(m.id));
+      const dd = devMissions.filter(m => isDone(m.id)).length;
+      return el('button', { class: 'btn-primary', text: dn ? (dd ? 'DevTools コースの続きへ ▸' : 'DevTools コースを始める ▸') : 'DevTools コース修了 ✓', onclick: () => dn ? go('#/mission/' + dn.id) : go('#/stage/' + devTrack.stages[0].id) });
+    })(),
+    el('div', { class: 'stage-list', style: 'margin-top:12px' }, devTrack.stages.map(st => stageRow(st))),
+  ] : [];
+
   screen([
     topbar(''),
     header, stat, cont,
-    el('div', { class: 'section-label', text: '学習ステージ' }),
+    el('div', { class: 'section-label', text: 'メインコース — 学習ステージ' }),
     map,
+    ...devSection,
     el('p', { class: 'foot-note', text: 'これは学習用シミュレーターです。実在のLinuxとは一部挙動が異なります（docs/LIMITATIONS.md）。実際のコマンド実行や外部通信は一切行いません。' }),
   ]);
 }
@@ -141,7 +158,7 @@ function stageRow(st) {
 
 // ---------- ステージ画面 ----------
 function renderStage(stageId) {
-  const st = STAGES.find(s => s.id === stageId);
+  const st = getStage(stageId);
   if (!st) return renderHome();
   const list = el('div', { class: 'mission-list' }, st.missions.map((m, i) => {
     const unlocked = isMissionUnlocked(m.id, isDone);
@@ -156,13 +173,15 @@ function renderStage(stageId) {
     ]);
   }));
   const ch = chapterOf(st.id);
-  const idx = STAGES.indexOf(st);
+  const trk = trackOfStage(st.id);
+  const idx = trk.stages.indexOf(st);
+  const chPrefix = trk.id === 'main' ? '' : trk.title.replace(' コース', '') + ' ';
   const cleared = st.missions.every(m => isDone(m.id));
   screen([
     topbar(st.title, '#/'),
     el('div', { class: 'stage-hero' }, [
       el('div', { class: 'section-label', text: st.title }),
-      ch.title ? el('div', { class: 'chapter-head', text: `第${idx + 1}章 ${ch.title}` }) : null,
+      ch.title ? el('div', { class: 'chapter-head', text: `${chPrefix}第${idx + 1}章 ${ch.title}` }) : null,
       dialogue(ch.intro),
       el('p', { class: 'stage-intro', text: st.intro }),
     ]),
@@ -223,9 +242,17 @@ function startPlay(id) {
   const m = getMission(id);
   if (!m) return renderHome();
   store.markStarted(id);
+  if (m.browser) {
+    // ブラウザ型: ターミナルの代わりに、架空ページ + 疑似DevTools を使う
+    const dev = createSession(m.browser);
+    play = { mission: m, shell: null, term: null, dev, devUi: { quick: m.browser.quick || [] }, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
+    dev.subscribe(() => { if (play && play.dev === dev) checkCurrentTask(true); });
+    renderPlay();
+    return;
+  }
   const { shell } = buildEnvironment(m);
   const term = new Terminal(shell, { onCommand: () => { if (play) checkCurrentTask(true); } });
-  play = { mission: m, shell, term, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
+  play = { mission: m, shell, term, dev: null, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
   renderPlay();
   // 既にクリア済みなら最初から復習として解き直せる（進捗は保持）
 }
@@ -233,13 +260,14 @@ function startPlay(id) {
 function renderPlay() {
   const m = play.mission;
 
-  // タブ切り替え（ミッション説明 / ターミナル）
-  const tabs = el('div', { class: 'play-tabs' }, [
-    el('button', { class: 'ptab' + (play.view === 'mission' ? ' active' : ''), text: '課題', onclick: () => { play.view = 'mission'; renderPlay(); } }),
-    el('button', { class: 'ptab' + (play.view === 'terminal' ? ' active' : ''), text: 'ターミナル', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }),
-  ]);
+  // タブ切り替え（課題 / ターミナル）。ブラウザ型は（課題 / ページ / DevTools）
+  const tabDefs = play.dev
+    ? [['mission', '課題'], ['page', 'ページ'], ['dev', 'DevTools']]
+    : [['mission', '課題'], ['terminal', 'ターミナル']];
+  const tabs = el('div', { class: 'play-tabs' }, tabDefs.map(([v, label]) =>
+    el('button', { class: 'ptab' + (play.view === v ? ' active' : ''), text: label, onclick: () => { play.view = v; renderPlay(); if (v === 'terminal') setTimeout(() => play.term.focus(), 50); } })));
 
-  const body = play.view === 'terminal' ? renderTerminalView() : renderTaskView();
+  const body = play.view === 'terminal' ? renderTerminalView() : play.view === 'dev' ? renderDevView() : play.view === 'page' ? renderPageView() : renderTaskView();
 
   screen([
     el('div', { class: 'play-top' }, [
@@ -250,6 +278,26 @@ function renderPlay() {
     tabs,
     body,
   ]);
+}
+
+function currentTaskMini() {
+  const task = play.mission.tasks[play.taskIdx];
+  return el('div', { class: 'cur-task-mini' }, [
+    el('span', { class: 'ctm-label', text: '現在の課題 ' + (play.taskIdx + 1) + '/' + play.mission.tasks.length }),
+    el('span', { class: 'ctm-text', text: task.q }),
+  ]);
+}
+
+function renderDevView() {
+  const box = el('div', { class: 'dt-host' });
+  mountDevtools(box, play.dev, play.devUi);
+  return el('div', {}, [currentTaskMini(), box]);
+}
+
+function renderPageView() {
+  const box = el('div', {});
+  renderPagePreview(box, play.dev);
+  return el('div', {}, [currentTaskMini(), box]);
 }
 
 function renderTerminalView() {
@@ -300,10 +348,10 @@ function renderTaskView() {
       input,
       el('button', { class: 'btn-answer', text: '提出', onclick: () => submitAnswer(input.value) }),
     ]));
-    blocks.push(el('div', { class: 'hint-note', text: 'ヒント: ターミナルで調べて、分かった値をここに入力します。' }));
+    blocks.push(el('div', { class: 'hint-note', text: play.dev ? 'ヒント: DevTools で調べて、分かった値をここに入力します。' : 'ヒント: ターミナルで調べて、分かった値をここに入力します。' }));
   } else {
     // 状態判定タスク：ターミナルで操作 → 判定ボタン
-    blocks.push(el('div', { class: 'hint-note', text: 'この課題はターミナルで操作して達成します。操作後、下のボタンで判定するか、コマンド実行ごとに自動で判定されます。' }));
+    blocks.push(el('div', { class: 'hint-note', text: play.dev ? 'この課題は DevTools の操作で達成します。操作後、下のボタンで判定するか、操作のたびに自動で判定されます。' : 'この課題はターミナルで操作して達成します。操作後、下のボタンで判定するか、コマンド実行ごとに自動で判定されます。' }));
     blocks.push(el('div', { class: 'answer-row' }, [
       el('button', { class: 'btn-answer wide', text: '達成を判定する', onclick: () => checkCurrentTask(false) }),
     ]));
@@ -311,7 +359,8 @@ function renderTaskView() {
   blocks.push(feedback);
 
   // ターミナルへ
-  blocks.push(el('button', { class: 'to-term', text: '⌨ ターミナルを開いて操作する', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }));
+  if (play.dev) blocks.push(el('div', { class: 'to-term-row' }, [el('button', { class: 'to-term', text: '🛠 DevTools を開く', onclick: () => { play.view = 'dev'; renderPlay(); } }), el('button', { class: 'to-term', text: '🌐 ページを見る', onclick: () => { play.view = 'page'; renderPlay(); } })]));
+  else blocks.push(el('button', { class: 'to-term', text: '⌨ ターミナルを開いて操作する', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }));
 
   // ヒント（段階的）
   const hintBox = el('div', { class: 'hint-box' });
@@ -349,9 +398,11 @@ function renderTaskView() {
   ]);
 }
 
+function runtimeOf() { return { vfs: play.shell ? play.shell.vfs : null, shell: play.shell, dev: play.dev }; }
+
 function submitAnswer(value) {
   const task = play.mission.tasks[play.taskIdx];
-  const r = evaluate(task.check, value, { vfs: play.shell.vfs, shell: play.shell });
+  const r = evaluate(task.check, value, runtimeOf());
   showFeedback(r.ok, r.ok ? '正解！' : (r.detail || 'もう一度試してみましょう'));
   if (r.ok) markSolved();
 }
@@ -360,7 +411,7 @@ function checkCurrentTask(silent) {
   const task = play.mission.tasks[play.taskIdx];
   if (play.solved[play.taskIdx]) return;
   if (needsAnswer(task) && !task.noInput) return; // 入力系は自動判定しない
-  const r = evaluate(task.check, null, { vfs: play.shell.vfs, shell: play.shell });
+  const r = evaluate(task.check, null, runtimeOf());
   if (r.ok) { markSolved(); if (silent) flashToast('課題達成 ✓'); }
   else if (!silent) showFeedback(false, r.detail || 'まだ条件を満たしていません');
 }
@@ -410,16 +461,17 @@ function renderReview(m) {
   ));
 
   const stageId = getStageOf(m.id);
-  const st = STAGES.find(s => s.id === stageId);
+  const st = getStage(stageId);
+  const trk = trackOfStage(st.id);
   const nextInStage = st.missions.find(x => !isDone(x.id));
   const ch = chapterOf(st.id);
   const stageCleared = !nextInStage;
-  const gameCleared = stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
+  const gameCleared = trk.id === 'main' && stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
   let nextBtn;
   if (nextInStage) nextBtn = el('button', { class: 'btn-primary', text: '次のミッションへ ▸', onclick: () => { play = null; go('#/mission/' + nextInStage.id); } });
   else {
-    const stIdx = STAGES.indexOf(st);
-    const nextStage = STAGES[stIdx + 1];
+    const stIdx = trk.stages.indexOf(st);
+    const nextStage = trk.stages[stIdx + 1];
     if (nextStage) nextBtn = el('button', { class: 'btn-primary', text: '次のステージへ ▸', onclick: () => { play = null; go('#/stage/' + nextStage.id); } });
     else nextBtn = el('button', { class: 'btn-primary', text: '学習進捗を見る ▸', onclick: () => { play = null; go('#/progress'); } });
   }
@@ -437,7 +489,7 @@ function renderReview(m) {
     rv.why ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: 'なぜこの操作が必要だったか' }), el('div', { class: 'db-text', text: rv.why })]) : null,
     rv.practice ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '実務での使いどころ' }), el('div', { class: 'db-text', text: rv.practice })]) : null,
     rv.related && rv.related.length ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '次につながる知識' }), el('div', { class: 'chips' }, rv.related.map(r => el('span', { class: 'chip', text: r })))]) : null,
-    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `第${STAGES.indexOf(st) + 1}章 クリア` }) : null,
+    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `${trk.id === 'main' ? '' : trk.title.replace(' コース', '') + ' '}第${trk.stages.indexOf(st) + 1}章 クリア` }) : null,
     stageCleared ? dialogue(ch.outro) : null,
     gameCleared ? el('div', { class: 'section-label', text: EPILOGUE.title }) : null,
     gameCleared ? dialogue(EPILOGUE.lines) : null,
