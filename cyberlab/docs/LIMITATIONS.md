@@ -38,6 +38,12 @@ JavaScriptのデータ構造だけを操作します。そのため本物のLinu
 - ケイパビリティ、ACL、SELinux/AppArmor は未対応。
 - SUID/SGID はビットの表示・検索・判定は再現しますが、実際の特権昇格は起こりません（学習用の見立て）。
 
+## 疑似 DevTools（DevTools コース）
+- 本物のブラウザではなく、ミッションが定義した「架空ページ」を扱うシミュレータです。通信・Cookie・ソース・計測値はすべてミッション同梱のデータです。
+- Console は **制限付きの JavaScript 式評価器**です（`eval`/`Function` は不使用）。算術・比較・論理・三項、文字列/配列/Object/JSON の基本メソッド、`document.querySelector(All)`/`getElementById` と要素の属性操作、`localStorage`/`sessionStorage`/`document.cookie` などの許可リスト方式で、`__proto__`/`constructor`/`prototype` や `window` 経由の抜け道は遮断します。関数定義・ループ・`async` 等は未対応です。
+- ブレークポイントは、ミッションが用意した行でのみ停止し、スコープ値は定義済みの値を表示します（実際のコードは実行しません）。
+- Performance の数値は定義値で、スロットリングは倍率（Fast 4G ×2 / Slow 4G ×5）による簡易再現です。
+
 ## 安全性に関する設計
 - `eval` / `new Function` / 文字列 `setTimeout` を一切使用しません。
 - ユーザー入力は独自パーサーで解釈し、ホストのJavaScriptやOSには決して渡しません。

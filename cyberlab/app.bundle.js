@@ -4996,6 +4996,41 @@ function evaluate(check, answer, runtime) {
       if (check.notMember != null && g.members.includes(check.notMember)) return { ok: false, detail: `${check.notMember} がまだ ${check.name} のメンバーです` };
       return { ok: true };
     }
+    case 'dev': {
+      // 仮想ブラウザ(DevTools)上の操作・状態で判定する。runtime.dev は vb/session.js のセッション。
+      const d = runtime.dev;
+      if (!d) return { ok: false, detail: 'DevTools が起動していません' };
+      const st = d.state;
+      if (check.consoleRan != null) {
+        let re; try { re = new RegExp(check.consoleRan, 'i'); } catch { return { ok: false, detail: '判定定義が不正です' }; }
+        if (!d.replHistory.some(x => re.test(x))) return { ok: false, detail: 'Console で該当の式をまだ実行していません' };
+      }
+      if (check.breakpoint) { if (!st.breakpoints.some(b => b.file === check.breakpoint.file && b.line === check.breakpoint.line)) return { ok: false, detail: `${check.breakpoint.file} の ${check.breakpoint.line} 行目にブレークポイントがありません` }; }
+      if (check.pausedAt) { if (!st.pausedOnce.some(b => b.file === check.pausedAt.file && b.line === check.pausedAt.line)) return { ok: false, detail: 'その行でまだ実行を止めていません' }; }
+      if (check.tab != null && !st.visited.has(check.tab)) return { ok: false, detail: `${check.tab} タブをまだ開いていません` };
+      if (check.viewedRequest != null && !st.viewedRequests.has(check.viewedRequest)) return { ok: false, detail: '該当のリクエストの詳細をまだ開いていません' };
+      if (check.filterUsed != null && !st.filtersUsed.has(check.filterUsed)) return { ok: false, detail: `Network の「${check.filterUsed}」フィルタをまだ使っていません` };
+      if (check.throttle != null && st.throttle !== check.throttle) return { ok: false, detail: `スロットリングが ${check.throttle} になっていません` };
+      if (check.searched != null) { let re; try { re = new RegExp(check.searched, 'i'); } catch { return { ok: false, detail: '判定定義が不正です' }; } if (!st.searches.some(q => re.test(q))) return { ok: false, detail: 'Sources でその語をまだ検索していません' }; }
+      if (check.prettyPrinted != null && !st.prettyPrinted.has(check.prettyPrinted)) return { ok: false, detail: `${check.prettyPrinted} をまだ整形表示していません` };
+      if (check.dom) {
+        const n = d.querySelector(check.dom.sel);
+        if (check.dom.exists === false) { if (n) return { ok: false, detail: `${check.dom.sel} がまだ存在します` }; }
+        else {
+          if (!n) return { ok: false, detail: `${check.dom.sel} が見つかりません` };
+          if (check.dom.visible != null && (!d.isHidden(n)) !== check.dom.visible) return { ok: false, detail: `${check.dom.sel} の表示状態が目標と違います` };
+          if (check.dom.attr) for (const [k, v] of Object.entries(check.dom.attr)) { const cur = n.attrs[k]; if (v === null ? cur !== undefined : cur !== v) return { ok: false, detail: `${check.dom.sel} の ${k} 属性が目標と違います` }; }
+        }
+      }
+      if (check.storage) {
+        for (const kind of ['local', 'session']) for (const [k, v] of Object.entries(check.storage[kind] || {})) {
+          const cur = Object.prototype.hasOwnProperty.call(d[kind], k) ? d[kind][k] : null;
+          if (cur !== v) return { ok: false, detail: `${kind === 'local' ? 'localStorage' : 'sessionStorage'} の ${k} が目標と違います` };
+        }
+        for (const [k, want] of Object.entries(check.storage.cookie || {})) if (d.cookies.some(c => c.name === k) !== want) return { ok: false, detail: `Cookie ${k} の有無が目標と違います` };
+      }
+      return { ok: true };
+    }
     case 'env': {
       const v = shell.env[check.name];
       if (check.equals != null) return norm(v) === norm(check.equals) ? { ok: true } : { ok: false, detail: `環境変数 ${check.name} が目標と違います` };
@@ -10802,6 +10837,1105 @@ const stageAISec = {
 Object.assign(exports, { stageAISec });
 
 };
+__mods["js/missions/dt/d01-console.js"] = function (module, exports, __require) {
+// DevTools 1: Console を読む・使う
+const HTML = `<!DOCTYPE html>
+<html><head><title>ミニショップ</title></head>
+<body>
+<header><h1>ミニショップ</h1></header>
+<div id="app">
+  <p class="lead">今日のおすすめ商品</p>
+  <ul id="items"><li class="item">キーボード</li><li class="item">マウス</li><li class="item">モニター</li></ul>
+  <button id="buy">購入する</button>
+</div>
+<script src="/js/app.js"></script>
+</body></html>`;
+
+const APP_JS = `// ミニショップ アプリ本体
+const items = document.querySelectorAll('.item');
+const user = null;
+
+function showWelcome() {
+  // ユーザー名を表示する
+  const label = 'ようこそ、' + user.name + ' さん';
+  document.title = label;
+}
+
+document.getElementById('buy').addEventListener('click', () => {
+  fetch('/api/cart/add', { method: 'POST' });
+});
+
+showWelcome();`;
+
+const d01 = {
+  id: 'dv-01-console',
+  title: 'Console でエラーを読み、式を試す',
+  minutes: 12,
+  objectives: ['Console のエラー・警告メッセージを読む', 'エラー文から原因の場所（ファイルと行）をたどる', 'Console で式を実行してページの状態を調べる'],
+  prereq: [],
+  briefing: '同僚が作った「ミニショップ」のページで、ボタンが反応しない。画面を見ても原因は分からない。そこで開発者ツールの Console を開く。エラーが赤く出ていれば、そこに「何が」「どこで」起きたかが書かれている。まずは読み方から覚えよう。',
+  concepts: [{
+    title: 'Console の役割',
+    why: '画面に表示されない「内部の失敗」は、まず Console に出る。ブラウザは問題が起きるたびに、種類・内容・発生場所を Console に記録している。',
+    problem: 'ページが動かないとき、画面を眺めても原因は分からない。どこで何が失敗したかを知る手がかりが必要になる。',
+    how: 'メッセージは重要度で色分けされる: エラー(赤)=処理が止まった、警告(黄)=問題の可能性、ログ(白)=開発者が出した情報。エラー文は「種類: 内容」の形(例: TypeError: Cannot read properties of null)で、右端の「ファイル名:行番号」を押すと該当のソースを開ける。入力欄(›)に式を書けば、そのページの中身をその場で調べられる。',
+    example: "Uncaught TypeError: Cannot read properties of null (reading 'name')  app.js:7\n> document.title\n'ミニショップ'",
+    relation: 'エラー文を読んで原因の行を特定し、Console の式でページの状態を確かめる。',
+  }],
+  browser: {
+    url: 'https://minishop.example.com/',
+    html: HTML,
+    tabs: ['console', 'elements', 'sources'],
+    console: [
+      { level: 'warn', text: "[Deprecation] 'DOMNodeInserted' イベントは非推奨です。MutationObserver を使ってください。", source: 'legacy.js:12' },
+      { level: 'log', text: 'ミニショップを初期化しています…', source: 'app.js:1' },
+      { level: 'error', text: "Uncaught TypeError: Cannot read properties of null (reading 'name')", source: 'app.js:7' },
+      { level: 'error', text: 'Failed to load resource: the server responded with a status of 404 ()  /img/banner.png', source: 'minishop.example.com/:1' },
+    ],
+    sources: { 'app.js': APP_JS },
+    globals: { shopConfig: { name: 'ミニショップ', currency: 'JPY', tax: 0.1, version: '2.4.1' } },
+    quick: ['document.title', "document.querySelectorAll('.item').length", 'shopConfig.version', 'shopConfig', "document.querySelector('#buy').textContent"],
+  },
+  tasks: [
+    {
+      q: 'Console には赤いエラーが2件あります。そのうち、JavaScript の実行が失敗したエラー（Uncaught で始まるもの）の「エラーの種類」を答えてください（例: ○○Error）。',
+      narration: 'Console を開き、赤いメッセージを探す。エラー文は「種類: 内容」の形で書かれていて、コロンの前が種類にあたる。',
+      check: { type: 'answer', any: ['TypeError'], ci: true },
+      answerHint: '○○Error の形式',
+      hints: ['Console タブの赤いメッセージ（⛔）を読む', '「Uncaught」で始まる方のエラー。コロンの前に種類が書かれている', 'Uncaught TypeError: … の「TypeError」'],
+      explain: 'TypeError は「値の型が合わない操作をした」エラー。今回は null（値が無い）に対して .name を読もうとして失敗している。エラーの種類を見るだけで、原因の見当がつく: TypeError=値の型・存在の問題、ReferenceError=存在しない変数の参照、SyntaxError=文法ミス。',
+    },
+    {
+      q: 'そのエラーが発生しているファイル名と行番号が、メッセージの右端にリンクで表示されています。エラーが起きている行番号を答えてください。',
+      narration: 'メッセージ右端の「ファイル名:行番号」はボタンになっていて、押すと Sources タブで該当ソースが開く。原因の行を直接見に行ける。',
+      check: { type: 'answer', any: ['7'] },
+      answerHint: '数字',
+      hints: ['エラー文の右端にある「app.js:◯」のリンクを見る', 'リンクをタップすると該当行が開く（Sources タブ）', 'app.js:7 → 7行目'],
+      explain: 'エラーの発生場所（app.js の7行目）が分かった。実際に開くと `user.name` を読む行で、直前で `const user = null;` と定義されている。「エラー文の種類＋発生場所」の2つが分かれば、原因はほぼ特定できる。これがデバッグの基本の動き。',
+    },
+    {
+      q: 'Console の入力欄に式を入力して、ページのタイトル（document.title）の値を調べてください。表示された文字列（引用符は除く）を答えてください。',
+      narration: 'Console の入力欄（›）は、そのページの中身を直接調べる道具。document はページ全体を表す特別な名前で、document.title でタイトルが取れる。',
+      check: { type: 'answer', any: ['ミニショップ'] },
+      answerHint: 'タイトルの文字列',
+      hints: ['Console タブ下部の入力欄に式を入力して「実行」', '入力するのは document.title', "結果は 'ミニショップ' （引用符は文字列であることを示す記号）"],
+      explain: 'Console では、ページの状態を式で直接確認できる。document.title の結果が引用符付きで表示されるのは「文字列」という印。画面を見て分かることも、式なら確実に取れる。デバッグでは「いま変数や画面の状態がどうなっているか」を式で確かめながら原因を絞る。',
+    },
+    {
+      q: 'このページは .item というクラスの要素が商品リストになっています。Console で document.querySelectorAll(\'.item\').length を実行して、商品の数を答えてください。',
+      narration: 'querySelectorAll はセレクタ（CSSと同じ書き方）に一致する要素をすべて取り出す。.length で個数が分かる。Elements タブでも確認できるが、式なら一瞬で数えられる。',
+      check: { type: 'answer', any: ['3'] },
+      hints: ["document.querySelectorAll('.item') は要素の一覧を返す", '一覧の個数は .length で取れる', "document.querySelectorAll('.item').length → 3"],
+      explain: '3件。セレクタ（#id、.class、タグ名）で要素を取り出す書き方は、Elements タブでの検索やスクレイピング、テストコードでもそのまま使える共通の知識。Console は「ページに対する電卓」のように使えるのがポイント。',
+    },
+    {
+      q: 'このページは設定オブジェクト shopConfig を持っています。Console で shopConfig.version を実行して、バージョン番号を答えてください。',
+      narration: '開発者はアプリの設定や状態を、グローバル変数（どこからでも見える変数）に置くことがある。Console からは、その中身を直接読める。',
+      check: { type: 'answer', any: ['2.4.1'] },
+      answerHint: 'x.y.z 形式',
+      hints: ['Console では、ページが持つ変数の名前をそのまま入力すると値が見られる', 'shopConfig と入力すると設定全体、.version でその中の1項目が読める', "shopConfig.version → '2.4.1'"],
+      explain: 'グローバル変数の中身は、誰でも Console から読めてしまう。便利な反面、設定にAPIキーや内部URLを入れておくと筒抜けになる、というセキュリティ上の落とし穴にもなる。「ブラウザに渡したものは、ユーザーに見られる前提」で設計することが大切。',
+    },
+  ],
+  review: {
+    steps: ['Console の赤いエラー（⛔）を見つける', 'エラーの種類（TypeError など）と内容を読む', '右端の ファイル名:行番号 で発生場所を特定する', '入力欄の式で、ページの状態を確かめる'],
+    commands: [{ cmd: 'document.title', meaning: 'ページのタイトルを調べる' }, { cmd: "document.querySelectorAll('.item').length", meaning: 'セレクタに一致する要素の数' }, { cmd: 'shopConfig.version', meaning: 'ページが持つ変数の中身を読む' }],
+    why: 'Console は、画面に出ない失敗の最初の手がかり。エラーの種類と場所を読めれば、原因の切り分けが一気に早くなる。',
+    practice: '不具合報告を受けたら、まず Console のエラーを確認する。スマホ実機でのデバッグやサポート対応でも、エラー文を共有してもらえば原因の見当がつく。',
+    related: ['Elements', 'Sources', 'Network', 'エラーの種類（TypeError/ReferenceError）'],
+  },
+  learned: ['devtools-console', 'console-errors', 'js-error-types', 'console-eval', 'document-queryselector'],
+  solution: ["document.title", "document.querySelectorAll('.item').length", 'shopConfig.version'],
+};
+
+Object.assign(exports, { d01 });
+
+};
+__mods["js/missions/dt/d02-elements.js"] = function (module, exports, __require) {
+// DevTools 2: Elements — 「画面に見えるもの」と「HTMLにあるもの」の違い
+const HTML = `<!DOCTYPE html>
+<html><head><title>社内ポータル</title></head>
+<body>
+<header><h1>社内ポータル</h1><nav><a href="/news">お知らせ</a> <a href="/docs">資料</a> <a id="admin-link" href="/admin/console" style="display:none">管理コンソール</a></nav></header>
+<main>
+  <p class="notice">来週の定期メンテナンスは火曜 22:00 からです。</p>
+  <!-- TODO: 公開前に削除 / 検証用の旧環境は stg-portal.example.com にある -->
+  <form id="feedback" action="/feedback" method="post">
+    <input type="text" name="comment" placeholder="ご意見をどうぞ">
+    <input type="hidden" name="form_token" value="a91f-77c2-board-20">
+    <button id="send" type="submit" disabled>送信</button>
+  </form>
+  <p id="status" hidden>送信を受け付けました。ありがとうございます。</p>
+</main>
+</body></html>`;
+
+const d02 = {
+  id: 'dv-02-elements',
+  title: 'Elements: 画面に見えないものを探す',
+  minutes: 14,
+  objectives: ['Elements でDOMツリーを開いて要素を探せる', '非表示の要素・HTMLコメント・hidden な入力欄が「誰にでも見える」ことを理解する', '属性を編集してページの挙動を確かめられる'],
+  prereq: ['dv-01-console'],
+  briefing: '社内ポータルのフィードバック欄で、送信ボタンが押せない。画面からは理由が分からない。Elements タブはページの「HTMLそのもの」を見せてくれる。画面に見えている部分だけでなく、隠れている部分もそこには全部ある。',
+  concepts: [{
+    title: 'Elements と DOM',
+    why: '画面に見えているものは、HTML のごく一部。見えない要素・コメント・属性にこそ、不具合の原因や、公開すべきでない情報が残っていることがある。',
+    problem: '「見えない = 存在しない」と思い込むと、ボタンが押せない理由も、うっかり公開されている情報も見落とす。',
+    how: 'Elements タブは、ブラウザが組み立てた DOM（要素の木構造）を表示する。▸ をタップして展開、行をタップすると属性を確認・編集できる。検索欄にはセレクタ（#id、.class）やテキストが使える。「非表示」バッジは CSS や hidden 属性で隠されている要素。ここでの編集はその場のページにだけ反映され、サーバーには何も影響しない。',
+    example: '<a id="admin-link" style="display:none">…</a>   ← 画面には出ないが HTML には存在\n<input type="hidden" name="form_token" value="…">   ← 画面には出ないが誰でも読める',
+    relation: '画面→HTML の順で調べ、原因（disabled 属性など）と、公開すべきでない情報の両方に気づけるようになる。',
+  }],
+  browser: {
+    url: 'https://portal.example.com/',
+    html: HTML,
+    tabs: ['elements', 'console'],
+    console: [{ level: 'log', text: 'ポータルを読み込みました', source: 'portal.js:1' }],
+    sources: { 'portal.js': "console.log('ポータルを読み込みました');" },
+    quick: ["document.querySelector('#send').disabled", "document.querySelector('#send').getAttribute('disabled')"],
+  },
+  tasks: [
+    {
+      q: 'Elements タブで、画面には表示されていない（「非表示」バッジが付く）リンクの id を答えてください。',
+      narration: 'nav の中のリンクは「お知らせ」「資料」の2つしか見えない。だが HTML には、もう1つ隠れたリンクがある。Elements なら、非表示の要素にも「非表示」バッジが付いて表示される。',
+      check: { type: 'answer', any: ['admin-link'], ci: true },
+      answerHint: 'id の値',
+      hints: ['Elements タブで html → body → header → nav と ▸ を開く', '「非表示」バッジが付いた <a> を探す', 'id="admin-link"'],
+      explain: '画面に出ないリンク（/admin/console 宛て）が HTML には残っていた。display:none は「見せない」だけで「アクセスできない」にはならない。管理画面を守るのはリンクを隠すことではなく、サーバー側の認証・認可。「隠す」と「守る」は別物、というのが最初の大事な理解。',
+    },
+    {
+      q: 'HTML には開発者が残したコメント（<!-- … -->）があります。そこに書かれている「旧環境」のホスト名を答えてください。',
+      narration: 'コメントは画面には一切出ないが、ブラウザには送られてくる。Elements では、灰色の <!-- … --> として表示される。',
+      check: { type: 'answer', any: ['stg-portal.example.com'], ci: true },
+      answerHint: 'ホスト名',
+      hints: ['<main> の中を展開する。灰色で表示されている行がコメント', '検索欄に「TODO」と入れても探せる', 'stg-portal.example.com'],
+      explain: '開発メモに検証用環境のホスト名が残っていた。コメントは「公開されるHTMLの一部」で、閲覧者全員に届く。社内の構成・TODO・パスワードなどをコメントに残したまま公開するのは、情報漏えいの典型的な原因。公開前にコメントを除去する（ビルドで自動削除する）運用が必要。',
+    },
+    {
+      q: 'フォームには画面に出ない hidden の入力欄があります。その name が form_token の値を答えてください。',
+      narration: 'type="hidden" の入力欄は、フォーム送信時にサーバーへ一緒に送られる「隠しデータ」。画面には出ないが、Elements で選べば value が読める。',
+      check: { type: 'answer', any: ['a91f-77c2-board-20'], ci: true },
+      answerHint: '値そのまま',
+      hints: ['<form id="feedback"> を展開する', 'type="hidden" の <input> をタップして属性を見る', 'value="a91f-77c2-board-20"'],
+      explain: 'hidden でも値は誰でも読めるし、書き換えもできる。hidden 欄を「ユーザーに見せない安全な入れ物」として使い、価格・権限・ユーザーIDなどをそこに置くと、書き換えられて悪用される（パラメータ改ざん）。サーバー側で必ず検証しよう。',
+    },
+    {
+      q: '送信ボタン（#send）が押せない原因は、ボタンに付いたある属性です。その属性名を答えてください。',
+      narration: 'ボタンが反応しない原因は、見た目ではなく属性にあることが多い。#send の行をタップして属性の一覧を確認する。',
+      check: { type: 'answer', any: ['disabled'], ci: true },
+      answerHint: '属性名',
+      hints: ['検索欄に #send と入力して、該当の行をタップする', '属性一覧（タップして編集）を見る', 'disabled 属性'],
+      explain: 'disabled 属性が付いていると、ボタンは押せない。属性の有無を確認できるのが Elements の強み。本物の不具合なら、なぜ disabled のままなのか（入力チェックのJSが動いていない等）を Console や Sources で追う。',
+    },
+    {
+      q: 'Elements の属性編集を使って、#send ボタンから disabled 属性を削除してください（ページ内だけの変更で、サーバーには影響しません）。',
+      narration: '属性の編集は「その場の実験」。原因の仮説が正しいかを、コードを直す前に確かめられる。',
+      check: { type: 'dev', dom: { sel: '#send', attr: { disabled: null } } },
+      noInput: true,
+      hints: ['#send を選択して、属性一覧の disabled の横の「削除」をタップ', 'DevTools の Elements タブで、選択した要素の属性欄を操作する', 'Console でも document.querySelector(\'#send\').removeAttribute(\'disabled\') で同じことができる'],
+      explain: 'disabled を外すとボタンが押せる状態になった。これは「原因の仮説を即座に検証する」ための操作で、元のソースは変わらない（再読み込みで元に戻る）。恒久的に直すには、HTML／JSを修正する必要がある。逆に言えば、画面側の制限（disabled・hidden・maxlength）はユーザー側で簡単に外せるので、サーバー側の検証が必須。',
+    },
+  ],
+  review: {
+    steps: ['Elements で html → body を展開して構造を見る', '「非表示」バッジ・コメント・hidden な入力欄を探す', '検索欄で #id / .class / テキストを検索する', '属性を編集して仮説を確かめる（サーバーには影響しない）'],
+    commands: [{ cmd: "document.querySelector('#send')", meaning: 'セレクタで要素を取り出す' }, { cmd: "el.getAttribute('disabled')", meaning: '属性の値を読む' }, { cmd: "el.removeAttribute('disabled')", meaning: '属性を削除する' }],
+    why: 'HTML は閲覧者全員に全文が届く。画面に出さないことは、守ることではない。',
+    practice: 'リリース前に自分のページを Elements で見て、コメント・hidden欄・display:none の要素に「公開すべきでない情報」が無いか点検する。',
+    related: ['Console', 'Sources', 'パラメータ改ざん', 'アクセス制御'],
+  },
+  learned: ['devtools-elements', 'dom-hidden-elements', 'html-comments-leak', 'hidden-input', 'attr-edit'],
+  solution: ["document.querySelector('#send').removeAttribute('disabled')"],
+};
+
+Object.assign(exports, { d02 });
+
+};
+__mods["js/missions/dt/d03-network.js"] = function (module, exports, __require) {
+// DevTools 3: Network — リクエスト一覧とステータスコード
+const HTML = `<!DOCTYPE html>
+<html><head><title>カフェ Leaf — メニュー</title><link rel="stylesheet" href="/css/main.css"></head>
+<body>
+<h1>カフェ Leaf</h1>
+<img src="/img/hero.jpg" alt="店内の写真">
+<ul id="menu"></ul>
+<script src="/js/menu.js"></script>
+<script src="https://cdn.tracker-example.net/t.js"></script>
+</body></html>`;
+
+const net = [
+  { url: '/', status: 200, mime: 'text/html', size: 4200, time: 120, start: 0, initiator: 'ナビゲーション', resHeaders: { 'content-type': 'text/html; charset=utf-8' } },
+  { url: '/css/main.css', status: 200, mime: 'text/css', size: 9800, time: 60, start: 130, initiator: '/ (HTML)' },
+  { url: '/img/hero.jpg', status: 200, mime: 'image/jpeg', size: 1840000, resourceSize: 1840000, time: 900, start: 130, initiator: '/ (HTML)', note: '約1.8MB の画像です。表示サイズに対して大きすぎます。' },
+  { url: '/js/menu.js', status: 200, mime: 'application/javascript', size: 14200, time: 80, start: 130, initiator: '/ (HTML)' },
+  { url: '/api/menu', status: 200, mime: 'application/json', size: 1900, time: 200, start: 230, initiator: 'menu.js:3', resBody: '{"items":[{"name":"ブレンド","price":450},{"name":"カフェラテ","price":520}]}' },
+  { url: '/img/logo.png', status: 404, mime: 'text/html', size: 310, time: 40, start: 140, initiator: '/ (HTML)' },
+  { url: '/api/recommend', status: 500, mime: 'application/json', size: 120, time: 300, start: 240, initiator: 'menu.js:9', method: 'POST', reqBody: '{"area":"tokyo"}', resBody: '{"error":"internal server error"}' },
+  { url: 'https://cdn.tracker-example.net/t.js', status: 200, mime: 'application/javascript', size: 31000, time: 350, start: 140, initiator: '/ (HTML)' },
+  { url: '/js/old-widget.js', status: 304, mime: 'application/javascript', size: 180, time: 25, start: 135, initiator: '/ (HTML)', fromCache: false },
+];
+
+const d03 = {
+  id: 'dv-03-network',
+  title: 'Network: 通信の一覧を読む',
+  minutes: 14,
+  objectives: ['Network タブでリクエスト一覧を読める', 'ステータスコード（2xx/3xx/4xx/5xx）の意味と失敗の見分け方を理解する', 'フィルタで知りたい種類の通信を絞り込める'],
+  prereq: ['dv-02-elements'],
+  briefing: 'カフェのメニューページで、ロゴが出ない・おすすめ欄が空になる、と報告があった。画面を作るために、ブラウザは裏で何十もの通信（リクエスト）をしている。Network タブはそのすべてを時系列で一覧にしてくれる。',
+  concepts: [{
+    title: 'Network タブとステータスコード',
+    why: '画面が壊れる原因の多くは通信の失敗。「どのリクエストが」「どんなステータスで」失敗したかが分かれば、サーバー側か、ブラウザ側か、場所を絞れる。',
+    problem: '画像が出ない・データが空、という症状だけでは、URLの間違い・サーバーの障害・権限・ネットワークのどれなのか分からない。',
+    how: '一覧の1行が1リクエスト。左からメソッド・名前・ステータス。ステータスは 2xx=成功、3xx=転送/キャッシュ、4xx=リクエスト側の問題（404 見つからない、401 未認証、403 権限なし）、5xx=サーバー側の障害（500 内部エラー）。赤い行は失敗。上のフィルタ（Fetch/XHR、JS、CSS、Img…）で種類を絞れる。行をタップすると詳細が開く。',
+    example: 'GET  logo.png       404   ← URLが違う／ファイルが無い\nPOST recommend      500   ← サーバー側の障害',
+    relation: '失敗した行を見つけ、ステータスの桁で原因の側（クライアント／サーバー）を切り分ける。',
+  }],
+  browser: {
+    url: 'https://leaf-cafe.example.com/menu',
+    html: HTML,
+    tabs: ['network', 'console'],
+    console: [
+      { level: 'error', text: 'Failed to load resource: the server responded with a status of 404 ()', source: 'leaf-cafe.example.com/img/logo.png' },
+      { level: 'error', text: 'Failed to load resource: the server responded with a status of 500 ()', source: 'leaf-cafe.example.com/api/recommend' },
+    ],
+    network: net,
+  },
+  tasks: [
+    {
+      q: 'Network タブで、ステータスが 404 になっているリクエストの「名前」（ファイル名）を答えてください。',
+      narration: '一覧の中で、赤い行を探す。404 は「そのURLには何も無い」というステータス。',
+      check: { type: 'answer', any: ['logo.png'], ci: true },
+      answerHint: 'ファイル名',
+      hints: ['Network タブを開き、一覧の赤い行（ステータスが赤）を探す', '404 と書かれた行の名前欄を読む', 'logo.png'],
+      explain: '404 Not Found は「URLが間違っているか、ファイルが存在しない」。画像が出ない原因はこれ。参照パスのタイプミス、デプロイ漏れ、ファイル名の大文字小文字の違いなどが定番の原因。',
+    },
+    {
+      q: 'おすすめ欄が空になる原因のリクエスト（/api/recommend）のステータスコードを答えてください。',
+      narration: 'データを取りに行く通信（Fetch/XHR）の失敗は、画面の「空」として現れる。種類のフィルタを使うと見つけやすい。',
+      check: { type: 'answer', any: ['500'] },
+      answerHint: '3桁の数字',
+      hints: ['フィルタの「Fetch/XHR」を押して、データ取得の通信だけにする', 'recommend の行の右端のステータスを読む', '500'],
+      explain: '500 Internal Server Error は「サーバー側で何か失敗した」。4xx とは違い、リクエストを送った側（ブラウザ）の問題ではないので、直すのはサーバー側。フロントエンドとしては、失敗時の表示（エラー表示・再試行）を用意しておくのも大事。',
+    },
+    {
+      q: 'Network のフィルタ「Fetch/XHR」を使い、API の通信だけを表示してください。',
+      narration: '通信が何十件もあると、目的のものが埋もれる。フィルタは Network を使いこなす最初の一歩。',
+      check: { type: 'dev', filterUsed: 'fetch' },
+      noInput: true,
+      hints: ['Network タブ上部のチップ（すべて／Fetch/XHR／JS…）を見る', '「Fetch/XHR」をタップする', 'タップするとフィルタが有効になる'],
+      explain: 'Fetch/XHR は、JavaScriptが裏でAPIを呼ぶ通信。SPA（画面遷移なしで動くアプリ）の不具合調査では、まずここを見る。JS・CSS・Img などで絞れば、読み込み漏れや巨大ファイルも探しやすい。',
+    },
+    {
+      q: 'このページが読み込んでいる、別ドメイン（第三者）のスクリプトのホスト名を答えてください。第三者のホストはオレンジ色で表示されます。',
+      narration: 'ページは自分のサーバーだけでなく、広告・解析・CDN など外部のサービスからも読み込む。Host 欄で自分以外のドメインを探す。',
+      check: { type: 'answer', any: ['cdn.tracker-example.net'], ci: true },
+      answerHint: 'ホスト名',
+      hints: ['一覧の各行の右端にホスト名がある', 'leaf-cafe.example.com 以外のものを探す（オレンジ色）', 'cdn.tracker-example.net'],
+      explain: '外部ドメインのスクリプトは、読み込んだ時点でそのページ上で動く強い権限を持つ（Cookie以外のページ内容は全部読める）。便利だが、相手が改ざんされると自分のサイトも巻き込まれる（サプライチェーンリスク）。どこの外部サービスを使っているか、Network で棚卸しできる。',
+    },
+    {
+      q: 'もっとも転送サイズの大きいリクエストの名前を答えてください（Img フィルタで画像を絞って確認できます）。',
+      narration: '表示が遅いときは「何が重いか」を探す。サイズの大きいものから見ていくのが定石。',
+      check: { type: 'answer', any: ['hero.jpg'], ci: true },
+      answerHint: 'ファイル名',
+      hints: ['各行の2段目にサイズ（kB/MB）が出ている', '1つだけ MB 単位のものがある', 'hero.jpg（約1.8MB）'],
+      explain: 'hero.jpg が約1.8MB で、ページ全体の大半を占めている。画像の圧縮・サイズ縮小・新形式（WebP/AVIF）への変更は、表示速度改善で最も効果が大きい施策のひとつ。次のミッション以降で、通信量を回線速度別にも見ていく。',
+    },
+  ],
+  review: {
+    steps: ['Network で読み込み直し、赤い行（失敗）を探す', 'ステータスの桁（4xx / 5xx）で切り分ける', 'フィルタ（Fetch/XHR・JS・Img）で種類を絞る', 'ホスト欄で第三者ドメインを確認、サイズで重いものを探す'],
+    commands: [{ cmd: '404', meaning: '見つからない（URL・ファイルの問題）' }, { cmd: '500', meaning: 'サーバー内部の障害' }, { cmd: 'Fetch/XHR', meaning: 'JavaScript が行うデータ取得だけを表示するフィルタ' }],
+    why: '画面の不具合の多くは「通信のどこかが失敗している」。一覧を見れば、原因の場所（クライアント／サーバー／外部）が一目で分かる。',
+    practice: '不具合報告に「Network のスクリーンショット」を添えてもらうと、再現できない問題でも原因の目星が付く。',
+    related: ['ステータスコード', 'Headers', 'サプライチェーンリスク', 'パフォーマンス'],
+  },
+  learned: ['devtools-network', 'http-status-codes', 'network-filter', 'third-party-requests', 'resource-size'],
+  solution: [{ do: 'setFilter', args: ['fetch'] }],
+};
+
+Object.assign(exports, { d03 });
+
+};
+__mods["js/missions/dt/d04-headers.js"] = function (module, exports, __require) {
+// DevTools 4: Network 詳細 — ヘッダ・ペイロード・レスポンス
+const HTML = `<!DOCTYPE html>
+<html><head><title>書店 Pageturn — ログイン</title></head>
+<body>
+<h1>Pageturn</h1>
+<form id="login"><input name="email" type="email" placeholder="メールアドレス"><input name="password" type="password" placeholder="パスワード"><button type="submit">ログイン</button></form>
+<div id="msg"></div>
+<script src="/static/login.js"></script>
+</body></html>`;
+
+const net = [
+  { id: 'doc', url: '/login', status: 200, mime: 'text/html', size: 2800, time: 140, start: 0, initiator: 'ナビゲーション', remote: '203.0.113.20:443',
+    resHeaders: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'strict-transport-security': 'max-age=31536000', 'server': 'nginx' },
+    reqHeaders: { 'accept': 'text/html', 'user-agent': 'Mozilla/5.0 (Linux; Android 13)' } },
+  { id: 'js', url: '/static/login.js', status: 200, mime: 'application/javascript', size: 3100, time: 60, start: 150, initiator: '/login (HTML)',
+    resHeaders: { 'content-type': 'application/javascript', 'cache-control': 'public, max-age=31536000, immutable' } },
+  { id: 'login', url: '/api/v1/login', method: 'POST', status: 401, mime: 'application/json', size: 190, time: 220, start: 260, initiator: 'login.js:12', remote: '203.0.113.20:443',
+    reqHeaders: { 'content-type': 'application/json', 'accept': 'application/json', 'origin': 'https://pageturn.example.com', 'x-request-id': 'req-5f3a91' },
+    resHeaders: { 'content-type': 'application/json', 'www-authenticate': 'Bearer realm="pageturn"', 'x-ratelimit-remaining': '4' },
+    reqBody: '{"email":"reader@example.com","password":"●●●●●●●●"}',
+    resBody: '{"error":"invalid_credentials","message":"メールアドレスまたはパスワードが違います","attempts_left":4}',
+    note: '401 Unauthorized: 認証に失敗しました。' },
+  { id: 'search', url: '/api/v1/books?q=nature&page=2&sort=new', status: 200, mime: 'application/json', size: 2400, time: 180, start: 300, initiator: 'login.js:30',
+    reqHeaders: { 'accept': 'application/json' }, resHeaders: { 'content-type': 'application/json', 'cache-control': 'private, max-age=60' },
+    resBody: '{"page":2,"total":57,"books":[{"id":101,"title":"森の記録"},{"id":102,"title":"川の音"}]}' },
+];
+
+const d04 = {
+  id: 'dv-04-headers',
+  title: 'Network 詳細: ヘッダ・送信内容・レスポンス',
+  minutes: 15,
+  objectives: ['リクエストを開き、Headers / Payload / Response / Timing の見方を理解する', 'リクエストヘッダとレスポンスヘッダの違いを説明できる', 'ログイン失敗などの原因を、通信の中身から読み取る'],
+  prereq: ['dv-03-network'],
+  briefing: '書店 Pageturn のログインで「パスワードを正しく入れたのに失敗する」という問い合わせが来た。画面には「違います」としか出ない。Network の詳細を開けば、実際に何を送り、サーバーが何と返したかが読める。',
+  concepts: [{
+    title: 'リクエストとレスポンスの中身',
+    why: '通信は「送った内容（リクエスト）」と「返ってきた内容（レスポンス）」の往復。不具合は、どちらかの中身が想定と違うことで起きる。',
+    problem: '画面のエラー文は要約でしかない。実際に何が送られたか・返ったかを見ないと、原因を断定できない。',
+    how: '行をタップすると詳細が開き、4つのタブがある。Headers=URL・メソッド・ステータスと、リクエスト/レスポンス両方のヘッダ。Payload=クエリ文字列（?q=… の分解）と送信した本文。Response=サーバーが返した本文。Timing=所要時間。ヘッダは「通信の取扱説明書」で、種類・認証・キャッシュ方針などが書かれる。',
+    example: 'POST /api/v1/login   Status: 401\nRequest Headers: content-type: application/json\nPayload: {"email": …}\nResponse: {"error":"invalid_credentials"}',
+    relation: 'まず Headers で成否と条件を確認し、Payload で送った内容、Response でサーバーの言い分を読む。',
+  }],
+  browser: {
+    url: 'https://pageturn.example.com/login',
+    html: HTML,
+    tabs: ['network', 'console'],
+    console: [{ level: 'error', text: 'Failed to load resource: the server responded with a status of 401 ()', source: 'pageturn.example.com/api/v1/login' }],
+    sources: { 'login.js': '// ログイン処理\n' },
+    network: net,
+  },
+  tasks: [
+    {
+      q: 'Network タブで、ログイン API（/api/v1/login）の行をタップして詳細を開いてください。',
+      narration: '詳細は、一覧の行をタップすると開く。「‹ 一覧へ」で戻れる。',
+      check: { type: 'dev', viewedRequest: 'login' },
+      noInput: true,
+      hints: ['Network タブを開く', '名前が login の行を探す（メソッドは POST）', '行をタップする'],
+      explain: '詳細を開くと、ヘッダ・送信内容・レスポンス・タイミングが見られる。まずは Headers の「General」で、URL・メソッド・ステータスを確認するのが定番の入口。',
+    },
+    {
+      q: 'このログイン通信のステータスコードを答えてください（Headers タブの Status Code）。',
+      narration: 'ステータスは成否の第一声。数字だけでなく、その後ろの文言（Unauthorized など）も大事な情報。',
+      check: { type: 'answer', any: ['401'] },
+      answerHint: '3桁の数字',
+      hints: ['詳細の Headers タブ、全般 (General) を見る', 'Status Code の行', '401（Unauthorized）'],
+      explain: '401 Unauthorized は「認証が通っていない（誰か分からない／資格情報が違う）」。似た 403 Forbidden は「誰かは分かったが、権限がない」。この区別は、認証（あなたは誰か）と認可（何をしてよいか）の違いそのもの。',
+    },
+    {
+      q: 'Payload タブでサーバーに送られた内容を見て、送信された JSON の email の値を答えてください。',
+      narration: 'Payload には、ブラウザがサーバーへ送った本文が出る。ログインフォームの入力が、どう送られたかが分かる。',
+      check: { type: 'answer', any: ['reader@example.com'], ci: true },
+      answerHint: 'メールアドレス',
+      hints: ['詳細の Payload タブを開く', '「送信内容 (Request Payload)」を読む', 'reader@example.com'],
+      explain: '入力した値がそのまま送られている（このデモではパスワードは伏せ字）。通信が HTTPS でなければ、この内容は経路上で盗み見られる。パスワードを URL のクエリに載せるのも厳禁（履歴・ログに残る）。ここで「POST の本文に入れる」理由が分かる。',
+    },
+    {
+      q: 'Response タブで、サーバーが返した JSON の attempts_left（残り試行回数）の値を答えてください。',
+      narration: 'サーバーは画面に出ない詳しい情報も返していることがある。ログインのやり直しが何回できるか、ここに書かれている。',
+      check: { type: 'answer', any: ['4'] },
+      answerHint: '数字',
+      hints: ['詳細の Response タブ', '返ってきた JSON の中の attempts_left', '4'],
+      explain: 'パスワード試行の残り回数（ロックアウト）が返っている。総当たりを防ぐ仕組みの一部。ただし「ユーザーが存在するか」を示すメッセージの出し分けは、アカウント列挙に使われかねないので、エラー文は同じ内容に揃えるのが定石。',
+    },
+    {
+      q: 'この通信のレスポンスヘッダ x-ratelimit-remaining の値を答えてください（Headers タブのレスポンスヘッダ）。',
+      narration: 'ヘッダは「本文以外のメタ情報」。レート制限（一定時間内の回数制限）の残りなども、ヘッダで通知される。',
+      check: { type: 'answer', any: ['4'] },
+      answerHint: '数字',
+      hints: ['Headers タブの「レスポンスヘッダ (Response Headers)」を見る', 'x-ratelimit-remaining の行', '4'],
+      explain: 'レスポンスヘッダでは、キャッシュ方針（cache-control）、認証方式（www-authenticate）、制限の残り（x-ratelimit-*）などが分かる。リクエストヘッダ（ブラウザ→サーバー）とは向きが違う、という点を押さえておこう。',
+    },
+    {
+      q: '別の通信 /api/v1/books?q=nature&page=2&sort=new の Payload で、クエリパラメータ page の値を答えてください。',
+      narration: 'URL の ? 以降（クエリ文字列）は、Payload タブで1項目ずつ分解して表示される。検索や並び替えの条件が一目で分かる。',
+      check: { type: 'answer', any: ['2'] },
+      answerHint: '数字',
+      hints: ['一覧の books の行をタップする（「‹ 一覧へ」で戻れる）', 'Payload タブのクエリパラメータ', 'page = 2'],
+      explain: 'クエリパラメータは、URL を見るより分解表示のほうが読みやすい。GET でデータを取る通信では、パラメータが条件のすべて。変な値が送られている／想定した値が送られていない、という原因を見つけるのに役立つ。',
+    },
+  ],
+  review: {
+    steps: ['一覧から対象のリクエストを開く', 'Headers: URL・メソッド・ステータス・各ヘッダを見る', 'Payload: クエリと送信本文を確認する', 'Response: サーバーの返答と、期待との差を探す'],
+    commands: [{ cmd: 'Headers', meaning: 'URL・ステータス・リクエスト/レスポンスのヘッダ' }, { cmd: 'Payload', meaning: 'クエリパラメータと送信した本文' }, { cmd: 'Response', meaning: 'サーバーが返した本文' }],
+    why: '「送ったもの」と「返ってきたもの」を直接見れば、画面のメッセージに頼らず原因を断定できる。',
+    practice: 'API の不具合報告では、該当リクエストの Headers/Payload/Response（機密は伏せて）を共有してもらうと、フロントとサーバーのどちらの問題かがすぐ分かる。',
+    related: ['HTTP ヘッダ', '401 と 403', 'レート制限', '認証と認可'],
+  },
+  learned: ['network-detail', 'request-response-headers', 'payload-vs-response', 'status-401-403', 'query-params'],
+  solution: [{ do: 'openRequest', args: ['login'] }],
+};
+
+Object.assign(exports, { d04 });
+
+};
+__mods["js/missions/stage-devtools1.js"] = function (module, exports, __require) {
+// DevTools コース I — 画面の裏側を見る
+const { d01 } = __require("js/missions/dt/d01-console.js");
+const { d02 } = __require("js/missions/dt/d02-elements.js");
+const { d03 } = __require("js/missions/dt/d03-network.js");
+const { d04 } = __require("js/missions/dt/d04-headers.js");
+
+const stageDevtools1 = {
+  id: 'dt-basics',
+  track: 'devtools',
+  title: 'DevTools I — 画面の裏側を見る',
+  subtitle: 'Console・Elements・Network で、ブラウザが裏でやっていることを読む',
+  intro: 'ブラウザの開発者ツール(DevTools)は、画面の「裏側」を見るための道具。スマホでは直接開けないので、ここでは架空のWebページを使った疑似DevToolsで練習する。画面の見え方は同じなので、PCで本物を開いたときにそのまま使える。',
+  missions: [d01, d02, d03, d04],
+};
+
+Object.assign(exports, { stageDevtools1 });
+
+};
+__mods["js/missions/dt/d05-storage.js"] = function (module, exports, __require) {
+// DevTools 5: Application — Storage と Cookie
+const HTML = `<!DOCTYPE html>
+<html><head><title>Mochi Market</title></head>
+<body>
+<header><h1>Mochi Market</h1><button id="theme-toggle">テーマ切替</button></header>
+<main><p>カートに入っている商品を確認できます。</p><div id="cart-count"></div></main>
+<script src="/js/shop.js"></script>
+</body></html>`;
+
+const d05 = {
+  id: 'dv-05-application',
+  title: 'Application: Storage と Cookie を読む',
+  minutes: 15,
+  objectives: ['Local Storage / Session Storage / Cookie の違いを説明できる', 'Cookie の HttpOnly / Secure / SameSite を読める', '「ブラウザに保存した秘密は読まれうる」という前提を理解する'],
+  prereq: ['dv-04-headers'],
+  briefing: 'ECサイト Mochi Market では、カートの中身やログイン状態がブラウザ内に保存されている。ページを閉じても残るのはなぜか？ どこに何が入っているのか？ Application タブで保存領域を直接のぞいてみよう。',
+  concepts: [{
+    title: 'ブラウザが覚えている場所',
+    why: 'ログイン状態・カート・設定は、ブラウザ側に保存されている。セキュリティ設計の多くは「何を、どこに、どの保護付きで置くか」の判断。',
+    problem: '保存場所ごとに性質が違う。選択を間違えると、他人に盗まれたり、勝手に送信されたりする。',
+    how: 'Local Storage=閉じても残る・JSから読み書き自由。Session Storage=タブを閉じると消える・JSから読める。Cookie=サーバーへ自動送信される小さな値。Cookie には保護の属性がある: HttpOnly(JSから読めない)、Secure(HTTPSでだけ送信)、SameSite(他サイトからの送信を制限)。Application タブでは、これらの中身と属性が一覧できる。',
+    example: 'localStorage: theme = "dark"\nCookie: sid  HttpOnly✓ Secure✓ SameSite=Lax\nCookie: auth_token  HttpOnly✗  ← JSから読める！',
+    relation: '保存の中身と属性を確認し、ユーザーのJSが読めるもの・盗まれたら困るものを見分ける。',
+  }],
+  browser: {
+    url: 'https://mochi-market.example.com/',
+    html: HTML,
+    tabs: ['application', 'console'],
+    storage: {
+      local: { theme: 'dark', cart: '[{"id":11,"qty":1},{"id":24,"qty":2},{"id":31,"qty":1}]', access_token: 'mm_at_5c1e90aa77' },
+      session: { checkout_step: '2' },
+      cookies: [
+        { name: 'sid', value: 'S-4b7d0e19c2', httpOnly: true, secure: true, sameSite: 'Lax', path: '/' },
+        { name: 'auth_token', value: 'mm_ck_77aa31d0', httpOnly: false, secure: true, sameSite: '', path: '/' },
+        { name: 'pref_lang', value: 'ja', httpOnly: false, secure: false, sameSite: 'Lax', path: '/', expires: '2027-01-01' },
+      ],
+    },
+    sources: { 'shop.js': "const theme = localStorage.getItem('theme');" },
+    quick: ["localStorage.getItem('theme')", "JSON.parse(localStorage.getItem('cart')).length", 'document.cookie', "Object.keys(localStorage)"],
+  },
+  tasks: [
+    {
+      q: 'Application タブの Local Storage を開き、キー theme の値を答えてください。',
+      narration: 'Local Storage は、サイトごとに用意された「ブラウザ内の小さな保存庫」。設定の記憶によく使われる。',
+      check: { type: 'answer', any: ['dark'], ci: true },
+      answerHint: '値',
+      hints: ['Application タブ → Local Storage', 'キー theme の行を読む', 'dark'],
+      explain: 'テーマ設定のような「見られても困らない」ものの保存は、Local Storage の正しい使い道。ブラウザを閉じても残る。逆に、見られたら困るものを置くべきではない。',
+    },
+    {
+      q: 'キー cart の値は JSON です。Console で JSON.parse(localStorage.getItem(\'cart\')).length を実行して、カートの商品種類数を答えてください。',
+      narration: 'Storage の値は文字列だけ。配列や辞書は JSON 文字列にして保存される。JSON.parse で戻せば、Console から中身を数えられる。',
+      check: { type: 'answer', any: ['3'] },
+      answerHint: '数字',
+      hints: ['Console タブで localStorage.getItem(\'cart\') を実行すると文字列が見える', 'JSON.parse(…) で配列に戻し、.length で個数', '3'],
+      explain: '3件。ブラウザ内に保存したデータは、ユーザー自身がいつでも書き換えられる。カートの単価や割引率をここに置いて信用すると、改ざんされる。金額計算はサーバー側で行うのが原則。',
+    },
+    {
+      q: 'Local Storage に、ログイン用のトークンらしき項目があります。そのキー名を答えてください。',
+      narration: 'トークンは「ログイン済みであること」を示す合言葉のようなもの。持っている人は、本人として扱われる。',
+      check: { type: 'answer', any: ['access_token'], ci: true },
+      answerHint: 'キー名',
+      hints: ['Local Storage の一覧を上から読む', 'token という語が入ったキー', 'access_token'],
+      explain: 'Local Storage のトークンは、同じサイトで動くJS（XSSで混入した悪意あるスクリプトも）から読める。盗まれると、パスワードなしで本人になりすまされる。認証情報は、HttpOnly Cookie など JS から読めない場所に置く設計が安全寄り。',
+    },
+    {
+      q: 'Cookies の中で、「認証用に見えるのに HttpOnly が付いていない」Cookie の名前を答えてください。',
+      narration: 'Cookie の下に、HttpOnly / Secure / SameSite の3つの属性が出ている。✓ が付いていれば保護あり、✗ は保護なし。',
+      check: { type: 'answer', any: ['auth_token'], ci: true },
+      answerHint: 'Cookie 名',
+      hints: ['Application → Cookies を開く', '各 Cookie の HttpOnly の ✓/✗ を見る', 'auth_token'],
+      explain: 'HttpOnly が無い認証 Cookie は、XSS でスクリプトを仕込まれたとき document.cookie で盗める。sid のように HttpOnly+Secure+SameSite が揃っているのが理想の姿。pref_lang のような言語設定なら、保護が弱くても被害は小さい。',
+    },
+    {
+      q: 'Console で document.cookie を実行すると、現在のページから読める Cookie が出ます。そこに表示される Cookie の「個数」を答えてください。',
+      narration: 'HttpOnly の Cookie は、JavaScript からは見えない（それが保護の仕組み）。Console の結果から、何個見えるか数えてみよう。',
+      check: { type: 'answer', any: ['2'] },
+      answerHint: '数字',
+      hints: ['Console で document.cookie を実行し、「;」で区切られた項目を数える', 'HttpOnly の Cookie は結果に含まれない', '2（sid は見えない）'],
+      explain: 'Cookie は3つあるのに、JS から見えるのは2つだけ。HttpOnly の sid は JS から隠されている。これが「XSS が起きても、セッションCookieは盗めない」という保護。属性ひとつの差が、被害の大きさを分ける。',
+    },
+    {
+      q: '「テーマ設定をリセットする」操作として、Local Storage の theme を削除してください（Application タブの削除、または Console の localStorage.removeItem で）。',
+      narration: 'ストレージの編集は、デバッグでよく使う。「初回アクセス時の状態」を再現したいときなどに便利。',
+      check: { type: 'dev', storage: { local: { theme: null } } },
+      noInput: true,
+      hints: ['Application → Local Storage の theme 行', '行の右の「削除」をタップ', "Console なら localStorage.removeItem('theme')"],
+      explain: '保存データを消して「初回の状態」でテストするのは、再現テストの基本。ただし本物のサイトで Cookie やストレージを消すとログアウトするので、操作の影響は考えてから行うこと。',
+    },
+  ],
+  review: {
+    steps: ['Application タブで Local / Session Storage と Cookie を開く', '保存されている値の種類・機密性を見る', 'Cookie の HttpOnly / Secure / SameSite を確認する', 'JS から読めるものに秘密が入っていないか点検する'],
+    commands: [{ cmd: "localStorage.getItem('key')", meaning: 'Local Storage の値を読む' }, { cmd: 'document.cookie', meaning: 'JS から見える Cookie（HttpOnly は除く）' }, { cmd: "localStorage.removeItem('key')", meaning: '項目を削除する' }],
+    why: '「ブラウザに置いたものは、持ち主（ユーザー）と、同じページで動くJSに読まれる」。何をどこに置くかは設計上の重大な判断。',
+    practice: '認証Cookieは HttpOnly + Secure + SameSite を付ける。トークンの置き場所と属性は、レビューで必ず確認する項目。',
+    related: ['XSS', 'セッション管理', 'CSRF と SameSite', 'JWT'],
+  },
+  learned: ['devtools-application', 'web-storage', 'cookie-flags', 'httponly', 'token-storage-risk'],
+  solution: ["JSON.parse(localStorage.getItem('cart')).length", 'document.cookie', "localStorage.removeItem('theme')"],
+};
+
+Object.assign(exports, { d05 });
+
+};
+__mods["js/missions/dt/d06-sources.js"] = function (module, exports, __require) {
+// DevTools 6: Sources — ソースの全文検索・整形表示（フロントに残る秘密）
+const HTML = `<!DOCTYPE html>
+<html><head><title>NoteBox</title></head>
+<body><h1>NoteBox</h1><div id="app"></div>
+<script src="/js/config.js"></script><script src="/js/app.min.js"></script>
+</body></html>`;
+
+const CONFIG = `// NoteBox 設定
+const CONFIG = {
+  apiBase: 'https://api.notebox.example.com',
+  apiKey: 'demo-key-7f3a9c',   // TODO: サーバー側へ移す
+  debug: false,
+};`;
+
+const MIN = `!function(){var c=window.CONFIG||{},u=c.apiBase;function g(p,o){return fetch(u+p,Object.assign({headers:{"X-Api-Key":c.apiKey}},o))}function l(){g("/v1/notes").then(function(r){return r.json()}).then(function(d){document.getElementById("app").textContent=d.length+" notes"})}function x(){g("/internal/v2/export",{method:"POST"})}window.NoteBox={load:l,exportAll:x};l()}();
+//# sourceMappingURL=app.min.js.map`;
+
+const d06 = {
+  id: 'dv-06-sources',
+  title: 'Sources: ソースを検索・整形して読む',
+  minutes: 15,
+  objectives: ['Sources で JS ファイルを開き、全文検索できる', '圧縮(minify)されたコードを整形表示して読める', 'フロントのコードに残る機密（APIキー・内部URL・ソースマップ）の危険を理解する'],
+  prereq: ['dv-05-application'],
+  briefing: 'メモアプリ NoteBox のセキュリティ点検を頼まれた。ブラウザに届く JavaScript は、そのまま全部読める。つまり、そこに何が書かれているかが「世界に公開されている情報」。Sources タブで、公開されている情報を棚卸ししよう。',
+  concepts: [{
+    title: 'Sources と minify',
+    why: 'ページを動かす JS はブラウザに全文が送られる。開発者が「見られないはず」と思っていても、実際は誰でも読める。',
+    problem: 'ソース内に APIキー・内部URL・コメントの TODO などが残ると、そこから攻撃の手がかりが得られてしまう。',
+    how: 'Sources タブでは、ページが読み込んだファイルを開ける。上部の検索欄は全ファイル横断の検索（key / token / password など）。サイズ削減のため1行に圧縮(minify)されたコードは、「{} 整形表示」で読みやすくできる。行番号をタップするとブレークポイントが置ける（次のミッション）。ファイル末尾の sourceMappingURL は、元のコードを復元できる「ソースマップ」の場所を示す。',
+    example: "apiKey: 'demo-key-7f3a9c',   // フロントに置いた時点で公開情報\n//# sourceMappingURL=app.min.js.map  ← 元コードが復元できる",
+    relation: '検索で気になる語を探し、整形して読み、機密が公開されていないかを点検する。',
+  }],
+  browser: {
+    url: 'https://notebox.example.com/',
+    html: HTML,
+    tabs: ['sources', 'console', 'network'],
+    sources: { 'config.js': CONFIG, 'app.min.js': MIN },
+    network: [
+      { url: '/', status: 200, mime: 'text/html', size: 900, time: 80 },
+      { url: '/js/config.js', status: 200, mime: 'application/javascript', size: 230, time: 40, start: 90 },
+      { url: '/js/app.min.js', status: 200, mime: 'application/javascript', size: 560, time: 40, start: 90 },
+    ],
+  },
+  tasks: [
+    {
+      q: 'Sources タブの全文検索で「apiKey」を検索してください。',
+      narration: '設定やキーのような文字列は、ファイルを1つずつ開くより、全ファイル検索のほうが速い。検索欄に語を入れて「検索」を押す。',
+      check: { type: 'dev', searched: 'apikey' },
+      noInput: true,
+      hints: ['Sources タブの一番上の検索欄に入力する', '「apiKey」と入力して「検索」をタップ', '結果の行をタップすると、該当行が開く'],
+      explain: '全文検索は、キー・トークン・パスワード・内部URL・TODO など、「置いてはいけない語」を探す最速の方法。セキュリティ点検（棚卸し）の基本動作。',
+    },
+    {
+      q: '検索で見つかった apiKey の値（引用符の中身）を答えてください。',
+      narration: 'config.js に、アプリが API を呼ぶときに使うキーが書かれている。コメントにも注目。',
+      check: { type: 'answer', any: ['demo-key-7f3a9c'], ci: true },
+      answerHint: 'キーの文字列',
+      hints: ['検索結果の config.js の行をタップして開く', 'apiKey: の右側の引用符の中', 'demo-key-7f3a9c'],
+      explain: 'ブラウザに届くコードに入れたキーは、全員に公開されているのと同じ。コメントの「TODO: サーバー側へ移す」が示す通り、秘密のキーはサーバー側に置き、フロントからはサーバー経由で呼ぶ設計にする。もし実運用でこうなっていたら、キーを失効させて再発行する。',
+    },
+    {
+      q: 'app.min.js は1行に圧縮されて読みにくい状態です。「{} 整形表示」を使って読みやすくしてください。',
+      narration: '本番のJSは、サイズを小さくするため改行や空白が削られている（minify）。整形表示は、読むための補助。',
+      check: { type: 'dev', prettyPrinted: 'app.min.js' },
+      noInput: true,
+      hints: ['ファイル名 app.min.js をタップして開く', 'ファイル名の下の「{} 整形表示」ボタンを押す', 'ボタンを押すと改行・インデントされる'],
+      explain: '整形（pretty print）は、元のコードの意味を変えずに見た目だけを整える。minify は「読みにくくする」だけで、「隠す」わけではない。難読化も、時間をかければ読み解ける。秘密を守る手段にはならない。',
+    },
+    {
+      q: '整形したコードを読んで、「エクスポート」機能が呼んでいる API のパス（/ から始まる）を答えてください。',
+      narration: 'ユーザー画面には出ていない機能の入口が、コードの中には残っていることがある。関数名 x が呼ぶ先を読んでみよう。',
+      check: { type: 'answer', any: ['/internal/v2/export'], ci: true },
+      answerHint: '/ から始まるパス',
+      hints: ['整形表示で、POST を使っている行を探す', 'g("/…", {method:"POST"}) の最初の引数', '/internal/v2/export'],
+      explain: '画面には出ない内部向け API（/internal/…）の存在が、フロントのコードから分かってしまう。URLを知られるだけでは問題ではないが、「内部用だから認証不要」にしていると悪用される。アクセス制御は常にサーバー側で行う。',
+    },
+    {
+      q: 'app.min.js の最終行のコメントに書かれている、ソースマップのファイル名を答えてください。',
+      narration: '最終行の `//# sourceMappingURL=…` は、「圧縮前の元コードを復元するための対応表」の場所。デバッグには便利だが、本番では扱いに注意が要る。',
+      check: { type: 'answer', any: ['app.min.js.map'], ci: true },
+      answerHint: 'ファイル名',
+      hints: ['app.min.js を開き、一番下の行を見る', 'sourceMappingURL= の右側', 'app.min.js.map'],
+      explain: 'ソースマップが公開されていると、圧縮前の元コード（変数名・コメント・ディレクトリ構造）が復元できてしまう。本番では非公開にするか、エラー監視サービスにだけ渡す運用が一般的。「見せたくないものは、そもそもフロントに置かない」が大原則。',
+    },
+  ],
+  review: {
+    steps: ['Sources で読み込まれているファイルを一覧する', '全文検索で key / token / password / TODO / internal を探す', '圧縮コードは整形表示して読む', 'ソースマップの公開状況を確認する'],
+    commands: [{ cmd: '全文検索', meaning: '全ファイルから語を探す' }, { cmd: '{} 整形表示', meaning: '圧縮コードを読みやすくする' }, { cmd: 'sourceMappingURL', meaning: '元コード復元用の対応表の場所' }],
+    why: 'フロントのコードは全公開。そこに秘密があれば、それは秘密ではない。',
+    practice: 'リリース前に、ビルド成果物（minify後のJS）を全文検索して、キー・内部URL・コメントの残骸がないか確認する。',
+    related: ['シークレット管理', 'アクセス制御', 'ソースマップ', 'ビルドパイプライン'],
+  },
+  learned: ['devtools-sources', 'source-search', 'pretty-print', 'frontend-secrets', 'source-maps'],
+  solution: [{ do: 'searchSources', args: ['apiKey'] }, { do: 'prettyPrint', args: ['app.min.js'] }],
+};
+
+Object.assign(exports, { d06 });
+
+};
+__mods["js/missions/dt/d07-debugger.js"] = function (module, exports, __require) {
+// DevTools 7: Sources のデバッガ — ブレークポイントで実行を止めて変数を読む
+const HTML = `<!DOCTYPE html>
+<html><head><title>Shop Cart</title></head>
+<body><h1>カート</h1><ul id="lines"></ul><p>合計: <span id="total">-</span></p><button id="checkout">購入手続きへ</button>
+<script src="/js/cart.js"></script></body></html>`;
+
+const CART = `// カートの合計金額を計算する
+const COUPON_RATE = 0.2;          // 20% 割引
+
+function calcTotal(items, coupon) {
+  let subtotal = 0;
+  for (const it of items) {
+    subtotal += it.price * it.qty;
+  }
+  const discount = coupon ? COUPON_RATE * 100 : 0;
+  const total = subtotal - discount * subtotal;
+  document.getElementById('total').textContent = total + '円';
+  return total;
+}
+
+function onCheckout() {
+  const items = loadCart();
+  return calcTotal(items, 'SPRING');
+}`;
+
+const d07 = {
+  id: 'dv-07-debugger',
+  title: 'デバッガ: ブレークポイントで実行を止める',
+  minutes: 16,
+  objectives: ['ブレークポイントを設定して実行を一時停止できる', 'Scope で変数の「その瞬間の値」を読める', 'Call Stack で「誰が呼んだか」をたどれる'],
+  prereq: ['dv-06-sources'],
+  briefing: 'ショップのカートで、クーポンを使うと合計がマイナスになるというバグ報告。コードを眺めても原因が分からない。そこで、計算の途中で実行を止めて、変数の値を直接見る。これがデバッガ(ブレークポイント)の使い方。',
+  concepts: [{
+    title: 'ブレークポイントとスコープ',
+    why: 'console.log を足して再実行する方法は遅く、必要な値を見落としやすい。止めて直接見れば、その瞬間のすべての変数が分かる。',
+    problem: '計算結果が想定と違うとき、どの時点で値がおかしくなったかを特定したい。',
+    how: 'Sources でコードを開き、行番号をタップするとブレークポイントが付く。その行が実行される直前にプログラムが一時停止し、下に「Scope」（その時点の変数の値）と「Call Stack」（どの関数がどの順で呼んだか）が出る。「▶ 再開」で実行を続ける。止めた行は、まだ実行される前という点に注意。',
+    example: '行 10 にブレークポイント → 一時停止\nScope (Local): subtotal = 6000, discount = 20\nCall Stack: calcTotal ← onCheckout',
+    relation: '怪しい行の手前に止め、変数の値を読み、期待値とのズレから原因の行を特定する。',
+  }],
+  browser: {
+    url: 'https://shop.example.com/cart',
+    html: HTML,
+    tabs: ['sources', 'console', 'elements'],
+    sources: { 'cart.js': CART },
+    breakpoints: {
+      'cart.js:10': {
+        scope: { 'Local': { items: '[3 items]', coupon: 'SPRING', subtotal: 6000, discount: 20 }, 'Global': { COUPON_RATE: 0.2 } },
+        stack: ['calcTotal (cart.js:10)', 'onCheckout (cart.js:17)', '(anonymous) (cart.js:21)'],
+        note: '10行目の直前で停止中。まだ total は計算されていません。',
+      },
+    },
+  },
+  tasks: [
+    {
+      q: 'Sources タブで cart.js を開き、合計金額を計算している行（const total = …、10行目）にブレークポイントを設定してください。',
+      narration: '行番号をタップすると、その行でプログラムが止まる印（ブレークポイント）が付く。止まった瞬間のすべての変数が見られる。',
+      check: { type: 'dev', pausedAt: { file: 'cart.js', line: 10 } },
+      noInput: true,
+      hints: ['Sources → ファイル名 cart.js をタップして開く', '10行目の行番号をタップする', '「一時停止しました」と表示され、下に Scope が出る'],
+      explain: 'ブレークポイントは「ここまで来たら止まれ」という指示。本番ほぼ同じ状態を再現できるのが、ログ出力より便利な点。止まる行は、実行される「直前」である点を覚えておこう。',
+    },
+    {
+      q: '停止中の Scope（Local）にある discount の値を答えてください。',
+      narration: 'Scope は、止まった瞬間の変数の値一覧。期待している値と実際の値を並べて見ると、バグの場所が見えてくる。',
+      check: { type: 'answer', any: ['20'] },
+      answerHint: '数字',
+      hints: ['下の「一時停止中」の枠を見る', 'スコープ (Scope) の Local の discount', '20'],
+      explain: '割引率 0.2（20%）のはずが discount=20 になっていた。9行目で COUPON_RATE * 100 としたのが原因で、「割引率」と「パーセント表記」が混ざっている。原因の行は、期待値と実際の値のズレを辿ると特定できる。',
+    },
+    {
+      q: 'この値で total を計算すると subtotal - discount * subtotal になります。subtotal が 6000 のときの total を答えてください。',
+      narration: '止まっているのは total が計算される直前。頭の中（または Console）で計算して、結果が想定と違うことを確かめよう。',
+      check: { type: 'answer', any: ['-114000', '−114000'] },
+      answerHint: '数字（マイナスもあり）',
+      hints: ['discount * subtotal を先に計算する（20 × 6000）', '6000 - 120000', '-114000'],
+      explain: '合計がマイナス 114,000 円になる。これがユーザーに見えていた不具合の正体。直し方は、割引率 0.2 をそのまま使う（discount = COUPON_RATE）か、パーセントで持つなら 100 で割る。値を止めて見ることで、推測ではなく根拠付きで直せる。',
+    },
+    {
+      q: 'Call Stack を見て、calcTotal を呼び出している関数の名前を答えてください。',
+      narration: 'Call Stack は「いまの関数を、誰が、どの順で呼んだか」の履歴。上が現在、下ほど呼び出し元。',
+      check: { type: 'answer', any: ['onCheckout'], ci: true },
+      answerHint: '関数名',
+      hints: ['停止中の枠の「コールスタック (Call Stack)」を見る', '一番上が calcTotal。その次の行が呼び出し元', 'onCheckout'],
+      explain: 'Call Stack を使うと「この値はどこから渡されたか」を遡れる。今回なら、coupon の \'SPRING\' は onCheckout が渡している。呼び出し元までたどれると、原因が引数なのか内部ロジックなのかを切り分けられる。',
+    },
+  ],
+  review: {
+    steps: ['怪しい処理の行番号をタップしてブレークポイントを置く', '停止した Scope で変数の値を期待値と比べる', 'Call Stack で呼び出し元をたどる', '直したら、ブレークポイントを外して「▶ 再開」'],
+    commands: [{ cmd: 'ブレークポイント', meaning: '実行を行の手前で止める印' }, { cmd: 'Scope', meaning: '止まった瞬間の変数の値' }, { cmd: 'Call Stack', meaning: '関数の呼び出しの履歴' }],
+    why: '値を直接見るデバッグは、推測を減らし、根拠のある修正につなげる。',
+    practice: 'バグ報告を受けたら、まず再現手順を確認し、怪しい行にブレークポイントを置いて期待値との差を探す。',
+    related: ['console.log デバッグ', 'ユニットテスト', '単位の取り違え（率とパーセント）'],
+  },
+  learned: ['devtools-debugger', 'breakpoints', 'scope-callstack', 'debug-method'],
+  solution: [{ do: 'toggleBreakpoint', args: ['cart.js', 10] }],
+};
+
+Object.assign(exports, { d07 });
+
+};
+__mods["js/missions/dt/d08-security.js"] = function (module, exports, __require) {
+// DevTools 8: Security / Issues — HTTPS・証明書・混在コンテンツ・CORS・CSP
+const HTML = `<!DOCTYPE html>
+<html><head><title>Maple Bank — マイページ</title></head>
+<body><h1>Maple Bank マイページ</h1>
+<img src="http://images.legacy-cdn.example.net/banner.png" alt="キャンペーン">
+<div id="profile">読み込み中…</div>
+<script src="/js/mypage.js"></script></body></html>`;
+
+const d08 = {
+  id: 'dv-08-security',
+  title: 'Security と Issues: 保護の状態を読む',
+  minutes: 15,
+  objectives: ['Security タブで HTTPS と証明書の情報を読める', '混在コンテンツ・Cookie 属性・CSP/CORS の警告を読み解ける', 'ブロックされた通信の原因と、守るべき意図を理解する'],
+  prereq: ['dv-07-debugger'],
+  briefing: 'ネットバンキング風のデモページ「Maple Bank マイページ」で、プロフィールが表示されない。Console には赤い警告が並ぶ。ブラウザは危険な通信を自動でブロックしてくれる。その警告は「守ろうとしている意図」を伝えている。Security タブと Issues で読み解こう。',
+  concepts: [{
+    title: 'ブラウザが守ってくれること',
+    why: 'ブラウザには、盗聴・改ざん・なりすましから利用者を守る仕組みがある。ブロックされたときの警告を理解すれば、直し方と、守るべき理由の両方が分かる。',
+    problem: '赤い警告を見ても、「なぜ駄目なのか」が分からないと、設定を緩めて無理に動かしてしまい、かえって危険になる。',
+    how: 'Security タブは、HTTPS か・証明書の発行先/期限・暗号方式を示す。Issues は、混在コンテンツ（HTTPSなのにHTTPの部品がある）、Cookie の属性不足、CSP/CORS によるブロックなどを一覧する。CORS=他ドメインの API をブラウザが読めるかを、サーバーが許可する仕組み（Access-Control-Allow-Origin ヘッダ）。CSP=読み込んでよい元を制限する、ページの防御ルール。',
+    example: 'Access to fetch at \'https://api…\' from origin \'https://…\' has been blocked by CORS policy: No \'Access-Control-Allow-Origin\' header is present.',
+    relation: '警告の文面から原因（ヘッダの欠落・HTTPの部品）を特定し、「緩める」のではなく正しく直す。',
+  }],
+  browser: {
+    url: 'https://mypage.maple-bank.example.com/',
+    html: HTML,
+    tabs: ['security', 'console', 'network', 'application'],
+    security: { cert: { subject: 'mypage.maple-bank.example.com', issuer: 'Example Trust CA G2', validFrom: '2026-03-15', validTo: '2027-03-14', cipher: 'TLS_AES_128_GCM_SHA256' }, protocol: 'TLS 1.3' },
+    storage: { cookies: [{ name: 'bank_session', value: 'B-91ac7f', httpOnly: true, secure: false, sameSite: 'Lax', path: '/' }] },
+    console: [
+      { level: 'warn', text: "Mixed Content: The page at 'https://mypage.maple-bank.example.com/' was loaded over HTTPS, but requested an insecure image 'http://images.legacy-cdn.example.net/banner.png'." },
+      { level: 'error', text: "Access to fetch at 'https://api.partner-data.example.org/profile' from origin 'https://mypage.maple-bank.example.com' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.", source: 'mypage.js:8' },
+    ],
+    sources: { 'mypage.js': "fetch('https://api.partner-data.example.org/profile');" },
+    network: [
+      { url: '/', status: 200, mime: 'text/html', size: 1900, time: 120, resHeaders: { 'content-type': 'text/html', 'strict-transport-security': 'max-age=31536000', 'content-security-policy': "default-src 'self'; img-src 'self' https:" } },
+      { url: 'http://images.legacy-cdn.example.net/banner.png', status: 200, mime: 'image/png', size: 22000, time: 140, start: 130, protocol: 'http/1.1' },
+      { url: 'https://api.partner-data.example.org/profile', status: 0, blocked: 'cors', mime: '', size: 0, time: 90, start: 140, initiator: 'mypage.js:8', note: 'サーバーのレスポンスに Access-Control-Allow-Origin ヘッダが無いため、ブラウザがこのページに結果を渡しませんでした。' },
+    ],
+  },
+  tasks: [
+    {
+      q: 'Security タブで、この証明書の有効期限（有効期間の終わり）の日付を答えてください（例: 2027-01-31 の形式）。',
+      narration: 'HTTPS は「証明書」で通信相手の正しさを保証する。期限切れの証明書は、ブラウザが警告を出す。',
+      check: { type: 'answer', any: ['2027-03-14'] },
+      answerHint: 'YYYY-MM-DD',
+      hints: ['Security タブを開く', '「証明書 (Certificate)」の「有効期間」', '2026-03-15 〜 2027-03-14 の終わり側'],
+      explain: '証明書の期限切れは、サイト停止の定番の原因（ブラウザが「安全ではありません」を出す）。期限を監視し、自動更新（ACME/Let\'s Encrypt など）を整えるのが運用の基本。',
+    },
+    {
+      q: '混在コンテンツ（HTTPS ページ内の HTTP のリソース）になっている画像のホスト名を答えてください。',
+      narration: 'HTTPS のページに HTTP の部品が混ざると、その部分だけ盗聴・改ざんされうる。Security タブの「Issues」にも出る。',
+      check: { type: 'answer', any: ['images.legacy-cdn.example.net'], ci: true },
+      answerHint: 'ホスト名',
+      hints: ['Security タブの Issues の「混在コンテンツ」を見る', 'detail に URL が出ている', 'images.legacy-cdn.example.net'],
+      explain: '画像だけでも、HTTPの部品があれば通信路上で差し替えられる。ブラウザは警告やブロックで保護する。直し方は、読み込み元を https:// にする（相手が対応していなければ、自分のサーバーに置き直す）。',
+    },
+    {
+      q: 'Cookie の警告で、「Secure 属性がない」と指摘されている Cookie の名前を答えてください。',
+      narration: 'Issues の Cookie の項目は、属性の不足を教えてくれる。Secure が無いと、HTTP でも送信されうる。',
+      check: { type: 'answer', any: ['bank_session'], ci: true },
+      answerHint: 'Cookie 名',
+      hints: ['Security タブの Issues の Cookie の項目を見る', 'Secure 属性がない旨の行', 'bank_session'],
+      explain: 'Secure が無い認証 Cookie は、誤って HTTP で接続した際にそのまま送信され、盗聴される恐れがある。HTTPS 専用のサイトでは、Cookie に Secure を付け、HSTS（strict-transport-security）で常に HTTPS を強制するのが定番の組み合わせ。',
+    },
+    {
+      q: 'Network タブで、CORS ポリシーによりブロックされたリクエストの URL の「パス」（/ から始まる部分）を答えてください。',
+      narration: 'ブロックされた通信は、ステータスが（blocked:cors）と表示される。画面に表示されない原因の1つ。',
+      check: { type: 'answer', any: ['/profile'], ci: true },
+      answerHint: '/ から始まるパス',
+      hints: ['Network タブを開き、ステータス欄が（blocked:cors）の行を探す', '詳細を開いて Request URL を読む', '/profile'],
+      explain: 'CORS は「他のドメインの API を、このページの JS から読んでいいか」をサーバーが許可する仕組み。ここでは相手サーバーが許可ヘッダを返していないので、ブラウザが結果を渡さない。直すのは API 側の設定で、フロントで回避する裏技ではない。',
+    },
+    {
+      q: 'Console の CORS エラー文に書かれている、「無い」と指摘されているレスポンスヘッダ名（Access-Control-… で始まる）を答えてください。',
+      narration: 'エラー文には、足りないものが具体的に書かれている。長い文だが、「No ... header is present」の部分を探す。',
+      check: { type: 'answer', any: ['access-control-allow-origin'], ci: true },
+      answerHint: 'ヘッダ名',
+      hints: ['Console の赤いエラーを読む', '「No」と「header is present」の間の引用符の中', 'Access-Control-Allow-Origin'],
+      explain: 'このヘッダで、サーバーが「どのオリジン(ドメイン)からの読み取りを許すか」を宣言する。無暗に * (全許可)にせず、必要なドメインだけを許可するのが安全。エラー文に直し方のヒントが書かれているので、まず全文を読む癖を付けよう。',
+    },
+  ],
+  review: {
+    steps: ['Security タブで HTTPS・証明書の発行先と期限を確認する', 'Issues で混在コンテンツ・Cookie の属性を確認する', 'Console/Network のブロック（CORS・CSP）の文面から原因を読む', '設定を緩めず、サーバー/配信側を正しく直す'],
+    commands: [{ cmd: 'Mixed Content', meaning: 'HTTPS ページ内の HTTP 部品' }, { cmd: 'CORS', meaning: '他ドメイン API を読む許可の仕組み' }, { cmd: 'Secure / HttpOnly / SameSite', meaning: 'Cookie を守る3つの属性' }],
+    why: 'ブラウザの警告は「利用者を守るために止めた」というサイン。意図を理解すれば、直し方も分かる。',
+    practice: 'リリース前に Security/Issues を確認する。証明書期限・混在コンテンツ・Cookie 属性は、機械的に点検できる項目。',
+    related: ['HTTPS/TLS', 'HSTS', 'CORS', 'CSP', 'Cookie 属性'],
+  },
+  learned: ['devtools-security', 'https-cert', 'mixed-content', 'cors', 'csp-basics'],
+  solution: [{ do: 'visit', args: ['security'] }],
+};
+
+Object.assign(exports, { d08 });
+
+};
+__mods["js/missions/dt/d09-performance.js"] = function (module, exports, __require) {
+// DevTools 9: Performance — 表示速度（Core Web Vitals）とスロットリング
+const HTML = `<!DOCTYPE html>
+<html><head><title>Aoba Travel</title></head>
+<body><header><h1>Aoba Travel</h1></header>
+<img id="hero" src="/img/hero-banner.png" alt="海辺の写真">
+<section id="cards"><div class="card">プランA</div><div class="card">プランB</div></section>
+<script src="/js/bundle.js"></script><script src="/js/vendor.js"></script></body></html>`;
+
+const d09 = {
+  id: 'dv-09-performance',
+  title: 'Performance: 遅い理由を数字で読む',
+  minutes: 16,
+  objectives: ['Core Web Vitals（FCP/LCP/CLS/TBT）の意味を説明できる', 'スロットリングで遅い回線を再現できる', '転送サイズの内訳から、重いリソースを特定できる'],
+  prereq: ['dv-08-security'],
+  briefing: '旅行サイト Aoba Travel は「スマホで開くのが遅い」と言われている。開発者のPC（高速回線）では速く見える。DevTools は、遅い回線を再現し、何に時間がかかっているかを数字で示してくれる。',
+  concepts: [{
+    title: '表示速度の指標とスロットリング',
+    why: '体感の遅さは離脱の大きな原因。「なんとなく遅い」ではなく、どの指標が悪く、何が原因かを数字で示せば、直す優先順位が決められる。',
+    problem: '開発環境は高速なので、遅さに気付けない。実際のユーザー（モバイル回線）の体験とは差がある。',
+    how: 'Network タブの Throttling で回線速度を切り替える（Fast 4G / Slow 4G / Offline）。Performance タブは Core Web Vitals を表示する: FCP=最初に何か表示されるまで、LCP=最大の要素（画像・見出し）が表示されるまで（2.5秒以内が目安）、CLS=表示のガタつき（0.1以下が目安）、TBT=JSの処理で操作できない時間。下に種類別の転送サイズが出るので、重いものから対処する。',
+    example: 'LCP 2.0s → Slow 4G で 10.00s\nCLS 0.31（画像に width/height が無く、後から押し下げられる）',
+    relation: '遅い回線で再現し、指標と内訳から重いものを特定して、効果の大きい順に直す。',
+  }],
+  browser: {
+    url: 'https://aoba-travel.example.com/',
+    html: HTML,
+    tabs: ['performance', 'network'],
+    perf: { fcp: 900, lcp: 2000, cls: 0.31, tbt: 450, lcpElement: '<img id="hero" src="/img/hero-banner.png" alt="海辺の写真">' },
+    network: [
+      { url: '/', status: 200, mime: 'text/html', size: 6100, time: 130, start: 0, initiator: 'ナビゲーション' },
+      { url: '/img/hero-banner.png', status: 200, mime: 'image/png', size: 2400000, time: 700, start: 140, initiator: '/ (HTML)', note: '表示幅は 400px 程度なのに、約2.4MBのPNGを読み込んでいます。' },
+      { url: '/js/bundle.js', status: 200, mime: 'application/javascript', size: 280000, time: 260, start: 140 },
+      { url: '/js/vendor.js', status: 200, mime: 'application/javascript', size: 890000, time: 420, start: 140, note: '使われていないライブラリも含んだ大きなファイルです。' },
+      { url: '/css/site.css', status: 200, mime: 'text/css', size: 24000, time: 60, start: 140 },
+    ],
+  },
+  tasks: [
+    {
+      q: 'Network タブの Throttling（回線速度）を「Slow 4G」に切り替えてください。',
+      narration: '開発者の回線は速すぎて、遅さに気づけない。スロットリングは「遅い回線の人の体験」を再現する機能。',
+      check: { type: 'dev', throttle: 'slow4g' },
+      noInput: true,
+      hints: ['Network タブを開く', '右上のプルダウン（No throttling）を選ぶ', '「Slow 4G」を選択'],
+      explain: 'Slow 4G にすると、通信にかかる時間が約5倍になる。同じページでも、電波の弱い場所のスマホでは、これくらい遅く感じられる。速度の検証は、必ず遅い回線で行う。',
+    },
+    {
+      q: 'Slow 4G にした状態で Performance タブを開き、LCP（最大要素の描画）の値を答えてください（例: 3.00 s の場合は 3）。',
+      narration: '通常 2.0秒だった LCP が、遅い回線ではどうなるか。目安は2.5秒以内。それを超えると「遅い」と判定される。',
+      check: { type: 'answer', any: ['10', '10.0', '10.00', '10秒', '10.00 s', '10s', '10000'], ci: true },
+      answerHint: '秒数',
+      hints: ['まず Slow 4G を選ぶ（前の課題）。次に Performance タブを開く', 'LCP のカード。赤くなる（遅い）', '10.00 s → 10'],
+      explain: 'LCP が 10 秒。目安の 2.5 秒を大きく超えていて、ユーザーは待ちきれず離脱する。この数字が「改善の根拠」になる。「速くしたい」ではなく「LCP を 2.5 秒以内に」と目標を数字で置ける。',
+    },
+    {
+      q: '種類別の転送サイズの内訳（Performance タブ）を見て、JavaScript ファイルの中で最も大きいファイル名を答えてください（Network タブで確認できます）。',
+      narration: '遅さの原因は、ほとんどの場合「大きなもの」。大きい順に見ていくのが、改善の定石。',
+      check: { type: 'answer', any: ['vendor.js'], ci: true },
+      answerHint: 'ファイル名',
+      hints: ['Network タブで、フィルタ「JS」を使う', '各行のサイズを比べる', 'vendor.js（約890kB）'],
+      explain: 'vendor.js は外部ライブラリをまとめたファイルで、未使用コードが多いことが多い。コード分割（必要な画面でだけ読み込む）、不要なライブラリの削除、tree shaking などで縮められる。',
+    },
+    {
+      q: 'LCP（最大要素）になっている HTML 要素の「タグ名」を答えてください（Performance タブの LCP 要素）。',
+      narration: 'LCP を決めているのは「画面で最も大きく表示される要素」。それが画像なら、画像の最適化が一番効く。',
+      check: { type: 'answer', any: ['img'], ci: true },
+      answerHint: 'タグ名',
+      hints: ['Performance タブの「LCP 要素」を見る', '< の次に書かれているタグ名', 'img'],
+      explain: 'LCP 要素が img（約2.4MBのPNG）。画像を適切なサイズに縮小して WebP/AVIF に変換するだけで、LCP が大きく改善する典型例。画像は最も効果が出やすい改善対象。',
+    },
+    {
+      q: 'CLS（レイアウトのズレ）の値を答えてください。目安は 0.1 以下です。',
+      narration: 'CLS は、読み込み中に画面の要素がずれて動く度合い。画像のサイズ指定がないと、画像が読み込まれた瞬間に下の文章が押し下げられる。',
+      check: { type: 'answer', any: ['0.31'] },
+      answerHint: '小数',
+      hints: ['Performance タブの CLS のカード', '数値だけを読む', '0.31'],
+      explain: '0.31 は目安（0.1以下）の3倍以上で、ボタンを押そうとした瞬間にずれて誤タップする、といった体験につながる。対策は、画像に width/height を指定して場所をあらかじめ確保すること。',
+    },
+  ],
+  review: {
+    steps: ['Throttling で遅い回線（Slow 4G）を再現する', 'Performance で FCP/LCP/CLS/TBT を読む', '種類別サイズと Network で、重いリソースを探す', '効果の大きい順（画像→JS→CSS）に対策する'],
+    commands: [{ cmd: 'LCP', meaning: '最大の要素が表示されるまで（目安 2.5秒以内）' }, { cmd: 'CLS', meaning: '表示のずれ（目安 0.1以下）' }, { cmd: 'Throttling', meaning: '遅い回線を再現する機能' }],
+    why: '速度は数字で測り、目標を決めて改善する。ユーザーの体験は開発者の環境とは違う。',
+    practice: '大きい画像の圧縮、画像サイズの指定、使っていないJSの削除は、費用対効果の高い定番の改善策。',
+    related: ['Core Web Vitals', '画像最適化', 'コード分割', 'キャッシュ'],
+  },
+  learned: ['devtools-performance', 'core-web-vitals', 'network-throttling', 'resource-weight', 'cls-causes'],
+  solution: [{ do: 'setThrottle', args: ['slow4g'] }],
+};
+
+Object.assign(exports, { d09 });
+
+};
+__mods["js/missions/dt/d10-capstone.js"] = function (module, exports, __require) {
+// DevTools 10: 総合演習 — 購入できない原因を突き止める
+const HTML = `<!DOCTYPE html>
+<html><head><title>Stagelink — チケット購入</title></head>
+<body>
+<h1>Stagelink</h1>
+<p class="lead">春の音楽祭 S席 ¥8,500</p>
+<form id="checkout" action="/api/checkout" method="post">
+  <input type="hidden" name="csrf_token" value="">
+  <input type="text" name="coupon" placeholder="クーポンコード">
+  <button id="pay" type="submit">購入する</button>
+</form>
+<p id="err" style="color:red"></p>
+<script src="/js/checkout.js"></script>
+</body></html>`;
+
+const JS = `// 購入処理
+const token = localStorage.getItem('csrfToken');
+document.querySelector('input[name=csrf_token]').value = token || '';
+
+document.getElementById('checkout').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = { coupon: e.target.coupon.value, csrf_token: token };
+  const res = await fetch('/api/checkout', { method: 'POST', body: JSON.stringify(body) });
+  if (!res.ok) {
+    document.getElementById('err').textContent = '購入できませんでした';
+    return;
+  }
+  location.href = '/thanks';
+});`;
+
+const d10 = {
+  id: 'dv-10-capstone',
+  title: '総合演習: 購入できない原因を突き止める',
+  minutes: 20,
+  objectives: ['Console・Network・Sources・Application を連携させて原因を絞り込める', '画面の症状から、通信→コード→保存データの順に根本原因へたどれる', '調査結果を「現象・原因・対策」で説明できる'],
+  prereq: ['dv-09-performance'],
+  briefing: 'チケット販売サイト Stagelink で「購入ボタンを押すと『購入できませんでした』と出る」という報告が相次いでいる。画面に出るのは1行だけ。ここまで学んだ道具を総動員して、根本原因まで突き止めよう。調査の順番も大事だ。',
+  concepts: [{
+    title: '調査の流れ',
+    why: '症状（画面のエラー文）は結果にすぎない。原因は、通信・コード・保存データのどこかにある。決まった順で調べれば、迷わず絞り込める。',
+    problem: '闇雲に触ると、原因と無関係なところを直して時間を失う。',
+    how: '1) Console で赤いエラー（種類と場所）を確認。2) Network で失敗した通信のステータスとレスポンスを確認。3) Sources でその通信を出しているコードを読む。4) Application で、コードが参照している保存データ（キー名・値）を確認。5) Elements で、画面に反映された値（hidden欄など）を確認。「現象→直接原因→根本原因」の順にたどる。',
+    example: '現象: 購入できません → 通信: 403（csrf_token が空）→ コード: localStorage の csrfToken を読んでいる → 保存データ: 実際のキーは csrf_token（名前の食い違い）',
+    relation: '5つの道具の読み方を一つの調査にまとめて使う。',
+  }],
+  browser: {
+    url: 'https://stagelink.example.com/checkout',
+    html: HTML,
+    tabs: ['console', 'network', 'sources', 'application', 'elements'],
+    storage: { local: { csrf_token: '7d2e-41ab-cc09', user_pref: 'compact' }, session: { cart_id: 'C-4471' }, cookies: [{ name: 'session', value: 'ST-00a1', httpOnly: true, secure: true, sameSite: 'Lax', path: '/' }] },
+    console: [
+      { level: 'log', text: 'checkout.js loaded', source: 'checkout.js:1' },
+      { level: 'error', text: 'Failed to load resource: the server responded with a status of 403 ()', source: 'stagelink.example.com/api/checkout' },
+    ],
+    sources: { 'checkout.js': JS },
+    network: [
+      { url: '/checkout', status: 200, mime: 'text/html', size: 2100, time: 110, start: 0, initiator: 'ナビゲーション' },
+      { url: '/js/checkout.js', status: 200, mime: 'application/javascript', size: 700, time: 50, start: 120, initiator: '/checkout (HTML)' },
+      { id: 'pay', url: '/api/checkout', method: 'POST', status: 403, mime: 'application/json', size: 130, time: 90, start: 400, initiator: 'checkout.js:8',
+        reqHeaders: { 'content-type': 'text/plain;charset=UTF-8' },
+        reqBody: '{"coupon":"","csrf_token":null}',
+        resBody: '{"error":"csrf_token_missing","message":"CSRFトークンが見つかりません"}',
+        note: '403 Forbidden: サーバーがリクエストを拒否しました。' },
+    ],
+    quick: ["localStorage.getItem('csrfToken')", "localStorage.getItem('csrf_token')", "Object.keys(localStorage)"],
+  },
+  tasks: [
+    {
+      q: 'まず Network で失敗した購入リクエスト（/api/checkout）を開き、レスポンスの error の値を答えてください。',
+      narration: '調査の起点は、失敗した通信。ステータス（403）と、サーバーの言い分（Response）を確認する。',
+      check: { type: 'answer', any: ['csrf_token_missing'], ci: true },
+      answerHint: 'エラーコード',
+      hints: ['Network → /api/checkout の行（赤い）をタップ', 'Response タブを開く', 'csrf_token_missing'],
+      explain: 'サーバーは「CSRFトークンが見つからない」と返している。つまり、ブラウザがトークンを送れていない。CSRFトークンは、他サイトからの勝手な購入リクエストを防ぐための合言葉で、無いリクエストは拒否されるのが正しい動作。',
+    },
+    {
+      q: '送信したリクエストの本文（Payload）で、csrf_token にどんな値が送られていたか答えてください（JSON に書かれたそのままの値）。',
+      narration: 'サーバーが「無い」と言うなら、ブラウザが何を送ったかを確かめる。Payload タブが答えを持っている。',
+      check: { type: 'answer', any: ['null'], ci: true },
+      answerHint: 'JSON の値',
+      hints: ['同じ詳細画面の Payload タブ', '送信内容 (Request Payload) の csrf_token', 'null'],
+      explain: 'null が送られていた。ブラウザ側で、トークンの値が取得できていないということ。次に、コード（Sources）で、トークンをどこから読んでいるかを確認する。',
+    },
+    {
+      q: 'Sources の checkout.js で、トークンを localStorage から読んでいる行の「キー名」（getItem の引数）を答えてください。',
+      narration: 'コードは localStorage の特定のキーを探しにいく。そのキー名が実際の保存と一致しているかが、次の確認ポイント。',
+      check: { type: 'answer', any: ['csrfToken'], ci: false },
+      answerHint: 'キー名（大文字小文字に注意）',
+      hints: ['Sources → checkout.js を開く', '2行目の localStorage.getItem(…)', 'csrfToken'],
+      explain: 'コードは csrfToken（キャメルケース）というキーを読んでいる。大文字小文字も含め、キー名は完全一致が必要。ここまでで「直接原因」の見当が付いた。実際に保存されているキー名と照らし合わせる。',
+    },
+    {
+      q: 'Application の Local Storage に実際に保存されている CSRF トークンのキー名を答えてください。',
+      narration: 'コードが探すキー(csrfToken)と、実際に保存されているキーを並べて比べる。',
+      check: { type: 'answer', any: ['csrf_token'], ci: false },
+      answerHint: 'キー名',
+      hints: ['Application → Local Storage を開く', 'token を含むキーを探す', 'csrf_token'],
+      explain: '保存側は csrf_token（スネークケース）、読む側は csrfToken。名前が食い違って null になっていた。これが根本原因で、「命名規則の不統一」という、ありがちな人為ミス。直すのはコード側（キー名を揃える）。',
+    },
+    {
+      q: '原因の裏付けとして、ページ内のフォームの hidden 入力欄（name=csrf_token）に、正しいトークンの値を設定してください（Elements で value を編集するか、Console で setAttribute）。これは、直し方が正しいかの実験です。',
+      narration: '仮説（キー名の食い違い）が正しければ、正しい値を入れたとき購入が通るはず。実験として、画面側に値を入れてみる。',
+      check: { type: 'dev', dom: { sel: 'input[name=csrf_token]', attr: { value: '7d2e-41ab-cc09' } } },
+      noInput: true,
+      hints: ['Elements で input name="csrf_token" を探して選ぶ', '属性 value に Application で見たトークンを入力する', "Console: document.querySelector('input[name=csrf_token]').setAttribute('value', localStorage.getItem('csrf_token'))"],
+      explain: '仮説の検証として、値を入れて挙動を確かめる。これは実験で、恒久対策は checkout.js の getItem(\'csrfToken\') を csrf_token に直すこと。本番では、直した後にテスト（自動テスト含む）で再発を防ぐ。',
+    },
+    {
+      q: '調査のまとめです。このインシデントの「根本原因」として最も適切なものを選んでください。\n1) サーバーが落ちていた（5xx）\n2) ブラウザが CORS でブロックした\n3) JS が読むキー名と、保存されているキー名が一致していなかった\n4) ユーザーが Cookie を削除した',
+      narration: '「現象（購入できない）」「直接原因（トークンが送られていない）」「根本原因（なぜ送られなかったか）」を区別するのが、調査の締め。',
+      check: { type: 'answer', any: ['3'] },
+      answerHint: '番号',
+      hints: ['ステータスは 403（5xx ではない）、CORS のエラーは出ていない', 'Cookie の session は正常。問題はトークン', '3'],
+      explain: '現象=購入できない、直接原因=トークンが null、根本原因=キー名の不一致。調査報告は、この3層で書くと伝わる。「403 だからサーバー側のバグ」と決めつけず、通信→コード→保存データと順に確かめた点が、実務的なデバッグの型になる。',
+    },
+  ],
+  review: {
+    steps: ['Console で赤いエラーの種類と場所を確認', 'Network で失敗した通信のステータスと Response/Payload を読む', 'Sources でその通信を出すコードを読む', 'Application で保存データの実際のキー・値と照合する', '現象→直接原因→根本原因で整理する'],
+    commands: [{ cmd: 'Console → Network → Sources → Application', meaning: '症状から根本原因へたどる順番' }, { cmd: "localStorage.getItem('key')", meaning: 'コードが読む値を直接確かめる' }, { cmd: 'setAttribute', meaning: '仮説を検証するための一時的な変更' }],
+    why: '道具の使い方より、「何を、どの順で、何のために見るか」が実務の力になる。',
+    practice: '障害調査の報告は、現象・原因・対策・再発防止の4点で書く。スクリーンショット（機密は伏せて）を添えると、他の人が追体験しやすい。',
+    related: ['CSRF', 'インシデント報告', '根本原因分析', 'デバッグの型'],
+  },
+  learned: ['devtools-investigation', 'root-cause-analysis', 'csrf-token', 'debug-flow'],
+  solution: ["document.querySelector('input[name=csrf_token]').setAttribute('value', localStorage.getItem('csrf_token'))"],
+};
+
+Object.assign(exports, { d10 });
+
+};
+__mods["js/missions/stage-devtools2.js"] = function (module, exports, __require) {
+// DevTools コース II — 保存・コード・保護・速度を読む
+const { d05 } = __require("js/missions/dt/d05-storage.js");
+const { d06 } = __require("js/missions/dt/d06-sources.js");
+const { d07 } = __require("js/missions/dt/d07-debugger.js");
+const { d08 } = __require("js/missions/dt/d08-security.js");
+const { d09 } = __require("js/missions/dt/d09-performance.js");
+const { d10 } = __require("js/missions/dt/d10-capstone.js");
+
+const stageDevtools2 = {
+  id: 'dt-advanced',
+  track: 'devtools',
+  title: 'DevTools II — 保存・コード・保護・速度',
+  subtitle: 'Application・Sources・デバッガ・Security・Performance、そして総合演習',
+  intro: '後半は、ブラウザに保存されるもの、ページを動かすコード、守りの仕組み、表示速度を読む。最後は、これまでの道具を総動員して「購入できない」原因を突き止める総合演習。',
+  missions: [d05, d06, d07, d08, d09, d10],
+};
+
+Object.assign(exports, { stageDevtools2 });
+
+};
 __mods["js/missions/stage-packet.js"] = function (module, exports, __require) {
 // パケット解析（tcpdump でキャプチャファイルを読む）
 // キャプチャはすべてゲーム内の仮想データ。実在のネットワークからは一切取得しない。
@@ -11181,6 +12315,8 @@ const { stageApiSec } = __require("js/missions/stage-apisec.js");
 const { stageCloud } = __require("js/missions/stage-cloud.js");
 const { stageDetect } = __require("js/missions/stage-detect.js");
 const { stageAISec } = __require("js/missions/stage-aisec.js");
+const { stageDevtools1 } = __require("js/missions/stage-devtools1.js");
+const { stageDevtools2 } = __require("js/missions/stage-devtools2.js");
 const { stagePacket } = __require("js/missions/stage-packet.js");
 
 const STAGES = [
@@ -11215,28 +12351,51 @@ const STAGES = [
 // 今後のステージはここに追加する:
 //   フォレンジック / 暗号 / Active Directory / クラウド・コンテナ など
 
-// 索引を構築
+// ---------- コース(トラック) ----------
+// main    : 既存のメインコース（一本道）
+// devtools: ブラウザ開発者ツールの読み方を学ぶ並行コース。メインの進行状況とは独立して進められる。
+const DEV_STAGES = [stageDevtools1, stageDevtools2];
+
+const TRACKS = [
+  { id: 'main', title: 'メインコース', stages: STAGES },
+  { id: 'devtools', title: 'DevTools コース', stages: DEV_STAGES },
+];
+const ALL_STAGES = [...STAGES, ...DEV_STAGES];
+
+// 索引を構築（コースごとに一本道の順序を持つ）
 const missionById = {};
 const stageOfMission = {};
-let order = [];
-for (const st of STAGES) {
-  for (const m of st.missions) {
-    missionById[m.id] = m;
-    stageOfMission[m.id] = st.id;
-    order.push(m.id);
+const trackOfMission = {};
+const orderByTrack = {};
+const order = [];
+for (const tr of TRACKS) {
+  orderByTrack[tr.id] = [];
+  for (const st of tr.stages) {
+    for (const m of st.missions) {
+      missionById[m.id] = m;
+      stageOfMission[m.id] = st.id;
+      trackOfMission[m.id] = tr.id;
+      orderByTrack[tr.id].push(m.id);
+      order.push(m.id);
+    }
   }
 }
 
 function getMission(id) { return missionById[id]; }
 function getStageOf(id) { return stageOfMission[id]; }
+function trackOf(id) { return trackOfMission[id]; }
+function trackOfStage(stageId) { return TRACKS.find(t => t.stages.some(s => s.id === stageId)); }
+function getStage(stageId) { return ALL_STAGES.find(s => s.id === stageId); }
 function missionOrder() { return order.slice(); }
 function allMissions() { return order.map(id => missionById[id]); }
+function missionsOfTrack(trackId) { return (orderByTrack[trackId] || []).map(id => missionById[id]); }
 
-/** 直前のミッションが完了していれば解放（一本道） */
+/** 同じコース内で、直前のミッションが完了していれば解放（コースごとに一本道） */
 function isMissionUnlocked(id, isDone) {
-  const idx = order.indexOf(id);
+  const list = orderByTrack[trackOfMission[id]] || [];
+  const idx = list.indexOf(id);
   if (idx <= 0) return true;
-  return isDone(order[idx - 1]);
+  return isDone(list[idx - 1]);
 }
 
 /** ステージ内の最初の未クリアミッション、なければ null */
@@ -11245,7 +12404,1796 @@ function nextMissionInStage(stage, isDone) {
   return null;
 }
 
-Object.assign(exports, { STAGES, getMission, getStageOf, missionOrder, allMissions, isMissionUnlocked, nextMissionInStage });
+Object.assign(exports, { STAGES, DEV_STAGES, TRACKS, ALL_STAGES, getMission, getStageOf, trackOf, trackOfStage, getStage, missionOrder, allMissions, missionsOfTrack, isMissionUnlocked, nextMissionInStage });
+
+};
+__mods["js/vb/html.js"] = function (module, exports, __require) {
+// ============================================================
+// 仮想ブラウザ: HTMLパーサ・DOM・セレクタ・可視判定・シリアライズ
+// ゲーム内の架空ページを表現するためのもの。実ブラウザのDOMや innerHTML は使わない。
+// ノード: { t:'el', tag, attrs:{}, children:[], parent, uid } /
+//         { t:'text', text, parent, uid } / { t:'comment', text, parent, uid }
+// ============================================================
+
+const VOID = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+const RAW = new Set(['script', 'style', 'textarea', 'title']);
+const MAX_NODES = 3000;
+let uidSeq = 1;
+
+const nextUid = () => uidSeq++;
+
+function mk(t, props) { return Object.assign({ t, parent: null, uid: nextUid() }, props); }
+
+function parseHtml(src) {
+  const root = mk('el', { tag: '#document', attrs: {}, children: [] });
+  const stack = [root];
+  let i = 0, count = 0;
+  const top = () => stack[stack.length - 1];
+  const add = (n) => { if (++count > MAX_NODES) throw new Error('HTMLが大きすぎます'); n.parent = top(); top().children.push(n); return n; };
+  const pushText = (s) => { if (s) add(mk('text', { text: decodeEntities(s) })); };
+  while (i < src.length) {
+    if (src.startsWith('<!--', i)) {
+      const end = src.indexOf('-->', i + 4);
+      const e = end < 0 ? src.length : end;
+      add(mk('comment', { text: src.slice(i + 4, e) }));
+      i = end < 0 ? src.length : end + 3; continue;
+    }
+    if (src.startsWith('<!', i)) { const end = src.indexOf('>', i); i = end < 0 ? src.length : end + 1; continue; }
+    if (src.startsWith('</', i)) {
+      const end = src.indexOf('>', i);
+      const name = src.slice(i + 2, end < 0 ? src.length : end).trim().toLowerCase();
+      for (let k = stack.length - 1; k > 0; k--) if (stack[k].tag === name) { stack.length = k; break; }
+      i = end < 0 ? src.length : end + 1; continue;
+    }
+    if (src[i] === '<' && /[A-Za-z]/.test(src[i + 1] || '')) {
+      let j = i + 1;
+      while (j < src.length && /[^\s/>]/.test(src[j])) j++;
+      const tag = src.slice(i + 1, j).toLowerCase();
+      const attrs = {};
+      let selfClose = false;
+      for (;;) {
+        while (j < src.length && /\s/.test(src[j])) j++;
+        if (j >= src.length) break;
+        if (src[j] === '>') { j++; break; }
+        if (src[j] === '/' && src[j + 1] === '>') { selfClose = true; j += 2; break; }
+        if (src[j] === '/') { j++; continue; }
+        let k = j;
+        while (k < src.length && /[^\s=/>]/.test(src[k])) k++;
+        const name = src.slice(j, k).toLowerCase();
+        j = k;
+        while (j < src.length && /\s/.test(src[j])) j++;
+        let val = '';
+        if (src[j] === '=') {
+          j++;
+          while (j < src.length && /\s/.test(src[j])) j++;
+          if (src[j] === '"' || src[j] === "'") { const q = src[j]; const e = src.indexOf(q, j + 1); val = src.slice(j + 1, e < 0 ? src.length : e); j = e < 0 ? src.length : e + 1; }
+          else { let e = j; while (e < src.length && /[^\s>]/.test(src[e])) e++; val = src.slice(j, e); j = e; }
+        }
+        if (name) attrs[name] = decodeEntities(val);
+      }
+      const el = add(mk('el', { tag, attrs, children: [] }));
+      i = j;
+      if (VOID.has(tag) || selfClose) continue;
+      if (RAW.has(tag)) {
+        const close = src.toLowerCase().indexOf('</' + tag, i);
+        const e = close < 0 ? src.length : close;
+        if (e > i) { const tn = mk('text', { text: src.slice(i, e), raw: true }); tn.parent = el; el.children.push(tn); count++; }
+        const gt = src.indexOf('>', e);
+        i = close < 0 ? src.length : (gt < 0 ? src.length : gt + 1);
+        continue;
+      }
+      stack.push(el);
+      continue;
+    }
+    const next = src.indexOf('<', i + 1);
+    const e = next < 0 ? src.length : next;
+    pushText(src.slice(i, e));
+    i = e;
+  }
+  return root;
+}
+
+const ENT = { '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"', '&#39;': "'", '&nbsp;': ' ', '&copy;': '©', '&yen;': '¥' };
+function decodeEntities(s) { return s.replace(/&(?:lt|gt|amp|quot|#39|nbsp|copy|yen);/g, m => ENT[m]); }
+const escText = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const escAttr = (s) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+
+// ---------- シリアライズ ----------
+function openTag(n) {
+  const a = Object.entries(n.attrs).map(([k, v]) => (v === '' ? ` ${k}` : ` ${k}="${escAttr(v)}"`)).join('');
+  return `<${n.tag}${a}>`;
+}
+function outerHTML(n) {
+  if (n.t === 'text') return n.raw ? n.text : escText(n.text);
+  if (n.t === 'comment') return `<!--${n.text}-->`;
+  if (VOID.has(n.tag)) return openTag(n);
+  return openTag(n) + n.children.map(outerHTML).join('') + `</${n.tag}>`;
+}
+const innerHTML = (n) => n.children.map(outerHTML).join('');
+
+// ---------- テキスト ----------
+function textContent(n) {
+  if (n.t === 'text') return n.text;
+  if (n.t === 'comment') return '';
+  return n.children.map(textContent).join('');
+}
+const BLOCK = new Set(['div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'ul', 'ol', 'form', 'section', 'article', 'header', 'footer', 'nav', 'main', 'table', 'tr', 'br', 'pre', 'label']);
+function innerText(n) {
+  const parts = [];
+  const walk = (x) => {
+    if (x.t === 'text') { const t = x.text.replace(/\s+/g, ' ').trim(); if (t && !(x.parent && ['script', 'style'].includes(x.parent.tag))) parts.push(t); return; }
+    if (x.t !== 'el' || isHidden(x) || ['script', 'style', 'head'].includes(x.tag)) return;
+    const blk = BLOCK.has(x.tag);
+    if (blk) parts.push('\n');
+    x.children.forEach(walk);
+    if (blk) parts.push('\n');
+  };
+  walk(n);
+  return parts.join(' ').replace(/ ?\n ?/g, '\n').replace(/\n{2,}/g, '\n').trim();
+}
+
+// ---------- 可視判定 ----------
+function styleOf(n) {
+  const out = {};
+  for (const decl of (n.attrs && n.attrs.style ? n.attrs.style : '').split(';')) {
+    const i = decl.indexOf(':'); if (i < 0) continue;
+    out[decl.slice(0, i).trim().toLowerCase()] = decl.slice(i + 1).trim().toLowerCase();
+  }
+  return out;
+}
+function selfHidden(n) {
+  if (n.t !== 'el') return false;
+  if (n.attrs.hidden !== undefined) return true;
+  if (n.tag === 'input' && (n.attrs.type || '').toLowerCase() === 'hidden') return true;
+  const s = styleOf(n);
+  if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return true;
+  if (/^-\d{3,}/.test(s.left || '') || /^-\d{3,}/.test(s['margin-left'] || '') || /^-\d{3,}/.test(s['text-indent'] || '')) return true; // 画面外へ追い出す手口
+  if ((s.width === '0' || s.width === '0px') && (s.height === '0' || s.height === '0px')) return true;
+  return false;
+}
+function isHidden(n) { for (let x = n; x && x.t === 'el'; x = x.parent) if (selfHidden(x)) return true; return false; }
+
+// ---------- セレクタ ----------
+function parseCompound(s) {
+  const c = { tag: null, id: null, classes: [], attrs: [] };
+  const re = /^(\*|[A-Za-z][A-Za-z0-9-]*)|#([A-Za-z0-9_-]+)|\.([A-Za-z0-9_-]+)|\[\s*([A-Za-z_:][\w:-]*)\s*(?:([~^$*|]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]*)))?\s*\]/y;
+  let pos = 0;
+  while (pos < s.length) {
+    re.lastIndex = pos;
+    const m = re.exec(s);
+    if (!m || m[0] === '') throw new Error(`SyntaxError: '${s}' is not a valid selector`);
+    if (m[1]) c.tag = m[1].toLowerCase();
+    else if (m[2]) c.id = m[2];
+    else if (m[3]) c.classes.push(m[3]);
+    else if (m[4]) c.attrs.push({ name: m[4].toLowerCase(), op: m[5] || null, val: m[6] ?? m[7] ?? m[8] ?? '' });
+    pos = re.lastIndex;
+  }
+  return c;
+}
+function parseSelector(sel) {
+  return sel.split(',').map(part => {
+    const toks = part.trim().replace(/\s*>\s*/g, ' > ').split(/\s+/).filter(Boolean);
+    const chain = []; let comb = ' ';
+    for (const t of toks) { if (t === '>') { comb = '>'; continue; } chain.push({ comb, c: parseCompound(t) }); comb = ' '; }
+    if (!chain.length) throw new Error(`SyntaxError: '${sel}' is not a valid selector`);
+    return chain;
+  });
+}
+function matchCompound(n, c) {
+  if (n.t !== 'el') return false;
+  if (c.tag && c.tag !== '*' && c.tag !== n.tag) return false;
+  if (c.id && n.attrs.id !== c.id) return false;
+  if (c.classes.length) { const cl = (n.attrs.class || '').split(/\s+/); if (!c.classes.every(x => cl.includes(x))) return false; }
+  for (const a of c.attrs) {
+    const v = n.attrs[a.name];
+    if (v === undefined) return false;
+    if (!a.op) continue;
+    if (a.op === '=' && v !== a.val) return false;
+    if (a.op === '^=' && !v.startsWith(a.val)) return false;
+    if (a.op === '$=' && !v.endsWith(a.val)) return false;
+    if (a.op === '*=' && !v.includes(a.val)) return false;
+    if (a.op === '~=' && !v.split(/\s+/).includes(a.val)) return false;
+  }
+  return true;
+}
+function matchChain(n, chain, idx) {
+  const link = chain[idx];
+  if (!matchCompound(n, link.c)) return false;
+  if (idx === 0) return true;
+  if (link.comb === '>') return !!n.parent && matchChain(n.parent, chain, idx - 1);
+  for (let p = n.parent; p; p = p.parent) if (matchChain(p, chain, idx - 1)) return true;
+  return false;
+}
+function matches(n, sel) { return parseSelector(sel).some(ch => matchChain(n, ch, ch.length - 1)); }
+function descendants(root) {
+  const out = [];
+  const walk = (x) => { for (const c of x.children || []) { if (c.t === 'el') { out.push(c); walk(c); } } };
+  walk(root);
+  return out;
+}
+function querySelectorAll(root, sel) {
+  const chains = parseSelector(sel);
+  return descendants(root).filter(n => chains.some(ch => matchChain(n, ch, ch.length - 1)));
+}
+function querySelector(root, sel) { return querySelectorAll(root, sel)[0] || null; }
+function closest(n, sel) { for (let x = n; x && x.t === 'el'; x = x.parent) if (matches(x, sel)) return x; return null; }
+function allNodes(root) {
+  const out = [];
+  const walk = (x) => { for (const c of x.children || []) { out.push(c); walk(c); } };
+  walk(root);
+  return out;
+}
+function removeNode(n) { if (n.parent) n.parent.children = n.parent.children.filter(c => c !== n); n.parent = null; }
+
+Object.assign(exports, { nextUid, parseHtml, decodeEntities, openTag, outerHTML, innerHTML, textContent, innerText, styleOf, selfHidden, isHidden, matches, descendants, querySelectorAll, querySelector, closest, allNodes, removeNode });
+
+};
+__mods["js/vb/jsparse.js"] = function (module, exports, __require) {
+// ============================================================
+// Console 用 JavaScript 風式のパーサ（eval / Function は使わない）。
+// 対応: リテラル(数値/文字列/テンプレート/配列/オブジェクト/true/false/null/undefined)、
+//       メンバー(. [] ?.)、呼び出し、アロー関数(式本体)、単項(! - + typeof)、
+//       二項(+ - * / % < > <= >= == != === !== && || ??)、三項、代入(= += -=)、
+//       const/let/var 宣言、; 区切り
+// 非対応(明示エラー): new, function, class, ブロック文, 制御構文, 正規表現リテラル, ++/--
+// ============================================================
+
+class ParseError extends Error { constructor(msg) { super(msg); this.errName = 'SyntaxError'; } }
+
+const KEYWORDS_UNSUPPORTED = new Set(['new', 'function', 'class', 'if', 'for', 'while', 'do', 'switch', 'try', 'return', 'throw', 'delete', 'void', 'await', 'async', 'import', 'export', 'this', 'in', 'of', 'instanceof']);
+const OPS3 = ['===', '!==', '...'];
+const OPS2 = ['=>', '==', '!=', '<=', '>=', '&&', '||', '??', '?.', '+=', '-=', '++', '--'];
+
+function tokenize(src) {
+  const toks = [];
+  let i = 0;
+  const err = (m) => { throw new ParseError(m); };
+  while (i < src.length) {
+    const c = src[i];
+    if (/\s/.test(c)) { i++; continue; }
+    const start = i;
+    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(src[i + 1] || ''))) {
+      const m = src.slice(i).match(/^(0[xX][0-9a-fA-F]+|\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+)/);
+      toks.push({ t: 'num', v: Number(m[0]), s: start, e: i + m[0].length }); i += m[0].length; continue;
+    }
+    if (c === '"' || c === "'") {
+      let j = i + 1, out = '';
+      while (j < src.length && src[j] !== c) {
+        if (src[j] === '\n') err('Invalid or unexpected token');
+        if (src[j] === '\\') {
+          const n = src[j + 1];
+          if (n === 'u' && /^[0-9a-fA-F]{4}/.test(src.slice(j + 2, j + 6))) { out += String.fromCharCode(parseInt(src.slice(j + 2, j + 6), 16)); j += 6; continue; }
+          out += n === 'n' ? '\n' : n === 't' ? '\t' : n === 'r' ? '\r' : n === '0' ? '\0' : n; j += 2; continue;
+        }
+        out += src[j]; j++;
+      }
+      if (j >= src.length) err('Invalid or unexpected token');
+      toks.push({ t: 'str', v: out, s: start, e: j + 1 }); i = j + 1; continue;
+    }
+    if (c === '`') {
+      const quasis = [], exprs = [];
+      let j = i + 1, cur = '';
+      while (j < src.length && src[j] !== '`') {
+        if (src[j] === '\\') { const n = src[j + 1]; cur += n === 'n' ? '\n' : n === 't' ? '\t' : n; j += 2; continue; }
+        if (src[j] === '$' && src[j + 1] === '{') {
+          let depth = 1, k = j + 2;
+          while (k < src.length && depth > 0) { if (src[k] === '{') depth++; else if (src[k] === '}') depth--; k++; }
+          if (depth) err('Unexpected end of input');
+          quasis.push(cur); cur = '';
+          exprs.push(src.slice(j + 2, k - 1)); j = k; continue;
+        }
+        cur += src[j]; j++;
+      }
+      if (j >= src.length) err('Invalid or unexpected token');
+      quasis.push(cur);
+      toks.push({ t: 'tpl', quasis, exprs, s: start, e: j + 1 }); i = j + 1; continue;
+    }
+    if (/[A-Za-z_$]/.test(c)) {
+      let j = i; while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+      toks.push({ t: 'id', v: src.slice(i, j), s: start, e: j }); i = j; continue;
+    }
+    let op = OPS3.find(o => src.startsWith(o, i)) || OPS2.find(o => src.startsWith(o, i));
+    if (op === '?.' && /[0-9]/.test(src[i + 2] || '')) op = null; // 三項演算子 a?.5:1
+    if (!op && '+-*/%<>=!?:.,;()[]{}'.includes(c)) op = c;
+    if (!op) err('Invalid or unexpected token');
+    if (op === '/' ) err('正規表現リテラルや除算以外の / はこのシミュレーターでは未対応です');
+    toks.push({ t: 'op', v: op, s: start, e: i + op.length }); i += op.length;
+  }
+  return toks;
+}
+
+function parse(src) {
+  const toks = tokenize(src);
+  let p = 0;
+  const peek = (o = 0) => toks[p + o];
+  const isOp = (v, o = 0) => { const t = toks[p + o]; return t && t.t === 'op' && t.v === v; };
+  const fail = (t) => {
+    if (!t) throw new ParseError('Unexpected end of input');
+    if (t.t === 'str') throw new ParseError('Unexpected string');
+    if (t.t === 'num') throw new ParseError('Unexpected number');
+    if (t.t === 'id') throw new ParseError(`Unexpected identifier '${t.v}'`);
+    throw new ParseError(`Unexpected token '${t.v ?? t.t}'`);
+  };
+  const expect = (v) => { if (!isOp(v)) fail(peek()); p++; };
+  const span = (a, b) => src.slice(a, b);
+  const lastEnd = () => toks[p - 1].e;
+
+  function parseProgram() {
+    const stmts = [];
+    while (p < toks.length) {
+      if (isOp(';')) { p++; continue; }
+      stmts.push(parseStatement());
+      if (p < toks.length && !isOp(';')) fail(peek());
+    }
+    return stmts;
+  }
+  function parseStatement() {
+    const t = peek();
+    if (t.t === 'id' && ['const', 'let', 'var'].includes(t.v)) {
+      p++;
+      const id = peek(); if (!id || id.t !== 'id') fail(id);
+      p++;
+      let init = null;
+      if (isOp('=')) { p++; init = parseAssign(); }
+      else if (t.v === 'const') throw new ParseError('Missing initializer in const declaration');
+      return { k: 'decl', kind: t.v, name: id.v, init };
+    }
+    if (t.t === 'id' && KEYWORDS_UNSUPPORTED.has(t.v) && !(peek(1) && peek(1).t === 'op' && peek(1).v === '=>')) throw new ParseError(`'${t.v}' はこのシミュレーターのConsoleでは未対応です`);
+    if (isOp('{')) throw new ParseError('ブロック文はこのシミュレーターのConsoleでは未対応です（式を1つずつ実行してください）');
+    return { k: 'expr', e: parseAssign() };
+  }
+  function parseAssign() {
+    const start = peek() ? peek().s : 0;
+    // アロー関数: id => expr / (a, b) => expr
+    if (peek() && peek().t === 'id' && isOp('=>', 1) && !KEYWORDS_UNSUPPORTED.has(peek().v)) {
+      const name = peek().v; p += 2; return arrowBody([name], start);
+    }
+    if (isOp('(')) {
+      const params = tryArrowParams();
+      if (params) return arrowBody(params, start);
+    }
+    const left = parseCond();
+    const t = peek();
+    if (t && t.t === 'op' && ['=', '+=', '-='].includes(t.v)) {
+      if (!['id', 'member', 'index'].includes(left.k)) throw new ParseError('Invalid left-hand side in assignment');
+      p++;
+      return { k: 'assign', op: t.v, target: left, value: parseAssign(), s: start, e: lastEnd() };
+    }
+    return left;
+  }
+  function tryArrowParams() {
+    // ( id (, id)* ) =>
+    let q = p + 1; const names = [];
+    if (toks[q] && toks[q].t === 'op' && toks[q].v === ')') { q++; }
+    else {
+      for (;;) {
+        const t = toks[q]; if (!t || t.t !== 'id') return null;
+        names.push(t.v); q++;
+        if (toks[q] && toks[q].t === 'op' && toks[q].v === ',') { q++; continue; }
+        break;
+      }
+      if (!(toks[q] && toks[q].t === 'op' && toks[q].v === ')')) return null;
+      q++;
+    }
+    if (!(toks[q] && toks[q].t === 'op' && toks[q].v === '=>')) return null;
+    p = q + 1; return names;
+  }
+  function arrowBody(params, start) {
+    if (isOp('{')) throw new ParseError('アロー関数の本体は式のみ対応です（{ } のブロックは未対応）');
+    const body = parseAssign();
+    return { k: 'arrow', params, body, s: start, e: lastEnd() };
+  }
+  function parseCond() {
+    const c = parseBin(0);
+    if (isOp('?')) { p++; const a = parseAssign(); expect(':'); const b = parseAssign(); return { k: 'cond', c, a, b }; }
+    return c;
+  }
+  const LEVELS = [['??'], ['||'], ['&&'], ['==', '!=', '===', '!=='], ['<', '>', '<=', '>='], ['+', '-'], ['*', '%']];
+  function parseBin(level) {
+    if (level >= LEVELS.length) return parseUnary();
+    let left = parseBin(level + 1);
+    for (;;) {
+      const t = peek();
+      if (t && t.t === 'op' && LEVELS[level].includes(t.v)) { p++; left = { k: 'bin', op: t.v, l: left, r: parseBin(level + 1) }; }
+      else return left;
+    }
+  }
+  function parseUnary() {
+    const t = peek();
+    if (t && t.t === 'op' && ['!', '-', '+'].includes(t.v)) { p++; return { k: 'unary', op: t.v, e: parseUnary() }; }
+    if (t && t.t === 'op' && (t.v === '++' || t.v === '--')) throw new ParseError('++/-- はこのシミュレーターでは未対応です');
+    if (t && t.t === 'id' && t.v === 'typeof') { p++; return { k: 'unary', op: 'typeof', e: parseUnary() }; }
+    return parsePostfix();
+  }
+  function parsePostfix() {
+    const startTok = peek();
+    let e = parsePrimary();
+    for (;;) {
+      if (isOp('.') || isOp('?.')) {
+        const optional = isOp('?.'); p++;
+        if (optional && (isOp('(') || isOp('['))) {
+          if (isOp('[')) { p++; const idx = parseAssign(); expect(']'); e = { k: 'index', obj: e, idx, optional: true }; }
+          else { e = { k: 'call', callee: e, args: parseArgs(), optional: true, s: startTok.s, e: lastEnd() }; }
+          continue;
+        }
+        const n = peek(); if (!n || n.t !== 'id') fail(n);
+        p++; e = { k: 'member', obj: e, name: n.v, optional, s: startTok.s, e: lastEnd() };
+      } else if (isOp('[')) {
+        p++; const idx = parseAssign(); expect(']'); e = { k: 'index', obj: e, idx, optional: false, s: startTok.s, e: lastEnd() };
+      } else if (isOp('(')) {
+        e = { k: 'call', callee: e, args: parseArgs(), optional: false, s: startTok.s, e: lastEnd() };
+      } else return e;
+    }
+  }
+  function parseArgs() {
+    expect('('); const args = [];
+    if (!isOp(')')) { for (;;) { args.push(parseAssign()); if (isOp(',')) { p++; if (isOp(')')) break; continue; } break; } }
+    expect(')'); return args;
+  }
+  function parsePrimary() {
+    const t = peek();
+    if (!t) fail(null);
+    if (t.t === 'num') { p++; return { k: 'num', v: t.v }; }
+    if (t.t === 'str') { p++; return { k: 'str', v: t.v }; }
+    if (t.t === 'tpl') { p++; return { k: 'tpl', quasis: t.quasis, exprs: t.exprs.map(s => { const sub = parse(s); if (sub.length !== 1 || sub[0].k !== 'expr') throw new ParseError('テンプレート内は式のみ対応です'); return sub[0].e; }) }; }
+    if (t.t === 'id') {
+      if (['true', 'false', 'null', 'undefined'].includes(t.v)) { p++; return { k: 'lit', v: t.v === 'true' ? true : t.v === 'false' ? false : t.v === 'null' ? null : undefined }; }
+      if (KEYWORDS_UNSUPPORTED.has(t.v)) throw new ParseError(`'${t.v}' はこのシミュレーターのConsoleでは未対応です`);
+      p++; return { k: 'id', name: t.v };
+    }
+    if (isOp('(')) { p++; const e = parseAssign(); expect(')'); return { k: 'group', e }; }
+    if (isOp('[')) {
+      p++; const items = [];
+      while (!isOp(']')) { if (!peek()) fail(null); items.push(parseAssign()); if (isOp(',')) p++; else break; }
+      expect(']'); return { k: 'array', items };
+    }
+    if (isOp('{')) {
+      p++; const props = [];
+      while (!isOp('}')) {
+        const kt = peek(); if (!kt) fail(null);
+        let key;
+        if (kt.t === 'id' || kt.t === 'str') key = kt.v; else if (kt.t === 'num') key = String(kt.v); else fail(kt);
+        p++;
+        if (isOp(':')) { p++; props.push({ key, value: parseAssign() }); }
+        else if (kt.t === 'id') props.push({ key, value: { k: 'id', name: key } }); // 省略記法 {a}
+        else fail(peek());
+        if (isOp(',')) p++; else break;
+      }
+      expect('}'); return { k: 'object', props };
+    }
+    fail(t);
+  }
+  const prog = parseProgram();
+  prog.src = src;
+  return prog;
+}
+
+Object.assign(exports, { ParseError, tokenize, parse });
+
+};
+__mods["js/vb/jsrepl.js"] = function (module, exports, __require) {
+// ============================================================
+// Console 用の安全な実行系。実ブラウザの eval/Function は使わず、
+// 許可したオブジェクト(document / localStorage / location など)だけを操作できる。
+// プロトタイプ経由の脱出(__proto__ / constructor / prototype)は遮断する。
+// ============================================================
+const H = __require("js/vb/html.js");
+const { parse, ParseError } = __require("js/vb/jsparse.js");
+
+class ReplError extends Error { constructor(name, msg) { super(msg); this.errName = name; } }
+const E = (name, msg) => new ReplError(name, msg);
+const BLOCKED = new Set(['__proto__', 'constructor', 'prototype', '__defineGetter__', '__defineSetter__', '__lookupGetter__']);
+const MAX_STEPS = 60000, MAX_DEPTH = 40;
+
+// ---------- 値クラス ----------
+class El { constructor(node) { this.node = node; } }
+class NodeListV extends Array {}
+class Host { get() { return undefined; } set(k) { throw E('TypeError', `Cannot set property '${k}' of ${this.label()}`); } keys() { return []; } label() { return 'Object'; } }
+class HostFn { constructor(name, fn) { this.name = name; this.fn = fn; } }
+class Arrow { constructor(params, body, scope, src) { this.params = params; this.body = body; this.scope = scope; this.src = src; } }
+
+const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v) && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
+
+// ---------- 文字列化・整形 ----------
+function toStr(v) {
+  if (typeof v === 'string') return v;
+  if (v === null) return 'null';
+  if (v === undefined) return 'undefined';
+  if (Array.isArray(v)) return v.map(x => (x === null || x === undefined ? '' : toStr(x))).join(',');
+  if (v instanceof El) return `[object HTML${v.node.tag === 'a' ? 'Anchor' : 'Unknown'}Element]`;
+  if (v instanceof Arrow) return v.src;
+  if (v instanceof HostFn) return `function ${v.name}() { [native code] }`;
+  if (v instanceof Host) return `[object ${v.label().split(' ')[0]}]`;
+  if (isPlain(v)) return '[object Object]';
+  return String(v);
+}
+const toNum = (v) => (typeof v === 'number' ? v : v instanceof El || v instanceof Host || isPlain(v) ? NaN : Number(v));
+const truthy = (v) => !!v && !(typeof v === 'number' && Number.isNaN(v));
+
+function quote(s) {
+  const q = s.includes("'") && !s.includes('"') ? '"' : "'";
+  return q + s.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(q === "'" ? /'/g : /"/g, '\\' + q) + q;
+}
+function elLabel(n) {
+  const a = Object.entries(n.attrs).map(([k, v]) => (v === '' ? ` ${k}` : ` ${k}="${v.length > 40 ? v.slice(0, 40) + '…' : v}"`)).join('');
+  const kids = n.children.length;
+  return `<${n.tag}${a}>${kids ? '…' : ''}${['img', 'input', 'br', 'meta', 'link', 'hr'].includes(n.tag) ? '' : `</${n.tag}>`}`;
+}
+function fmt(v, depth = 0) {
+  let s;
+  if (v === undefined) s = 'undefined';
+  else if (v === null) s = 'null';
+  else if (typeof v === 'string') s = quote(v);
+  else if (typeof v === 'number' || typeof v === 'boolean') s = String(v);
+  else if (v instanceof El) s = elLabel(v.node);
+  else if (v instanceof NodeListV) s = `NodeList(${v.length}) [${v.slice(0, 6).map(x => fmt(x, depth + 1)).join(', ')}${v.length > 6 ? ', …' : ''}]`;
+  else if (Array.isArray(v)) s = depth > 1 ? `Array(${v.length})` : `(${v.length}) [${v.slice(0, 20).map(x => fmt(x, depth + 1)).join(', ')}${v.length > 20 ? ', …' : ''}]`;
+  else if (v instanceof Arrow) s = v.src;
+  else if (v instanceof HostFn) s = `ƒ ${v.name}() { [native code] }`;
+  else if (v instanceof Host) s = v.format ? v.format(depth, fmt) : v.label();
+  else if (isPlain(v)) {
+    const ks = Object.keys(v);
+    s = depth > 1 ? 'Object' : ks.length ? `{${ks.slice(0, 20).map(k => `${/^[A-Za-z_$][\w$]*$/.test(k) ? k : quote(k)}: ${fmt(v[k], depth + 1)}`).join(', ')}${ks.length > 20 ? ', …' : ''}}` : '{}';
+  } else s = String(v);
+  return s.length > 600 ? s.slice(0, 600) + '…' : s;
+}
+const fmtLog = (args) => args.map(a => (typeof a === 'string' ? a : fmt(a))).join(' ');
+
+// ---------- cookie ----------
+function cookieString(cookies) { return cookies.filter(c => !c.httpOnly).map(c => `${c.name}=${c.value}`).join('; '); }
+
+// ---------- atob / btoa（実ブラウザと同じくバイナリ文字列） ----------
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function btoaImpl(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i += 3) {
+    const a = s.charCodeAt(i), b = s.charCodeAt(i + 1), c = s.charCodeAt(i + 2);
+    if (a > 255 || b > 255 || c > 255) throw E('InvalidCharacterError', "Failed to execute 'btoa': The string to be encoded contains characters outside of the Latin1 range.");
+    out += B64[a >> 2] + B64[((a & 3) << 4) | ((b || 0) >> 4)] + (Number.isNaN(b) ? '=' : B64[((b & 15) << 2) | ((c || 0) >> 6)]) + (Number.isNaN(c) ? '=' : B64[c & 63]);
+  }
+  return out;
+}
+function atobImpl(s) {
+  s = s.replace(/[\t\n\f\r ]/g, '');
+  if (s.length % 4 === 1 || /[^A-Za-z0-9+/=]/.test(s)) throw E('InvalidCharacterError', "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.");
+  s = s.replace(/=+$/, '');
+  let out = '';
+  for (let i = 0; i < s.length; i += 4) {
+    const n = [0, 1, 2, 3].map(k => (i + k < s.length ? B64.indexOf(s[i + k]) : -1));
+    out += String.fromCharCode((n[0] << 2) | (n[1] >> 4));
+    if (n[2] >= 0) out += String.fromCharCode(((n[1] & 15) << 4) | (n[2] >> 2));
+    if (n[3] >= 0) out += String.fromCharCode(((n[2] & 3) << 6) | n[3]);
+  }
+  return out;
+}
+
+const ATTR_PROPS = { href: 'href', src: 'src', action: 'action', method: 'method', name: 'name', type: 'type', value: 'value', placeholder: 'placeholder', alt: 'alt', title: 'title', target: 'target', rel: 'rel', content: 'content', charset: 'charset', htmlFor: 'for', id: 'id', lang: 'lang', className: 'class' };
+const BOOL_PROPS = { checked: 'checked', disabled: 'disabled', hidden: 'hidden', required: 'required', readOnly: 'readonly', selected: 'selected', async: 'async', defer: 'defer' };
+const camel = (s) => s.replace(/-([a-z])/g, (m, c) => c.toUpperCase());
+const kebab = (s) => s.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+
+/**
+ * Repl を生成する。host は仮想ブラウザのセッションが提供する:
+ *  { root(), href(), userAgent, cookies[], local{}, session{}, globals{}, log(level,text), onDom(), onStorage(), onCookie() }
+ */
+function createRepl(host) {
+  const topScope = { vars: new Map(), parent: null };
+  let steps = 0, depth = 0;
+  const elCache = new Map();
+  const wrap = (n) => { if (!n) return null; let w = elCache.get(n.uid); if (!w) { w = new El(n); elCache.set(n.uid, w); } return w; };
+  const list = (nodes) => { const l = new NodeListV(); nodes.forEach(n => l.push(wrap(n))); return l; };
+  const fn = (name, f) => new HostFn(name, f);
+  const needEl = (v, what) => { if (!(v instanceof El)) throw E('TypeError', `${what} is not an Element`); return v.node; };
+  const sel = (root, s) => { try { return H.querySelectorAll(root, toStr(s)); } catch (e) { throw E('SyntaxError', `Failed to execute 'querySelectorAll' on 'Document': ${e.message.replace('SyntaxError: ', '')}`); } };
+
+  const base = () => new URL(host.href());
+  const resolveUrl = (v) => { try { return new URL(v, base()).href; } catch { return v; } };
+
+  // ---------- Style / Storage ----------
+  class StyleHost extends Host {
+    constructor(n) { super(); this.n = n; }
+    label() { return 'CSSStyleDeclaration'; }
+    get(k) { const s = H.styleOf(this.n); return s[kebab(k)] ?? ''; }
+    set(k, v) {
+      const s = H.styleOf(this.n); s[kebab(k)] = toStr(v);
+      this.n.attrs.style = Object.entries(s).filter(([, x]) => x !== '').map(([a, b]) => `${a}: ${b}`).join('; '); host.onDom();
+    }
+    keys() { return Object.keys(H.styleOf(this.n)).map(camel); }
+  }
+  class StorageHost extends Host {
+    constructor(name, data) { super(); this.nameV = name; this.data = data; }
+    label() { return 'Storage'; }
+    get(k) {
+      if (k === 'length') return Object.keys(this.data).length;
+      if (k === 'getItem') return fn('getItem', (t, a) => (Object.prototype.hasOwnProperty.call(this.data, toStr(a[0])) ? this.data[toStr(a[0])] : null));
+      if (k === 'setItem') return fn('setItem', (t, a) => { this.data[toStr(a[0])] = toStr(a[1]); host.onStorage(); });
+      if (k === 'removeItem') return fn('removeItem', (t, a) => { delete this.data[toStr(a[0])]; host.onStorage(); });
+      if (k === 'clear') return fn('clear', () => { for (const x of Object.keys(this.data)) delete this.data[x]; host.onStorage(); });
+      if (k === 'key') return fn('key', (t, a) => Object.keys(this.data)[toNum(a[0])] ?? null);
+      return Object.prototype.hasOwnProperty.call(this.data, k) ? this.data[k] : undefined;
+    }
+    set(k, v) { this.data[k] = toStr(v); host.onStorage(); }
+    keys() { return Object.keys(this.data); }
+    format(d, f) { const ks = Object.keys(this.data); return `Storage {${ks.slice(0, 12).map(k => `${k}: ${f(this.data[k], 2)}`).join(', ')}${ks.length ? ', ' : ''}length: ${ks.length}}`; }
+  }
+
+  // ---------- Document / Location / Navigator / Window / Console ----------
+  const docQuery = (root) => ({
+    querySelector: fn('querySelector', (t, a) => wrap(H.querySelector(root, toStr(a[0])))),
+    querySelectorAll: fn('querySelectorAll', (t, a) => list(sel(root, a[0]))),
+  });
+  class DocumentHost extends Host {
+    label() { return '#document'; }
+    format() { return '#document'; }
+    get(k) {
+      const root = host.root();
+      const html = () => H.querySelector(root, 'html'), q = (s) => H.querySelector(root, s);
+      switch (k) {
+        case 'title': { const t = q('title'); return t ? H.textContent(t).trim() : ''; }
+        case 'cookie': return cookieString(host.cookies);
+        case 'URL': case 'documentURI': return host.href();
+        case 'domain': return base().hostname;
+        case 'referrer': return '';
+        case 'readyState': return 'complete';
+        case 'characterSet': case 'charset': return 'UTF-8';
+        case 'contentType': return 'text/html';
+        case 'documentElement': return wrap(html());
+        case 'body': return wrap(q('body'));
+        case 'head': return wrap(q('head'));
+        case 'forms': return list(H.querySelectorAll(root, 'form'));
+        case 'links': return list(H.querySelectorAll(root, 'a[href], area[href]'));
+        case 'scripts': return list(H.querySelectorAll(root, 'script'));
+        case 'images': return list(H.querySelectorAll(root, 'img'));
+        case 'querySelector': case 'querySelectorAll': return docQuery(root)[k];
+        case 'getElementById': return fn('getElementById', (t, a) => wrap(q('#' + toStr(a[0]).replace(/[^\w-]/g, '')) || H.allNodes(root).find(n => n.t === 'el' && n.attrs.id === toStr(a[0])) || null));
+        case 'getElementsByTagName': return fn('getElementsByTagName', (t, a) => list(H.querySelectorAll(root, toStr(a[0]) === '*' ? '*' : toStr(a[0]).replace(/[^\w-]/g, ''))));
+        case 'getElementsByClassName': return fn('getElementsByClassName', (t, a) => list(H.querySelectorAll(root, '.' + toStr(a[0]).replace(/[^\w-]/g, ''))));
+        case 'getElementsByName': return fn('getElementsByName', (t, a) => list(H.allNodes(root).filter(n => n.t === 'el' && n.attrs.name === toStr(a[0]))));
+        default: return undefined;
+      }
+    }
+    set(k, v) {
+      if (k === 'title') {
+        let t = H.querySelector(host.root(), 'title');
+        if (!t) { const h = H.querySelector(host.root(), 'head'); if (!h) return; t = { t: 'el', tag: 'title', attrs: {}, children: [], parent: h, uid: H.nextUid() }; h.children.push(t); }
+        t.children = [{ t: 'text', text: toStr(v), parent: t, uid: H.nextUid(), raw: true }]; host.onDom(); return;
+      }
+      if (k === 'cookie') {
+        const parts = toStr(v).split(';').map(s => s.trim());
+        const [name, ...rest] = parts[0].split('=');
+        if (!name) return;
+        const attrs = parts.slice(1).map(s => s.toLowerCase());
+        if (attrs.includes('httponly')) return; // JavaScriptからHttpOnly属性付きのCookieは作れない
+        const val = rest.join('=');
+        const ex = host.cookies.find(c => c.name === name.trim());
+        if (ex && ex.httpOnly) return; // HttpOnlyのCookieはJavaScriptから上書きできない
+        const exp = parts.slice(1).find(s => /^expires=/i.test(s) || /^max-age=/i.test(s));
+        if (ex) { ex.value = val; } else host.cookies.push({ name: name.trim(), value: val, domain: base().hostname, path: '/', expires: exp ? exp.split('=')[1] : 'Session', httpOnly: false, secure: attrs.includes('secure'), sameSite: (attrs.find(a => a.startsWith('samesite=')) || '').split('=')[1] || '' });
+        host.onCookie(); return;
+      }
+      super.set(k);
+    }
+  }
+  class LocationHost extends Host {
+    label() { return 'Location'; }
+    format() { return `Location {href: ${quote(host.href())}, origin: ${quote(base().origin)}, pathname: ${quote(base().pathname)}, …}`; }
+    get(k) {
+      const u = base();
+      if (k === 'href') return u.href;
+      if (['origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'].includes(k)) return u[k];
+      if (k === 'toString') return fn('toString', () => u.href);
+      return undefined;
+    }
+  }
+  class NavigatorHost extends Host {
+    label() { return 'Navigator'; }
+    get(k) {
+      return ({ userAgent: host.userAgent, language: 'ja-JP', languages: ['ja-JP', 'ja', 'en-US'], platform: 'Linux armv81', onLine: true, cookieEnabled: true, hardwareConcurrency: 8, maxTouchPoints: 5, webdriver: false, vendor: 'Google Inc.' })[k];
+    }
+  }
+  class ConsoleHost extends Host {
+    label() { return 'console'; }
+    get(k) {
+      if (['log', 'info', 'warn', 'error', 'debug'].includes(k)) return fn(k, (t, a) => { host.log(k === 'debug' ? 'log' : k, fmtLog(a)); });
+      if (k === 'clear') return fn('clear', () => host.log('clear', ''));
+      if (k === 'table') return fn('table', (t, a) => { host.log('log', fmtLog(a)); });
+      return undefined;
+    }
+  }
+  const documentH = new DocumentHost(), locationH = new LocationHost(), navigatorH = new NavigatorHost(), consoleH = new ConsoleHost();
+  const localH = new StorageHost('localStorage', host.local), sessionH = new StorageHost('sessionStorage', host.session);
+  class WindowHost extends Host {
+    label() { return 'Window'; }
+    format() { return 'Window {window: Window, self: Window, document: document, location: Location, …}'; }
+    get(k) {
+      const b = builtin(k); if (b !== undefined) return b;
+      return Object.prototype.hasOwnProperty.call(host.globals, k) ? host.globals[k] : undefined;
+    }
+    set(k, v) { if (BLOCKED.has(k)) return; host.globals[k] = v; }
+    keys() { return Object.keys(host.globals); }
+  }
+  const windowH = new WindowHost();
+
+  // ---------- 静的ビルトイン ----------
+  const ObjectNS = new (class extends Host {
+    label() { return 'Object'; }
+    get(k) {
+      const keysOf = (o) => (o instanceof Host ? o.keys() : Array.isArray(o) ? o.map((x, i) => String(i)) : isPlain(o) ? Object.keys(o) : o instanceof El ? [] : typeof o === 'string' ? [...o].map((x, i) => String(i)) : []);
+      const valOf = (o, k2) => (o instanceof Host ? o.get(k2) : o[k2]);
+      if (k === 'keys') return fn('keys', (t, a) => keysOf(a[0]));
+      if (k === 'values') return fn('values', (t, a) => keysOf(a[0]).map(x => valOf(a[0], x)));
+      if (k === 'entries') return fn('entries', (t, a) => keysOf(a[0]).map(x => [x, valOf(a[0], x)]));
+      return undefined;
+    }
+  })();
+  const ArrayNS = new (class extends Host {
+    label() { return 'Array'; }
+    get(k) {
+      if (k === 'isArray') return fn('isArray', (t, a) => Array.isArray(a[0]));
+      if (k === 'from') return fn('from', (t, a) => {
+        const v = a[0];
+        const arr = Array.isArray(v) ? [...v] : typeof v === 'string' ? [...v] : v instanceof Host ? v.keys().map(x => v.get(x)) : [];
+        return a[1] ? arr.map((x, i) => callFn(a[1], undefined, [x, i])) : arr;
+      });
+      return undefined;
+    }
+  })();
+  const JSONNS = new (class extends Host {
+    label() { return 'JSON'; }
+    get(k) {
+      if (k === 'parse') return fn('parse', (t, a) => { try { return JSON.parse(toStr(a[0])); } catch (e) { throw E('SyntaxError', e.message); } });
+      if (k === 'stringify') return fn('stringify', (t, a) => {
+        const plain = (v, d) => {
+          if (d > 8) return undefined;
+          if (v === undefined || v instanceof Arrow || v instanceof HostFn) return undefined;
+          if (v === null || typeof v !== 'object') return v;
+          if (v instanceof El || v instanceof Host) return v instanceof StorageHost ? Object.fromEntries(v.keys().map(x => [x, v.get(x)])) : {};
+          if (Array.isArray(v)) return v.map(x => plain(x, d + 1) ?? null);
+          const o = {}; for (const x of Object.keys(v)) { const p = plain(v[x], d + 1); if (p !== undefined) o[x] = p; } return o;
+        };
+        const sp = a[2] === undefined ? undefined : Math.min(8, toNum(a[2]) || 0);
+        return JSON.stringify(plain(a[0], 0), null, sp);
+      });
+      return undefined;
+    }
+  })();
+  const MathNS = new (class extends Host {
+    label() { return 'Math'; }
+    get(k) {
+      const m1 = { floor: Math.floor, ceil: Math.ceil, round: Math.round, abs: Math.abs, sqrt: Math.sqrt, trunc: Math.trunc, log: Math.log, sign: Math.sign };
+      if (m1[k]) return fn(k, (t, a) => m1[k](toNum(a[0])));
+      if (k === 'max' || k === 'min') return fn(k, (t, a) => Math[k](...a.map(toNum)));
+      if (k === 'pow') return fn('pow', (t, a) => Math.pow(toNum(a[0]), toNum(a[1])));
+      if (k === 'random') return fn('random', () => 0.5);
+      if (k === 'PI') return Math.PI;
+      return undefined;
+    }
+  })();
+  const GLOBAL_FNS = {
+    atob: (t, a) => atobImpl(toStr(a[0])), btoa: (t, a) => btoaImpl(toStr(a[0])),
+    parseInt: (t, a) => { const r = a[1] === undefined ? undefined : toNum(a[1]); return parseInt(toStr(a[0]), r); },
+    parseFloat: (t, a) => parseFloat(toStr(a[0])), isNaN: (t, a) => Number.isNaN(toNum(a[0])),
+    encodeURIComponent: (t, a) => encodeURIComponent(toStr(a[0])), decodeURIComponent: (t, a) => { try { return decodeURIComponent(toStr(a[0])); } catch { throw E('URIError', 'URI malformed'); } },
+    encodeURI: (t, a) => encodeURI(toStr(a[0])), String: (t, a) => toStr(a[0]), Number: (t, a) => toNum(a[0]), Boolean: (t, a) => truthy(a[0]),
+    $: (t, a) => wrap(H.querySelector(host.root(), toStr(a[0]))), $$: (t, a) => list(sel(host.root(), a[0])),
+  };
+  const builtins = {
+    document: documentH, window: windowH, self: windowH, globalThis: windowH, location: locationH, navigator: navigatorH, console: consoleH,
+    localStorage: localH, sessionStorage: sessionH, Object: ObjectNS, Array: ArrayNS, JSON: JSONNS, Math: MathNS, NaN, Infinity,
+  };
+  for (const [n, f] of Object.entries(GLOBAL_FNS)) builtins[n] = fn(n, f);
+  function builtin(name) { return Object.prototype.hasOwnProperty.call(builtins, name) ? builtins[name] : undefined; }
+
+  // ---------- 文字列/配列/数値メソッド ----------
+  const argN = (a, i, d) => (a[i] === undefined ? d : toNum(a[i]));
+  const STR = {
+    split: (s, a) => (a[0] === undefined ? [s] : s.split(toStr(a[0]), a[1] === undefined ? undefined : toNum(a[1]))),
+    slice: (s, a) => s.slice(argN(a, 0, 0), a[1] === undefined ? undefined : toNum(a[1])),
+    substring: (s, a) => s.substring(argN(a, 0, 0), a[1] === undefined ? undefined : toNum(a[1])),
+    substr: (s, a) => s.substr(argN(a, 0, 0), a[1] === undefined ? undefined : toNum(a[1])),
+    toUpperCase: (s) => s.toUpperCase(), toLowerCase: (s) => s.toLowerCase(), trim: (s) => s.trim(), trimStart: (s) => s.trimStart(), trimEnd: (s) => s.trimEnd(),
+    includes: (s, a) => s.includes(toStr(a[0])), indexOf: (s, a) => s.indexOf(toStr(a[0])), lastIndexOf: (s, a) => s.lastIndexOf(toStr(a[0])),
+    startsWith: (s, a) => s.startsWith(toStr(a[0])), endsWith: (s, a) => s.endsWith(toStr(a[0])),
+    replace: (s, a) => s.replace(toStr(a[0]), () => toStr(a[1])), replaceAll: (s, a) => s.split(toStr(a[0])).join(toStr(a[1])),
+    charAt: (s, a) => s.charAt(argN(a, 0, 0)), charCodeAt: (s, a) => s.charCodeAt(argN(a, 0, 0)), at: (s, a) => s.at(argN(a, 0, 0)),
+    padStart: (s, a) => s.padStart(Math.min(200, argN(a, 0, 0)), a[1] === undefined ? ' ' : toStr(a[1])), padEnd: (s, a) => s.padEnd(Math.min(200, argN(a, 0, 0)), a[1] === undefined ? ' ' : toStr(a[1])),
+    repeat: (s, a) => s.repeat(Math.min(500, Math.max(0, argN(a, 0, 0)))), concat: (s, a) => s + a.map(toStr).join(''), toString: (s) => s,
+  };
+  const ARR = {
+    map: (r, a) => r.map((x, i) => callFn(a[0], undefined, [x, i, r])), filter: (r, a) => r.filter((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))),
+    forEach: (r, a) => { r.forEach((x, i) => callFn(a[0], undefined, [x, i, r])); }, find: (r, a) => r.find((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))),
+    findIndex: (r, a) => r.findIndex((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))), some: (r, a) => r.some((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))),
+    every: (r, a) => r.every((x, i) => truthy(callFn(a[0], undefined, [x, i, r]))), join: (r, a) => r.map(x => (x === null || x === undefined ? '' : toStr(x))).join(a[0] === undefined ? ',' : toStr(a[0])),
+    slice: (r, a) => r.slice(argN(a, 0, 0), a[1] === undefined ? undefined : toNum(a[1])), concat: (r, a) => r.concat(...a.map(x => (Array.isArray(x) ? [...x] : [x]))),
+    includes: (r, a) => r.includes(a[0]), indexOf: (r, a) => r.indexOf(a[0]), at: (r, a) => r.at(argN(a, 0, 0)), push: (r, a) => r.push(...a), pop: (r) => r.pop(),
+    reverse: (r) => r.reverse(), reduce: (r, a) => (a.length > 1 ? r.reduce((acc, x, i) => callFn(a[0], undefined, [acc, x, i, r]), a[1]) : r.reduce((acc, x, i) => callFn(a[0], undefined, [acc, x, i, r]))),
+    sort: (r, a) => r.sort(a[0] === undefined ? (x, y) => (toStr(x) < toStr(y) ? -1 : toStr(x) > toStr(y) ? 1 : 0) : (x, y) => toNum(callFn(a[0], undefined, [x, y]))),
+    flat: (r) => r.flat(), toString: (r) => toStr(r),
+  };
+  const NUM = { toFixed: (n, a) => n.toFixed(Math.min(20, Math.max(0, argN(a, 0, 0)))), toString: (n, a) => n.toString(a[0] === undefined ? 10 : toNum(a[0])) };
+
+  // ---------- Element ----------
+  function elGet(el, k) {
+    const n = el.node;
+    if (k === 'tagName' || k === 'nodeName') return n.tag.toUpperCase();
+    if (k === 'localName') return n.tag;
+    if (ATTR_PROPS[k]) { const a = ATTR_PROPS[k]; const v = n.attrs[a]; if (v === undefined) return ''; return (k === 'href' || k === 'src' || k === 'action') ? resolveUrl(v) : v; }
+    if (BOOL_PROPS[k]) return n.attrs[BOOL_PROPS[k]] !== undefined;
+    switch (k) {
+      case 'textContent': return H.textContent(n);
+      case 'innerText': return H.innerText(n);
+      case 'innerHTML': return H.innerHTML(n);
+      case 'outerHTML': return H.outerHTML(n);
+      case 'children': return list(n.children.filter(c => c.t === 'el'));
+      case 'childElementCount': return n.children.filter(c => c.t === 'el').length;
+      case 'firstElementChild': return wrap(n.children.find(c => c.t === 'el') || null);
+      case 'lastElementChild': return wrap([...n.children].reverse().find(c => c.t === 'el') || null);
+      case 'parentElement': case 'parentNode': return n.parent && n.parent.tag !== '#document' ? wrap(n.parent) : null;
+      case 'nextElementSibling': { const s = (n.parent ? n.parent.children : []).filter(c => c.t === 'el'); return wrap(s[s.indexOf(n) + 1] || null); }
+      case 'previousElementSibling': { const s = (n.parent ? n.parent.children : []).filter(c => c.t === 'el'); return wrap(s[s.indexOf(n) - 1] || null); }
+      case 'classList': return Object.assign((n.attrs.class || '').split(/\s+/).filter(Boolean), {});
+      case 'attributes': return Object.entries(n.attrs).map(([name, value]) => ({ name, value }));
+      case 'dataset': { const o = {}; for (const [a, v] of Object.entries(n.attrs)) if (a.startsWith('data-')) o[camel(a.slice(5))] = v; return o; }
+      case 'style': return new StyleHost(n);
+      case 'getAttribute': return fn('getAttribute', (t, a) => (n.attrs[toStr(a[0]).toLowerCase()] ?? null));
+      case 'setAttribute': return fn('setAttribute', (t, a) => { n.attrs[toStr(a[0]).toLowerCase()] = toStr(a[1]); host.onDom(); });
+      case 'removeAttribute': return fn('removeAttribute', (t, a) => { delete n.attrs[toStr(a[0]).toLowerCase()]; host.onDom(); });
+      case 'hasAttribute': return fn('hasAttribute', (t, a) => n.attrs[toStr(a[0]).toLowerCase()] !== undefined);
+      case 'getAttributeNames': return fn('getAttributeNames', () => Object.keys(n.attrs));
+      case 'querySelector': return fn('querySelector', (t, a) => wrap(H.querySelector(n, toStr(a[0]))));
+      case 'querySelectorAll': return fn('querySelectorAll', (t, a) => list(sel(n, a[0])));
+      case 'closest': return fn('closest', (t, a) => wrap(H.closest(n, toStr(a[0]))));
+      case 'matches': return fn('matches', (t, a) => H.matches(n, toStr(a[0])));
+      case 'remove': return fn('remove', () => { H.removeNode(n); host.onDom(); });
+      case 'click': return fn('click', () => { host.log('log', `click() → ${H.openTag(n)}`); });
+      case 'contains': return fn('contains', (t, a) => { for (let x = a[0] instanceof El ? a[0].node : null; x; x = x.parent) if (x === n) return true; return false; });
+      default: return undefined;
+    }
+  }
+  function elSet(el, k, v) {
+    const n = el.node;
+    if (ATTR_PROPS[k]) { n.attrs[ATTR_PROPS[k]] = toStr(v); host.onDom(); return; }
+    if (BOOL_PROPS[k]) { if (truthy(v)) n.attrs[BOOL_PROPS[k]] = ''; else delete n.attrs[BOOL_PROPS[k]]; host.onDom(); return; }
+    if (k === 'textContent' || k === 'innerText') { n.children = [{ t: 'text', text: toStr(v), parent: n, uid: H.nextUid() }]; host.onDom(); return; }
+    if (k === 'innerHTML') {
+      const frag = H.parseHtml(toStr(v));
+      n.children = frag.children; n.children.forEach(c => { c.parent = n; }); host.onDom(); return;
+    }
+    throw E('TypeError', `Cannot set property '${k}' of ${elLabel(n)}`);
+  }
+
+  // ---------- プロパティ取得/設定/呼び出し ----------
+  function getProp(obj, key, describe) {
+    if (obj === null || obj === undefined) throw E('TypeError', `Cannot read properties of ${obj === null ? 'null' : 'undefined'} (reading '${String(key)}')`);
+    key = typeof key === 'number' ? String(key) : key;
+    if (typeof key !== 'string') key = toStr(key);
+    if (BLOCKED.has(key)) return undefined;
+    if (typeof obj === 'string') {
+      if (key === 'length') return obj.length;
+      if (/^\d+$/.test(key)) return obj[Number(key)];
+      return STR[key] ? fn(key, (t, a) => STR[key](obj, a)) : undefined;
+    }
+    if (typeof obj === 'number') return NUM[key] ? fn(key, (t, a) => NUM[key](obj, a)) : undefined;
+    if (typeof obj === 'boolean') return undefined;
+    if (obj instanceof El) return elGet(obj, key);
+    if (obj instanceof Host) return obj.get(key);
+    if (Array.isArray(obj)) {
+      if (key === 'length') return obj.length;
+      if (/^\d+$/.test(key)) return obj[Number(key)];
+      if (obj.__classList && key === 'contains') return undefined;
+      if (key === 'item' && obj instanceof NodeListV) return fn('item', (t, a) => obj[toNum(a[0])] ?? null);
+      if (key === 'contains' && !ARR.contains) return fn('contains', (t, a) => obj.includes(toStr(a[0])));
+      return ARR[key] ? fn(key, (t, a) => ARR[key](obj, a)) : undefined;
+    }
+    if (isPlain(obj)) return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+    return undefined;
+  }
+  function setProp(obj, key, val) {
+    if (obj === null || obj === undefined) throw E('TypeError', `Cannot set properties of ${obj === null ? 'null' : 'undefined'} (setting '${String(key)}')`);
+    key = typeof key === 'string' ? key : toStr(key);
+    if (BLOCKED.has(key)) return;
+    if (obj instanceof El) return elSet(obj, key, val);
+    if (obj instanceof Host) return obj.set(key, val);
+    if (Array.isArray(obj)) { if (/^\d+$/.test(key)) obj[Number(key)] = val; return; }
+    if (isPlain(obj)) { obj[key] = val; }
+  }
+  function callFn(f, thisVal, args, text) {
+    if (f instanceof HostFn) return f.fn(thisVal, args);
+    if (f instanceof Arrow) {
+      if (++depth > MAX_DEPTH) { depth = 0; throw E('RangeError', 'Maximum call stack size exceeded'); }
+      try {
+        const scope = { vars: new Map(), parent: f.scope };
+        f.params.forEach((p, i) => scope.vars.set(p, { v: args[i], c: false }));
+        return ev(f.body, scope);
+      } finally { depth--; }
+    }
+    throw E('TypeError', `${text || toStr(f)} is not a function`);
+  }
+
+  // ---------- 評価 ----------
+  const lookup = (name, scope) => {
+    for (let s = scope; s; s = s.parent) if (s.vars.has(name)) return s.vars.get(name).v;
+    const b = builtin(name); if (b !== undefined) return b;
+    if (Object.prototype.hasOwnProperty.call(host.globals, name)) return host.globals[name];
+    throw E('ReferenceError', `${name} is not defined`);
+  };
+  const looseEq = (a, b) => {
+    const prim = (x) => x === null || x === undefined || typeof x !== 'object' && typeof x !== 'function';
+    if (prim(a) && prim(b)) return a == b; // eslint-disable-line eqeqeq
+    return a === b;
+  };
+  function ev(n, scope) {
+    if (++steps > MAX_STEPS) throw E('RangeError', '実行ステップ数の上限を超えました');
+    switch (n.k) {
+      case 'num': case 'str': return n.v;
+      case 'lit': return n.v;
+      case 'group': return ev(n.e, scope);
+      case 'tpl': return n.quasis.reduce((acc, q, i) => acc + q + (i < n.exprs.length ? toStr(ev(n.exprs[i], scope)) : ''), '');
+      case 'array': return n.items.map(x => ev(x, scope));
+      case 'object': { const o = {}; for (const p of n.props) if (!BLOCKED.has(p.key)) o[p.key] = ev(p.value, scope); return o; }
+      case 'id': return lookup(n.name, scope);
+      case 'member': { const o = ev(n.obj, scope); if (n.optional && (o === null || o === undefined)) return undefined; return getProp(o, n.name); }
+      case 'index': { const o = ev(n.obj, scope); if (n.optional && (o === null || o === undefined)) return undefined; return getProp(o, ev(n.idx, scope)); }
+      case 'call': {
+        let thisVal, f;
+        if (n.callee.k === 'member' || n.callee.k === 'index') {
+          thisVal = ev(n.callee.obj, scope);
+          if (n.callee.optional && (thisVal === null || thisVal === undefined)) return undefined;
+          f = getProp(thisVal, n.callee.k === 'member' ? n.callee.name : ev(n.callee.idx, scope));
+        } else f = ev(n.callee, scope);
+        if (n.optional && (f === null || f === undefined)) return undefined;
+        const text = n.src ? n.src : undefined;
+        return callFn(f, thisVal, n.args.map(a => ev(a, scope)), calleeText(n.callee));
+      }
+      case 'arrow': return new Arrow(n.params, n.body, scope, srcSlice(n));
+      case 'unary': {
+        if (n.op === 'typeof') { let v; try { v = ev(n.e, scope); } catch (e) { if (e instanceof ReplError && e.errName === 'ReferenceError') return 'undefined'; throw e; } return v === null ? 'object' : (v instanceof Arrow || v instanceof HostFn) ? 'function' : typeof v === 'object' || v instanceof Host ? 'object' : typeof v; }
+        const v = ev(n.e, scope);
+        return n.op === '!' ? !truthy(v) : n.op === '-' ? -toNum(v) : toNum(v);
+      }
+      case 'bin': {
+        if (n.op === '&&') { const l = ev(n.l, scope); return truthy(l) ? ev(n.r, scope) : l; }
+        if (n.op === '||') { const l = ev(n.l, scope); return truthy(l) ? l : ev(n.r, scope); }
+        if (n.op === '??') { const l = ev(n.l, scope); return l === null || l === undefined ? ev(n.r, scope) : l; }
+        const l = ev(n.l, scope), r = ev(n.r, scope);
+        switch (n.op) {
+          case '+': return typeof l === 'string' || typeof r === 'string' || typeof l === 'object' && l !== null || typeof r === 'object' && r !== null ? toStr(l) + toStr(r) : toNum(l) + toNum(r);
+          case '-': return toNum(l) - toNum(r);
+          case '*': return toNum(l) * toNum(r);
+          case '%': return toNum(l) % toNum(r);
+          case '===': return l === r;
+          case '!==': return l !== r;
+          case '==': return looseEq(l, r);
+          case '!=': return !looseEq(l, r);
+          case '<': return (typeof l === 'string' && typeof r === 'string') ? l < r : toNum(l) < toNum(r);
+          case '>': return (typeof l === 'string' && typeof r === 'string') ? l > r : toNum(l) > toNum(r);
+          case '<=': return (typeof l === 'string' && typeof r === 'string') ? l <= r : toNum(l) <= toNum(r);
+          default: return (typeof l === 'string' && typeof r === 'string') ? l >= r : toNum(l) >= toNum(r);
+        }
+      }
+      case 'cond': return truthy(ev(n.c, scope)) ? ev(n.a, scope) : ev(n.b, scope);
+      case 'assign': return assign(n, scope);
+      default: throw E('SyntaxError', `未対応の式: ${n.k}`);
+    }
+  }
+  let curSrc = '';
+  const srcSlice = (n) => (n.s !== undefined && n.e !== undefined ? curSrc.slice(n.s, n.e) : 'ƒ');
+  function calleeText(c) { return srcSlice(c) !== 'ƒ' ? srcSlice(c) : c.k === 'id' ? c.name : 'expression'; }
+  function assign(n, scope) {
+    const t = n.target;
+    let val;
+    const cur = () => (t.k === 'id' ? lookup(t.name, scope) : t.k === 'member' ? getProp(ev(t.obj, scope), t.name) : getProp(ev(t.obj, scope), ev(t.idx, scope)));
+    if (n.op === '=') val = ev(n.value, scope);
+    else { const a = cur(), b = ev(n.value, scope); val = n.op === '+=' ? (typeof a === 'string' || typeof b === 'string' ? toStr(a) + toStr(b) : toNum(a) + toNum(b)) : toNum(a) - toNum(b); }
+    if (t.k === 'id') {
+      for (let s = scope; s; s = s.parent) if (s.vars.has(t.name)) { const e = s.vars.get(t.name); if (e.c) throw E('TypeError', 'Assignment to constant variable.'); e.v = val; return val; }
+      topScope.vars.set(t.name, { v: val, c: false }); return val;
+    }
+    const obj = ev(t.obj, scope);
+    setProp(obj, t.k === 'member' ? t.name : ev(t.idx, scope), val);
+    return val;
+  }
+  function execStmt(st) {
+    if (st.k === 'decl') {
+      if (topScope.vars.has(st.name) && topScope.vars.get(st.name).kind !== 'var' && st.kind !== 'var') { /* 再宣言はREPLでは許容 */ }
+      topScope.vars.set(st.name, { v: st.init ? ev(st.init, topScope) : undefined, c: st.kind === 'const', kind: st.kind });
+      return undefined;
+    }
+    return ev(st.e, topScope);
+  }
+
+  return {
+    vars: topScope.vars,
+    /** 1行(複数文可)を実行。{ ok, text, value } / { ok:false, name, message, text } */
+    run(text) {
+      steps = 0; depth = 0; curSrc = text;
+      try {
+        const prog = parse(text);
+        let val;
+        for (const st of prog) val = execStmt(st);
+        return { ok: true, value: val, text: fmt(val) };
+      } catch (e) {
+        if (e instanceof ParseError || e instanceof ReplError) return { ok: false, name: e.errName, message: e.message, text: `Uncaught ${e.errName}: ${e.message}` };
+        throw e;
+      }
+    },
+    fmt, wrap,
+  };
+}
+
+Object.assign(exports, { ReplError, El, toStr, elLabel, fmt, cookieString, createRepl });
+
+};
+__mods["js/vb/session.js"] = function (module, exports, __require) {
+// ============================================================
+// 仮想ブラウザのセッション: 1ミッション分の「架空ページ」と DevTools の状態を保持する。
+// 実際のネットワークには一切アクセスしない（すべてミッション定義のデータ）。
+// def = { url, userAgent?, html, console[], network[], storage{local,session,cookies[]},
+//         sources{path:text}, breakpoints{"file:line":{scope,stack}}, globals{}, security{}, issues[], perf{}, tabs[] }
+// ============================================================
+const H = __require("js/vb/html.js");
+const { createRepl, cookieString } = __require("js/vb/jsrepl.js");
+
+const DEFAULT_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+const ALL_TABS = ['elements', 'console', 'network', 'sources', 'application', 'security', 'performance'];
+const TAB_LABEL = { elements: 'Elements', console: 'Console', network: 'Network', sources: 'Sources', application: 'Application', security: 'Security', performance: 'Performance' };
+
+const STATUS_TEXT = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed', 429: 'Too Many Requests', 500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable' };
+const THROTTLES = { none: { label: 'No throttling', f: 1 }, fast4g: { label: 'Fast 4G', f: 2 }, slow4g: { label: 'Slow 4G', f: 5 }, offline: { label: 'Offline', f: null } };
+
+const clone = (o) => JSON.parse(JSON.stringify(o));
+
+function formatBytes(n) {
+  if (n == null) return '-';
+  if (n < 1000) return `${n} B`;
+  if (n < 1e6) return `${(n / 1000).toFixed(n < 1e4 ? 1 : 0)} kB`;
+  return `${(n / 1e6).toFixed(1)} MB`;
+}
+function formatMs(ms) { return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`; }
+
+function guessType(r) {
+  if (r.type) return r.type;
+  const m = (r.mime || '').toLowerCase(), u = r.url.split('?')[0].toLowerCase();
+  if (/html/.test(m) || /\.html?$/.test(u)) return 'document';
+  if (/javascript/.test(m) || /\.m?js$/.test(u)) return 'script';
+  if (/css/.test(m) || /\.css$/.test(u)) return 'stylesheet';
+  if (/^image\//.test(m) || /\.(png|jpe?g|gif|webp|svg|ico)$/.test(u)) return 'img';
+  if (/font/.test(m) || /\.(woff2?|ttf)$/.test(u)) return 'font';
+  if (/json/.test(m)) return 'fetch';
+  return 'other';
+}
+
+function createSession(def) {
+  const root = H.parseHtml(def.html || '<html><body></body></html>');
+  const page = new URL(def.url);
+  const ses = {
+    def, root, page,
+    tabs: def.tabs && def.tabs.length ? def.tabs : ALL_TABS,
+    cookies: clone((def.storage && def.storage.cookies) || []),
+    local: clone((def.storage && def.storage.local) || {}),
+    session: clone((def.storage && def.storage.session) || {}),
+    globals: clone(def.globals || {}),
+    consoleLog: [],          // { level, text, source?, nav? }
+    replHistory: [],         // 実行した式（デバッグ状態の判定に使う）
+    state: { visited: new Set(['elements']), breakpoints: [], paused: null, pausedOnce: [], filtersUsed: new Set(), viewedRequests: new Set(), searches: [], throttle: 'none', domEdits: 0, storageEdits: 0, sourcesOpened: new Set(), prettyPrinted: new Set(), networkFilter: 'all' },
+    listeners: new Set(),
+    userAgent: def.userAgent || DEFAULT_UA,
+    domVersion: 0,
+  };
+  const notify = (what) => { ses.domVersion++; for (const f of ses.listeners) f(what); };
+  for (const m of (def.console || [])) ses.consoleLog.push({ level: m.level || 'log', text: m.text, source: m.source || null, nav: m.nav || null });
+
+  // ---- ネットワーク: 正規化 ----
+  ses.requests = (def.network || []).map((r, i) => {
+    const u = new URL(r.url, page);
+    const type = guessType(r);
+    const name = (u.pathname.split('/').filter(Boolean).pop() || u.hostname) + (u.search && type === 'fetch' ? '' : '');
+    return {
+      id: r.id || `r${i + 1}`, idx: i, method: r.method || 'GET', url: u.href, host: u.host, path: u.pathname + u.search, name, type,
+      status: r.failed ? 0 : (r.status ?? 200), statusText: r.failed ? '(failed)' : (r.statusText || STATUS_TEXT[r.status ?? 200] || ''),
+      failed: r.failed || null, blocked: r.blocked || null, mime: r.mime || '', initiator: r.initiator || '', protocol: r.protocol || 'h2', remote: r.remote || '',
+      size: r.size ?? 0, resourceSize: r.resourceSize ?? r.size ?? 0, time: r.time ?? 50, start: r.start ?? 0, fromCache: !!r.fromCache,
+      reqHeaders: r.reqHeaders || {}, resHeaders: r.resHeaders || {}, reqBody: r.reqBody || '', resBody: r.resBody ?? '', note: r.note || '',
+      params: [...u.searchParams.entries()],
+      thirdParty: u.host !== page.host,
+    };
+  });
+
+  // ---- 実行系(Console) ----
+  const repl = createRepl({
+    root: () => root, href: () => page.href, userAgent: ses.userAgent, cookies: ses.cookies, local: ses.local, session: ses.session, globals: ses.globals,
+    log: (level, text) => { if (level === 'clear') ses.consoleLog.length = 0; else ses.consoleLog.push({ level, text, source: 'VM:1' }); notify('console'); },
+    onDom: () => { ses.state.domEdits++; notify('dom'); }, onStorage: () => { ses.state.storageEdits++; notify('storage'); }, onCookie: () => { ses.state.storageEdits++; notify('storage'); },
+  });
+  ses.repl = repl;
+  ses.runConsole = (text) => {
+    const t = text.trim(); if (!t) return null;
+    ses.replHistory.push(t);
+    ses.consoleLog.push({ level: 'input', text: t });
+    let r;
+    try { r = repl.run(t); } catch (e) { r = { ok: false, name: 'Error', message: String(e && e.message || e), text: `Uncaught Error: ${e && e.message}` }; }
+    ses.consoleLog.push({ level: r.ok ? 'result' : 'error', text: r.text, source: r.ok ? null : 'VM:1' });
+    notify('console');
+    return r;
+  };
+
+  // ---- Elements ----
+  ses.isHidden = H.isHidden;
+  ses.querySelector = (s) => { try { return H.querySelector(root, s); } catch { return null; } };
+  ses.querySelectorAll = (s) => { try { return H.querySelectorAll(root, s); } catch { return []; } };
+  ses.editAttr = (node, name, value) => { if (value === null) delete node.attrs[name]; else node.attrs[name] = value; ses.state.domEdits++; notify('dom'); };
+  ses.setTitle = () => {};
+
+  // ---- Cookie / Storage ----
+  ses.documentCookie = () => cookieString(ses.cookies);
+  ses.removeCookie = (name) => { ses.cookies = ses.cookies.filter(c => c.name !== name); ses.state.storageEdits++; notify('storage'); };
+  ses.removeStorage = (kind, key) => { delete ses[kind][key]; ses.state.storageEdits++; notify('storage'); };
+
+  // ---- Sources ----
+  ses.sourceFiles = () => Object.keys(def.sources || {});
+  ses.sourceText = (f) => (def.sources || {})[f] ?? '';
+  ses.searchSources = (q, { regex = false, caseSensitive = false } = {}) => {
+    const out = [];
+    if (!q) return out;
+    let re = null;
+    if (regex) { if (q.length > 80) return out; try { re = new RegExp(q, caseSensitive ? '' : 'i'); } catch { return out; } }
+    for (const f of ses.sourceFiles()) {
+      const lines = ses.sourceText(f).split('\n');
+      lines.forEach((l, i) => { const hit = re ? re.test(l) : (caseSensitive ? l.includes(q) : l.toLowerCase().includes(q.toLowerCase())); if (hit) out.push({ file: f, line: i + 1, text: l.trim().slice(0, 160) }); });
+    }
+    ses.state.searches.push(q);
+    return out;
+  };
+  ses.toggleBreakpoint = (file, line) => {
+    const i = ses.state.breakpoints.findIndex(b => b.file === file && b.line === line);
+    if (i >= 0) { ses.state.breakpoints.splice(i, 1); if (ses.state.paused && ses.state.paused.file === file && ses.state.paused.line === line) ses.state.paused = null; notify('bp'); return null; }
+    ses.state.breakpoints.push({ file, line });
+    const hit = (def.breakpoints || {})[`${file}:${line}`];
+    ses.state.paused = hit ? { file, line, scope: hit.scope || {}, stack: hit.stack || [], note: hit.note || '' } : null;
+    if (hit) ses.state.pausedOnce.push({ file, line });
+    notify('bp');
+    return hit ? 'paused' : 'set';
+  };
+  ses.resume = () => { ses.state.paused = null; notify('bp'); };
+
+  // ---- Network ----
+  // UI と同じ状態変更を行う操作（ミッションの solution 検証用にも使う）
+  ses.setFilter = (k) => { ses.state.networkFilter = k; ses.state.filtersUsed.add(k); notify('network'); };
+  ses.setThrottle = (k) => { if (THROTTLES[k]) { ses.state.throttle = k; notify('network'); } };
+  ses.openRequest = (id) => { ses.state.viewedRequests.add(id); notify('network'); };
+  ses.openSource = (f) => { ses.state.sourcesOpened.add(f); };
+  ses.prettyPrint = (f) => { ses.state.prettyPrinted.add(f); };
+  ses.throttledTime = (r) => { const f = THROTTLES[ses.state.throttle].f; return f == null ? null : r.time * f; };
+  ses.networkSummary = () => {
+    const f = THROTTLES[ses.state.throttle].f;
+    if (f == null) return { count: ses.requests.length, transferred: 0, resources: 0, finish: null };
+    let finish = 0, transferred = 0, resources = 0;
+    for (const r of ses.requests) { finish = Math.max(finish, (r.start + r.time) * f); transferred += r.fromCache ? 0 : r.size; resources += r.resourceSize; }
+    return { count: ses.requests.length, transferred, resources, finish };
+  };
+
+  // ---- Issues / Security / Performance ----
+  ses.issues = () => {
+    const list = [];
+    const https = page.protocol === 'https:';
+    for (const r of ses.requests) {
+      if (https && r.url.startsWith('http://') && !r.blocked) list.push({ kind: 'mixed', severity: 'warning', title: `混在コンテンツ: HTTPSページが安全でないリソースを読み込んでいます`, detail: r.url, why: 'HTTPSのページ内にHTTPのリソースがあると、その部分は盗聴・改ざんされうる。ブラウザはスクリプトなどを自動でブロックする。' });
+      if (r.blocked) list.push({ kind: r.blocked, severity: 'error', title: r.blocked === 'csp' ? 'Content Security Policy によりブロックされました' : r.blocked === 'cors' ? 'CORS ポリシーによりブロックされました' : 'ブロックされました', detail: r.url, why: r.note || '' });
+    }
+    for (const c of ses.cookies) {
+      if (https && !c.secure) list.push({ kind: 'cookie', severity: 'warning', title: `Cookie '${c.name}' に Secure 属性がありません`, detail: c.name, why: 'Secure が無いCookieは、HTTP(暗号化されていない通信)でも送信されうる。' });
+      if (!c.httpOnly && /sess|token|auth|sid/i.test(c.name)) list.push({ kind: 'cookie', severity: 'warning', title: `認証用らしい Cookie '${c.name}' に HttpOnly 属性がありません`, detail: c.name, why: 'HttpOnly が無いと、XSSなどでJavaScriptから読み取られて盗まれる恐れがある。' });
+      if (!c.sameSite) list.push({ kind: 'cookie', severity: 'info', title: `Cookie '${c.name}' に SameSite 属性がありません`, detail: c.name, why: 'SameSite の指定が無いと、他サイトからのリクエストにCookieが付く挙動(CSRFの足がかり)になりうる。' });
+    }
+    for (const i of (def.issues || [])) list.push(i);
+    return list;
+  };
+  ses.security = () => Object.assign({ https: page.protocol === 'https:', protocol: 'TLS 1.3', cert: null }, def.security || {});
+  ses.perf = () => Object.assign({ fcp: null, lcp: null, cls: null, tbt: null, lcpElement: '' }, def.perf || {});
+
+  ses.subscribe = (f) => { ses.listeners.add(f); return () => ses.listeners.delete(f); };
+  ses.visit = (tab) => { ses.state.visited.add(tab); };
+  return ses;
+}
+
+Object.assign(exports, { DEFAULT_UA, ALL_TABS, TAB_LABEL, THROTTLES, formatBytes, formatMs, createSession });
+
+};
+__mods["js/dt/elements.js"] = function (module, exports, __require) {
+// DevTools: Elements パネル（DOMツリーの閲覧と編集）
+const { el, clear } = __require("js/util.js");
+const { elLabel } = __require("js/vb/jsrepl.js");
+const H = __require("js/vb/html.js");
+
+const VOID = new Set(['img', 'input', 'br', 'hr', 'meta', 'link']);
+
+function renderElements(host, ses, ui) {
+  clear(host);
+  const open = ui.elOpen || (ui.elOpen = new Set());
+  if (!ui.elInit) {
+    // 既定で html → head/body までを展開（深い階層は自分で開いてもらう）
+    const html = H.querySelector(ses.root, 'html');
+    if (html) { open.add(html.uid); for (const c of html.children) if (c.t === 'el') open.add(c.uid); }
+    ui.elInit = true;
+  }
+  const search = el('input', { class: 'dt-input', type: 'search', placeholder: '検索（セレクタ・テキスト・属性値）', value: ui.elSearch || '', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+  const counter = el('span', { class: 'dt-muted' });
+  const sel = ui.elSelected && ui.elSelected.parent !== null ? ui.elSelected : null;
+  const matchSet = new Set();
+  const q = (ui.elSearch || '').trim();
+  if (q) {
+    let byCss = [];
+    try { byCss = H.querySelectorAll(ses.root, q); } catch { /* セレクタではない */ }
+    const ql = q.toLowerCase();
+    for (const n of H.allNodes(ses.root)) {
+      if (byCss.includes(n)) { matchSet.add(n); continue; }
+      if (n.t === 'text' && n.text.toLowerCase().includes(ql)) matchSet.add(n);
+      else if (n.t === 'comment' && n.text.toLowerCase().includes(ql)) matchSet.add(n);
+      else if (n.t === 'el' && (n.tag.includes(ql) || Object.entries(n.attrs).some(([k, v]) => k.includes(ql) || v.toLowerCase().includes(ql)))) matchSet.add(n);
+    }
+    // 一致ノードの祖先を展開する
+    for (const n of matchSet) for (let p = n.parent; p; p = p.parent) open.add(p.uid);
+    counter.textContent = `${matchSet.size} 件`;
+  }
+  search.addEventListener('input', () => { ui.elSearch = search.value; ui.rerender('elements', true); });
+
+  const tree = el('div', { class: 'dt-tree', role: 'tree' });
+  const renderNode = (n, depth, into) => {
+    const pad = Math.min(depth, 8) * 12;
+    if (n.t === 'text') {
+      const t = n.text.replace(/\s+/g, ' ').trim();
+      if (!t) return;
+      const raw = n.parent && ['script', 'style'].includes(n.parent.tag);
+      into.appendChild(el('div', { class: 'dt-row dt-text' + (matchSet.has(n) ? ' hit' : ''), style: `padding-left:${pad + 16}px` }, [el('span', { class: 'dt-txt', text: raw ? n.text.trim().slice(0, 160) : t })]));
+      return;
+    }
+    if (n.t === 'comment') {
+      into.appendChild(el('div', { class: 'dt-row dt-comment' + (matchSet.has(n) ? ' hit' : ''), style: `padding-left:${pad + 16}px` }, [el('span', { text: `<!--${n.text}-->` })]));
+      return;
+    }
+    const kids = n.children.filter(c => !(c.t === 'text' && !c.text.trim()));
+    const expandable = kids.length > 0 && !VOID.has(n.tag);
+    const isOpen = open.has(n.uid);
+    const hidden = H.selfHidden(n);
+    const row = el('div', { class: 'dt-row dt-el' + (sel === n ? ' sel' : '') + (hidden ? ' hidden-el' : '') + (matchSet.has(n) ? ' hit' : ''), style: `padding-left:${pad}px` });
+    const arrow = el('span', { class: 'dt-arrow', text: expandable ? (isOpen ? '▾' : '▸') : '' });
+    arrow.addEventListener('click', (e) => { e.stopPropagation(); if (!expandable) return; if (open.has(n.uid)) open.delete(n.uid); else open.add(n.uid); ui.rerender('elements', true); });
+    row.appendChild(arrow);
+    const tag = el('span', { class: 'dt-tag' });
+    tag.appendChild(document.createTextNode('<'));
+    tag.appendChild(el('span', { class: 'dt-tagname', text: n.tag }));
+    for (const [k, v] of Object.entries(n.attrs)) {
+      tag.appendChild(document.createTextNode(' '));
+      tag.appendChild(el('span', { class: 'dt-attrname', text: k }));
+      if (v !== '') { tag.appendChild(document.createTextNode('="')); tag.appendChild(el('span', { class: 'dt-attrval', text: v.length > 80 ? v.slice(0, 80) + '…' : v })); tag.appendChild(document.createTextNode('"')); }
+    }
+    tag.appendChild(document.createTextNode('>'));
+    row.appendChild(tag);
+    if (expandable && !isOpen) row.appendChild(el('span', { class: 'dt-muted', text: ' …' }));
+    if (!expandable && !VOID.has(n.tag)) row.appendChild(el('span', { class: 'dt-tag', text: `</${n.tag}>` }));
+    if (hidden) row.appendChild(el('span', { class: 'dt-badge', text: '非表示' }));
+    row.addEventListener('click', () => { ui.elSelected = n; ui.rerender('elements', true); });
+    into.appendChild(row);
+    if (expandable && isOpen) {
+      for (const c of n.children) renderNode(c, depth + 1, into);
+      into.appendChild(el('div', { class: 'dt-row dt-el', style: `padding-left:${pad}px` }, [el('span', { class: 'dt-arrow' }), el('span', { class: 'dt-tag', text: `</${n.tag}>` })]));
+    }
+  };
+  for (const c of ses.root.children) renderNode(c, 0, tree);
+
+  host.appendChild(el('div', { class: 'dt-toolbar' }, [search, counter]));
+  host.appendChild(tree);
+  host.appendChild(selectedPane(ses, ui, sel));
+}
+
+function selectedPane(ses, ui, n) {
+  const box = el('div', { class: 'dt-pane' });
+  if (!n) { box.appendChild(el('div', { class: 'dt-hint', text: '行をタップして要素を選ぶと、属性の確認と編集ができます。' })); return box; }
+  box.appendChild(el('div', { class: 'dt-pane-title', text: elLabel(n) }));
+  box.appendChild(el('div', { class: 'dt-kv' }, [
+    el('span', { class: 'dt-k', text: '表示状態' }),
+    el('span', { class: 'dt-v', text: H.isHidden(n) ? '画面には表示されません（非表示）' : '画面に表示されます' }),
+  ]));
+  const attrs = Object.entries(n.attrs);
+  box.appendChild(el('div', { class: 'dt-subhead', text: `属性（${attrs.length}）— タップして編集` }));
+  if (!attrs.length) box.appendChild(el('div', { class: 'dt-muted', text: '属性はありません' }));
+  for (const [k, v] of attrs) {
+    const row = el('div', { class: 'dt-attr' });
+    const val = el('input', { class: 'dt-input small', type: 'text', value: v, 'aria-label': `${k} の値`, autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+    val.addEventListener('change', () => { ses.editAttr(n, k, val.value); });
+    row.appendChild(el('span', { class: 'dt-attrname', text: k }));
+    row.appendChild(val);
+    row.appendChild(el('button', { class: 'dt-mini danger', type: 'button', text: '削除', 'aria-label': `${k} 属性を削除`, onclick: () => ses.editAttr(n, k, null) }));
+    box.appendChild(row);
+  }
+  const add = el('div', { class: 'dt-attr' });
+  const nm = el('input', { class: 'dt-input small', type: 'text', placeholder: '属性名', autocapitalize: 'off', spellcheck: 'false' });
+  const vl = el('input', { class: 'dt-input small', type: 'text', placeholder: '値', autocapitalize: 'off', spellcheck: 'false' });
+  add.appendChild(nm); add.appendChild(vl);
+  add.appendChild(el('button', { class: 'dt-mini', type: 'button', text: '追加', onclick: () => { const k = nm.value.trim().toLowerCase(); if (/^[a-z_:][\w:-]*$/.test(k)) ses.editAttr(n, k, vl.value); } }));
+  box.appendChild(add);
+  if (n.t === 'el' && n.children.some(c => c.t === 'text' && c.text.trim()) && !['script', 'style'].includes(n.tag)) {
+    box.appendChild(el('div', { class: 'dt-subhead', text: 'テキスト内容' }));
+    box.appendChild(el('div', { class: 'dt-code', text: H.textContent(n).trim().slice(0, 400) }));
+  }
+  box.appendChild(el('div', { class: 'dt-hint', text: 'ここでの編集は、この端末のブラウザ内の「架空ページ」にだけ反映されます（元のサーバーは変わりません）。' }));
+  return box;
+}
+
+Object.assign(exports, { renderElements });
+
+};
+__mods["js/dt/console.js"] = function (module, exports, __require) {
+// DevTools: Console パネル（メッセージの閲覧と式の実行）
+const { el, clear } = __require("js/util.js");
+
+const LEVEL_LABEL = { error: 'エラー', warn: '警告', info: '情報', log: 'ログ' };
+
+function renderConsole(host, ses, ui) {
+  clear(host);
+  const filter = ui.conFilter || 'all';
+  const filters = [['all', 'すべて'], ['error', 'エラー'], ['warn', '警告'], ['log', 'ログ/情報']];
+  const bar = el('div', { class: 'dt-chips' }, filters.map(([k, l]) => el('button', { class: 'dt-chip' + (filter === k ? ' on' : ''), type: 'button', text: l, onclick: () => { ui.conFilter = k; ui.rerender('console', true); } })));
+  const counts = { error: 0, warn: 0 };
+  for (const m of ses.consoleLog) if (counts[m.level] !== undefined) counts[m.level]++;
+  host.appendChild(el('div', { class: 'dt-toolbar' }, [bar, el('span', { class: 'dt-muted', text: `エラー ${counts.error} / 警告 ${counts.warn}` })]));
+
+  const out = el('div', { class: 'dt-console', 'aria-live': 'polite' });
+  const show = (m) => {
+    if (m.level === 'input' || m.level === 'result') return true;
+    if (filter === 'all') return true;
+    if (filter === 'log') return m.level === 'log' || m.level === 'info';
+    return m.level === filter;
+  };
+  for (const m of ses.consoleLog) {
+    if (!show(m)) continue;
+    const row = el('div', { class: `dt-msg ${m.level}` });
+    if (m.level === 'input') row.appendChild(el('span', { class: 'dt-prompt', text: '›' }));
+    else if (m.level === 'result') row.appendChild(el('span', { class: 'dt-prompt', text: '‹' }));
+    else if (m.level === 'error') row.appendChild(el('span', { class: 'dt-ico', text: '⛔', title: LEVEL_LABEL.error }));
+    else if (m.level === 'warn') row.appendChild(el('span', { class: 'dt-ico', text: '⚠️', title: LEVEL_LABEL.warn }));
+    else row.appendChild(el('span', { class: 'dt-prompt', text: ' ' }));
+    row.appendChild(el('span', { class: 'dt-msg-text', text: m.text }));
+    if (m.source) {
+      const link = el('button', { class: 'dt-src', type: 'button', text: m.source, 'aria-label': `${m.source} をSourcesで開く` });
+      const mm = /^(.+?):(\d+)(?::\d+)?$/.exec(m.source);
+      if (mm && ses.sourceFiles().includes(mm[1])) link.addEventListener('click', () => ui.openSource(mm[1], Number(mm[2])));
+      else link.disabled = true;
+      row.appendChild(link);
+    }
+    if (m.nav) row.appendChild(el('button', { class: 'dt-src', type: 'button', text: '通信を見る', onclick: () => ui.openRequest(m.nav) }));
+    out.appendChild(row);
+  }
+  host.appendChild(out);
+
+  const input = el('input', { class: 'dt-input mono', type: 'text', placeholder: 'JavaScript を入力（例: document.title）', autocapitalize: 'off', autocorrect: 'off', autocomplete: 'off', spellcheck: 'false', enterkeyhint: 'go', 'aria-label': 'Console に式を入力' });
+  const hist = ses.replHistory; let hi = hist.length;
+  const run = () => {
+    const t = input.value; if (!t.trim()) return;
+    input.value = ''; ses.runConsole(t); hi = hist.length;
+    ui.rerender('console', true, true);
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); run(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); hi = Math.max(0, hi - 1); input.value = hist[hi] || ''; }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hist.length, hi + 1); input.value = hist[hi] || ''; }
+  });
+  const row = el('div', { class: 'dt-inputrow' }, [el('span', { class: 'dt-prompt', text: '›' }), input, el('button', { class: 'dt-run', type: 'button', text: '実行', onclick: run })]);
+  host.appendChild(row);
+
+  const quick = (ui.quick || []);
+  if (quick.length) {
+    host.appendChild(el('div', { class: 'dt-subhead', text: '式の例（タップで入力欄へ）' }));
+    host.appendChild(el('div', { class: 'dt-chips wrap' }, quick.map(q => el('button', { class: 'dt-chip code', type: 'button', text: q, onclick: () => { input.value = q; input.focus(); } }))));
+  }
+  host.appendChild(el('div', { class: 'dt-hint', text: 'Console では、このページの中身に対して JavaScript の式を実行できます。実行できる範囲は学習用に限定されています。' }));
+  if (ui.stickBottom) { requestAnimationFrame(() => { out.scrollTop = out.scrollHeight; }); }
+}
+
+Object.assign(exports, { renderConsole });
+
+};
+__mods["js/dt/network.js"] = function (module, exports, __require) {
+// DevTools: Network パネル（リクエスト一覧と詳細）
+const { el, clear } = __require("js/util.js");
+const { formatBytes, formatMs, THROTTLES } = __require("js/vb/session.js");
+
+const FILTERS = [['all', 'すべて'], ['fetch', 'Fetch/XHR'], ['script', 'JS'], ['stylesheet', 'CSS'], ['img', 'Img'], ['document', 'Doc'], ['other', 'その他']];
+const matchFilter = (r, f) => f === 'all' || (f === 'fetch' ? (r.type === 'fetch' || r.type === 'xhr') : f === 'other' ? !['fetch', 'xhr', 'script', 'stylesheet', 'img', 'document'].includes(r.type) : r.type === f);
+const TYPE_LABEL = { fetch: 'fetch', xhr: 'xhr', script: 'script', stylesheet: 'css', img: 'img', document: 'doc', font: 'font', other: 'other' };
+
+function renderNetwork(host, ses, ui) {
+  clear(host);
+  if (ui.netDetail) return renderDetail(host, ses, ui, ses.requests.find(r => r.id === ui.netDetail));
+  const st = ses.state;
+  const filter = st.networkFilter || 'all';
+  const sum = ses.networkSummary();
+  const tl = THROTTLES[st.throttle];
+
+  const chips = el('div', { class: 'dt-chips' }, FILTERS.map(([k, l]) => el('button', { class: 'dt-chip' + (filter === k ? ' on' : ''), type: 'button', text: l, onclick: () => { st.networkFilter = k; st.filtersUsed.add(k); ui.rerender('network', true); } })));
+  const q = el('input', { class: 'dt-input', type: 'search', placeholder: 'URL・ステータスで絞り込み', value: ui.netSearch || '', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', 'aria-label': 'Network を検索' });
+  q.addEventListener('input', () => { ui.netSearch = q.value; ui.rerender('network', true); });
+  const th = el('select', { class: 'dt-select', 'aria-label': '回線速度のスロットリング' }, Object.entries(THROTTLES).map(([k, v]) => { const o = el('option', { value: k, text: v.label }); if (k === st.throttle) o.selected = true; return o; }));
+  th.addEventListener('change', () => { st.throttle = th.value; ui.rerender('network', true); });
+  host.appendChild(el('div', { class: 'dt-toolbar col' }, [chips, el('div', { class: 'dt-row-flex' }, [q, th])]));
+
+  const needle = (ui.netSearch || '').trim().toLowerCase();
+  const rows = ses.requests.filter(r => matchFilter(r, filter) && (!needle || r.url.toLowerCase().includes(needle) || String(r.status).includes(needle) || r.method.toLowerCase().includes(needle)));
+  const list = el('div', { class: 'dt-netlist', role: 'list' });
+  const maxEnd = Math.max(1, ...ses.requests.map(r => r.start + r.time));
+  if (!rows.length) list.appendChild(el('div', { class: 'dt-hint', text: '条件に一致するリクエストはありません。' }));
+  for (const r of rows) {
+    const bad = r.failed || r.status >= 400;
+    const line1 = el('div', { class: 'dt-net-l1' }, [
+      el('span', { class: 'dt-method', text: r.method }),
+      el('span', { class: 'dt-net-name', text: r.name }),
+      el('span', { class: 'dt-status ' + (bad ? 'bad' : r.status >= 300 ? 'redir' : 'ok'), text: r.failed ? '(failed)' : r.blocked ? `(blocked:${r.blocked})` : String(r.status) }),
+    ]);
+    const t = tl.f == null ? null : r.time * tl.f;
+    const line2 = el('div', { class: 'dt-net-l2' }, [
+      el('span', { text: TYPE_LABEL[r.type] || r.type }), el('span', { text: r.fromCache ? '(キャッシュ)' : formatBytes(r.size) }),
+      el('span', { text: t == null ? '—' : formatMs(t) }), el('span', { class: 'dt-host' + (r.thirdParty ? ' third' : ''), text: r.host }),
+    ]);
+    const bar = el('div', { class: 'dt-wf' }, [el('div', { class: 'dt-wf-bar' + (bad ? ' bad' : ''), style: `left:${(r.start / maxEnd) * 100}%;width:${Math.max(1.5, (r.time / maxEnd) * 100)}%` })]);
+    const row = el('button', { class: 'dt-netrow' + (bad ? ' bad' : ''), type: 'button', role: 'listitem', onclick: () => { ui.netDetail = r.id; ui.netTab = 'headers'; st.viewedRequests.add(r.id); ui.rerender('network', true); } }, [line1, line2, bar]);
+    list.appendChild(row);
+  }
+  host.appendChild(list);
+  host.appendChild(el('div', { class: 'dt-summary' }, [
+    el('span', { text: `${rows.length}/${sum.count} 件` }),
+    el('span', { text: sum.finish == null ? 'オフライン' : `転送 ${formatBytes(sum.transferred)}` }),
+    el('span', { text: sum.finish == null ? '' : `完了 ${formatMs(sum.finish)}` }),
+    el('span', { class: 'dt-muted', text: tl.label }),
+  ]));
+  host.appendChild(el('div', { class: 'dt-hint', text: 'リクエストをタップすると、ヘッダ・送信内容・レスポンスなどの詳細を確認できます。ステータスが赤いものは失敗です。' }));
+}
+
+const kvTable = (obj) => {
+  const entries = Array.isArray(obj) ? obj : Object.entries(obj);
+  if (!entries.length) return el('div', { class: 'dt-muted', text: '（なし）' });
+  return el('div', { class: 'dt-kvlist' }, entries.map(([k, v]) => el('div', { class: 'dt-kvrow' }, [el('span', { class: 'dt-k', text: k }), el('span', { class: 'dt-v', text: String(v) })])));
+};
+
+function renderDetail(host, ses, ui, r) {
+  if (!r) { ui.netDetail = null; return renderNetwork(host, ses, ui); }
+  const tabs = [['headers', 'Headers'], ['payload', 'Payload'], ['response', 'Response'], ['timing', 'Timing']];
+  const cur = ui.netTab || 'headers';
+  host.appendChild(el('div', { class: 'dt-toolbar' }, [
+    el('button', { class: 'dt-mini', type: 'button', text: '‹ 一覧へ', onclick: () => { ui.netDetail = null; ui.rerender('network', true); } }),
+    el('span', { class: 'dt-net-name big', text: r.name }),
+  ]));
+  host.appendChild(el('div', { class: 'dt-chips' }, tabs.map(([k, l]) => el('button', { class: 'dt-chip' + (cur === k ? ' on' : ''), type: 'button', text: l, onclick: () => { ui.netTab = k; ui.rerender('network', true); } }))));
+  const body = el('div', { class: 'dt-pane' });
+  if (cur === 'headers') {
+    body.appendChild(el('div', { class: 'dt-subhead', text: '全般 (General)' }));
+    body.appendChild(kvTable([['Request URL', r.url], ['Request Method', r.method], ['Status Code', `${r.failed ? '(failed) ' + r.failed : r.status + ' ' + r.statusText}`], ['Remote Address', r.remote || '—'], ['Protocol', r.protocol]]));
+    body.appendChild(el('div', { class: 'dt-subhead', text: 'レスポンスヘッダ (Response Headers)' }));
+    body.appendChild(kvTable(r.resHeaders));
+    body.appendChild(el('div', { class: 'dt-subhead', text: 'リクエストヘッダ (Request Headers)' }));
+    body.appendChild(kvTable(r.reqHeaders));
+  } else if (cur === 'payload') {
+    body.appendChild(el('div', { class: 'dt-subhead', text: 'クエリパラメータ (Query String Parameters)' }));
+    body.appendChild(kvTable(r.params));
+    body.appendChild(el('div', { class: 'dt-subhead', text: '送信内容 (Request Payload)' }));
+    body.appendChild(r.reqBody ? el('div', { class: 'dt-code', text: r.reqBody }) : el('div', { class: 'dt-muted', text: '（なし）' }));
+  } else if (cur === 'response') {
+    body.appendChild(el('div', { class: 'dt-subhead', text: `レスポンス (${r.mime || '不明'})` }));
+    let txt = r.resBody;
+    if (/json/.test(r.mime) && txt) { try { txt = JSON.stringify(JSON.parse(txt), null, 2); } catch { /* そのまま */ } }
+    body.appendChild(txt ? el('div', { class: 'dt-code', text: txt }) : el('div', { class: 'dt-muted', text: r.failed ? '（通信に失敗したためレスポンスはありません）' : '（レスポンス本文はありません）' }));
+  } else {
+    const f = THROTTLES[ses.state.throttle].f;
+    body.appendChild(el('div', { class: 'dt-subhead', text: 'タイミング (Timing)' }));
+    body.appendChild(kvTable([['開始', formatMs(r.start * (f || 1))], ['所要時間', f == null ? '—' : formatMs(r.time * f)], ['転送サイズ', r.fromCache ? '(キャッシュ)' : formatBytes(r.size)], ['展開後サイズ', formatBytes(r.resourceSize)], ['回線', THROTTLES[ses.state.throttle].label]]));
+    if (r.initiator) { body.appendChild(el('div', { class: 'dt-subhead', text: 'このリクエストを発行したもの (Initiator)' })); body.appendChild(el('div', { class: 'dt-code', text: r.initiator })); }
+  }
+  if (r.note) body.appendChild(el('div', { class: 'dt-hint', text: r.note }));
+  host.appendChild(body);
+}
+
+Object.assign(exports, { renderNetwork });
+
+};
+__mods["js/dt/application.js"] = function (module, exports, __require) {
+// DevTools: Application パネル（Local Storage / Session Storage / Cookies）
+const { el, clear } = __require("js/util.js");
+
+function renderApplication(host, ses, ui) {
+  clear(host);
+  const cur = ui.appTab || 'local';
+  const tabs = [['local', 'Local Storage'], ['session', 'Session Storage'], ['cookies', 'Cookies']];
+  host.appendChild(el('div', { class: 'dt-chips' }, tabs.map(([k, l]) => el('button', { class: 'dt-chip' + (cur === k ? ' on' : ''), type: 'button', text: l, onclick: () => { ui.appTab = k; ui.rerender('application', true); } }))));
+  const pane = el('div', { class: 'dt-pane' });
+  if (cur === 'local' || cur === 'session') {
+    const data = ses[cur];
+    const keys = Object.keys(data);
+    pane.appendChild(el('div', { class: 'dt-subhead', text: `${cur === 'local' ? 'localStorage' : 'sessionStorage'}（${keys.length} 件）— ${ses.page.origin}` }));
+    if (!keys.length) pane.appendChild(el('div', { class: 'dt-muted', text: '（空です）' }));
+    for (const k of keys) {
+      pane.appendChild(el('div', { class: 'dt-store' }, [
+        el('div', { class: 'dt-store-key', text: k }),
+        el('div', { class: 'dt-store-val', text: data[k] }),
+        el('button', { class: 'dt-mini danger', type: 'button', text: '削除', 'aria-label': `${k} を削除`, onclick: () => ses.removeStorage(cur, k) }),
+      ]));
+    }
+    pane.appendChild(el('div', { class: 'dt-hint', text: cur === 'local' ? 'Local Storage はブラウザを閉じても残り、同じサイトのJavaScriptなら誰でも読めます。' : 'Session Storage はタブを閉じると消えます。こちらも同じタブ内のJavaScriptから読めます。' }));
+  } else {
+    pane.appendChild(el('div', { class: 'dt-subhead', text: `Cookies（${ses.cookies.length} 件）— ${ses.page.hostname}` }));
+    if (!ses.cookies.length) pane.appendChild(el('div', { class: 'dt-muted', text: '（Cookie はありません）' }));
+    for (const c of ses.cookies) {
+      const flags = el('div', { class: 'dt-flags' }, [
+        el('span', { class: 'dt-flag ' + (c.httpOnly ? 'good' : 'bad'), text: c.httpOnly ? 'HttpOnly ✓' : 'HttpOnly ✗' }),
+        el('span', { class: 'dt-flag ' + (c.secure ? 'good' : 'bad'), text: c.secure ? 'Secure ✓' : 'Secure ✗' }),
+        el('span', { class: 'dt-flag ' + (c.sameSite ? 'good' : 'bad'), text: c.sameSite ? `SameSite=${c.sameSite}` : 'SameSite ✗' }),
+      ]);
+      pane.appendChild(el('div', { class: 'dt-store' }, [
+        el('div', { class: 'dt-store-key', text: c.name }),
+        el('div', { class: 'dt-store-val', text: c.value }),
+        el('div', { class: 'dt-muted', text: `Domain: ${c.domain || ses.page.hostname} / Path: ${c.path || '/'} / Expires: ${c.expires || 'Session'}` }),
+        flags,
+        el('button', { class: 'dt-mini danger', type: 'button', text: '削除', 'aria-label': `${c.name} を削除`, onclick: () => ses.removeCookie(c.name) }),
+      ]));
+    }
+    pane.appendChild(el('div', { class: 'dt-hint', text: 'HttpOnly が ✓ の Cookie は JavaScript（document.cookie）から読めません。Secure は HTTPS でのみ送信、SameSite は他サイトからの送信の制限です。' }));
+  }
+  host.appendChild(pane);
+}
+
+Object.assign(exports, { renderApplication });
+
+};
+__mods["js/dt/sources.js"] = function (module, exports, __require) {
+// DevTools: Sources パネル（ソース閲覧・全文検索・整形表示・ブレークポイント）
+const { el, clear } = __require("js/util.js");
+
+// 簡易整形（minify されたJSを読みやすくする）。文字列・コメントは壊さない。
+function prettyPrint(code) {
+  let out = '', indent = 0, i = 0, inStr = null, paren = 0;
+  const nl = () => { out = out.replace(/[ \t]+$/, '') + '\n' + '  '.repeat(Math.max(0, indent)); };
+  while (i < code.length) {
+    const c = code[i];
+    if (inStr) { out += c; if (c === '\\') { out += code[i + 1] || ''; i += 2; continue; } if (c === inStr) inStr = null; i++; continue; }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; out += c; i++; continue; }
+    if (c === '(') paren++; else if (c === ')') paren = Math.max(0, paren - 1);
+    if (c === '{') { out += ' {'; indent++; nl(); i++; if (code[i] === '}') { indent--; out = out.replace(/\n\s*$/, '') + '}'; i++; } continue; }
+    if (c === '}') { indent--; nl(); out += '}'; i++; if (code[i] && !/[;,)\s.]/.test(code[i])) nl(); continue; }
+    if (c === ';' && paren === 0) { out += ';'; nl(); i++; continue; }
+    if (c === ',' && paren === 0 && indent > 0 && /^[\s]*["'\w$]+\s*:/.test(code.slice(i + 1, i + 60))) { out += ','; nl(); i++; continue; }
+    if (c === '\n' ) { i++; continue; }
+    out += c; i++;
+  }
+  return out.replace(/\n\s*\n/g, '\n').trim();
+}
+
+function renderSources(host, ses, ui) {
+  clear(host);
+  const files = ses.sourceFiles();
+  if (!files.length) { host.appendChild(el('div', { class: 'dt-hint', text: 'このページにはソースファイルがありません。' })); return; }
+  if (!ui.srcFile || !files.includes(ui.srcFile)) ui.srcFile = null;
+  const st = ses.state;
+
+  // 全文検索
+  const qIn = el('input', { class: 'dt-input', type: 'search', placeholder: '全ファイルを検索（例: key / token / password）', value: ui.srcQuery || '', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'search', 'aria-label': 'ソース全体を検索' });
+  const doSearch = () => { ui.srcQuery = qIn.value.trim(); ui.srcResults = ui.srcQuery ? ses.searchSources(ui.srcQuery) : null; ui.rerender('sources', true); };
+  qIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
+  host.appendChild(el('div', { class: 'dt-toolbar' }, [qIn, el('button', { class: 'dt-run', type: 'button', text: '検索', onclick: doSearch })]));
+
+  if (ui.srcResults) {
+    const res = ui.srcResults;
+    host.appendChild(el('div', { class: 'dt-subhead', text: `検索結果 ${res.length} 件（タップで該当行を開く）` }));
+    const box = el('div', { class: 'dt-results' });
+    if (!res.length) box.appendChild(el('div', { class: 'dt-muted', text: '一致なし' }));
+    for (const r of res.slice(0, 60)) box.appendChild(el('button', { class: 'dt-result', type: 'button', onclick: () => ui.openSource(r.file, r.line) }, [el('span', { class: 'dt-src', text: `${r.file}:${r.line}` }), el('span', { class: 'dt-result-text', text: r.text })]));
+    host.appendChild(box);
+  }
+
+  host.appendChild(el('div', { class: 'dt-chips wrap' }, files.map(f => el('button', { class: 'dt-chip code' + (ui.srcFile === f ? ' on' : ''), type: 'button', text: f, onclick: () => { ui.srcFile = f; ui.srcLine = null; st.sourcesOpened.add(f); ui.rerender('sources', true); } }))));
+  if (!ui.srcFile) { host.appendChild(el('div', { class: 'dt-hint', text: 'ファイル名をタップして中身を表示します。行番号をタップするとブレークポイントを設定できます。' })); return; }
+
+  const f = ui.srcFile;
+  ui.pretty = ui.pretty || {};
+  const raw = ses.sourceText(f);
+  const isMin = raw.split('\n').some(l => l.length > 200);
+  const text = ui.pretty[f] ? prettyPrint(raw) : raw;
+  const bar = el('div', { class: 'dt-toolbar' }, [el('span', { class: 'dt-muted', text: `${f}（${text.split('\n').length} 行）` })]);
+  if (isMin || ui.pretty[f]) bar.appendChild(el('button', { class: 'dt-mini' + (ui.pretty[f] ? ' on' : ''), type: 'button', text: '{} 整形表示', onclick: () => { ui.pretty[f] = !ui.pretty[f]; if (ui.pretty[f]) st.prettyPrinted.add(f); ui.rerender('sources', true); } }));
+  host.appendChild(bar);
+
+  const lines = text.split('\n');
+  const view = el('div', { class: 'dt-src-view' });
+  const pausedHere = st.paused && st.paused.file === f ? st.paused.line : null;
+  lines.forEach((l, i) => {
+    const no = i + 1;
+    const bp = !ui.pretty[f] && st.breakpoints.some(b => b.file === f && b.line === no);
+    const row = el('div', { class: 'dt-line' + (ui.srcLine === no ? ' focus' : '') + (pausedHere === no && !ui.pretty[f] ? ' paused' : '') });
+    const num = el('button', { class: 'dt-lno' + (bp ? ' bp' : ''), type: 'button', text: String(no), 'aria-label': `${no} 行目${bp ? '（ブレークポイントあり）' : ''}`, 'aria-pressed': bp ? 'true' : 'false' });
+    num.addEventListener('click', () => { if (ui.pretty[f]) { ui.flash('整形表示中はブレークポイントを設定できません。{} をもう一度押して元のソースに戻してください。'); return; } const r = ses.toggleBreakpoint(f, no); ui.flash(r === 'paused' ? `${no} 行目で実行が一時停止しました（下の Scope を確認）` : r === 'set' ? `${no} 行目にブレークポイントを設定しました` : `${no} 行目のブレークポイントを解除しました`); ui.rerender('sources', true); });
+    row.appendChild(num);
+    row.appendChild(el('span', { class: 'dt-code-line', text: l || ' ' }));
+    view.appendChild(row);
+  });
+  host.appendChild(view);
+  if (ui.srcLine) requestAnimationFrame(() => { const t = view.querySelector('.dt-line.focus'); if (t && t.scrollIntoView) t.scrollIntoView({ block: 'center' }); });
+
+  if (st.paused) {
+    const p = st.paused;
+    const box = el('div', { class: 'dt-pane paused-box' }, [el('div', { class: 'dt-pane-title', text: `⏸ 一時停止中: ${p.file}:${p.line}` })]);
+    if (p.note) box.appendChild(el('div', { class: 'dt-hint', text: p.note }));
+    if (p.stack && p.stack.length) { box.appendChild(el('div', { class: 'dt-subhead', text: 'コールスタック (Call Stack)' })); box.appendChild(el('div', { class: 'dt-code', text: p.stack.join('\n') })); }
+    box.appendChild(el('div', { class: 'dt-subhead', text: 'スコープ (Scope) — この時点の変数の値' }));
+    for (const [scope, vars] of Object.entries(p.scope)) {
+      box.appendChild(el('div', { class: 'dt-scope-name', text: scope }));
+      box.appendChild(el('div', { class: 'dt-kvlist' }, Object.entries(vars).map(([k, v]) => el('div', { class: 'dt-kvrow' }, [el('span', { class: 'dt-k', text: k }), el('span', { class: 'dt-v', text: typeof v === 'string' ? JSON.stringify(v) : JSON.stringify(v) })]))));
+    }
+    box.appendChild(el('button', { class: 'dt-mini', type: 'button', text: '▶ 再開', onclick: () => { ses.resume(); ui.rerender('sources', true); } }));
+    host.appendChild(box);
+  }
+}
+
+Object.assign(exports, { prettyPrint, renderSources });
+
+};
+__mods["js/dt/security.js"] = function (module, exports, __require) {
+// DevTools: Security / Issues パネル
+const { el, clear } = __require("js/util.js");
+
+function renderSecurity(host, ses, ui) {
+  clear(host);
+  const sec = ses.security();
+  const pane = el('div', { class: 'dt-pane' });
+  pane.appendChild(el('div', { class: 'dt-subhead', text: '接続の概要 (Overview)' }));
+  pane.appendChild(el('div', { class: 'dt-secbanner ' + (sec.https ? 'ok' : 'bad'), text: sec.https ? '🔒 このページは HTTPS で配信されています' : '⚠️ このページは安全ではありません (HTTP)' }));
+  if (sec.cert) {
+    pane.appendChild(el('div', { class: 'dt-subhead', text: '証明書 (Certificate)' }));
+    pane.appendChild(el('div', { class: 'dt-kvlist' }, [['発行先', sec.cert.subject], ['発行者', sec.cert.issuer], ['有効期間', `${sec.cert.validFrom} 〜 ${sec.cert.validTo}`], ['プロトコル', sec.protocol], ['暗号スイート', sec.cert.cipher || '—']].filter(x => x[1]).map(([k, v]) => el('div', { class: 'dt-kvrow' }, [el('span', { class: 'dt-k', text: k }), el('span', { class: 'dt-v', text: v })]))));
+  }
+  const http = ses.requests.filter(r => r.url.startsWith('http://')).length, https = ses.requests.length - http;
+  pane.appendChild(el('div', { class: 'dt-subhead', text: 'リソースの通信方式' }));
+  pane.appendChild(el('div', { class: 'dt-kvlist' }, [['HTTPS', `${https} 件`], ['HTTP（暗号化なし）', `${http} 件`]].map(([k, v]) => el('div', { class: 'dt-kvrow' }, [el('span', { class: 'dt-k', text: k }), el('span', { class: 'dt-v', text: v })]))));
+  host.appendChild(pane);
+
+  const issues = ses.issues();
+  const box = el('div', { class: 'dt-pane' }, [el('div', { class: 'dt-subhead', text: `問題 (Issues) — ${issues.length} 件` })]);
+  if (!issues.length) box.appendChild(el('div', { class: 'dt-muted', text: '検出された問題はありません。' }));
+  for (const i of issues) {
+    box.appendChild(el('div', { class: `dt-issue ${i.severity}` }, [
+      el('div', { class: 'dt-issue-title', text: `${i.severity === 'error' ? '⛔' : i.severity === 'warning' ? '⚠️' : 'ℹ️'} ${i.title}` }),
+      i.detail ? el('div', { class: 'dt-code small', text: i.detail }) : null,
+      i.why ? el('div', { class: 'dt-hint', text: i.why }) : null,
+    ]));
+  }
+  host.appendChild(box);
+}
+
+Object.assign(exports, { renderSecurity });
+
+};
+__mods["js/dt/performance.js"] = function (module, exports, __require) {
+// DevTools: Performance パネル（Core Web Vitals と読み込みの内訳）
+const { el, clear } = __require("js/util.js");
+const { formatBytes, formatMs, THROTTLES } = __require("js/vb/session.js");
+
+function renderPerformance(host, ses, ui) {
+  clear(host);
+  const p = ses.perf();
+  const f = THROTTLES[ses.state.throttle].f || 1;
+  const metric = (label, v, unit, good, bad, hint) => {
+    const val = v == null ? null : (unit === 'ms' ? v * f : v);
+    const cls = val == null ? '' : (unit === 'ms' ? (val <= good ? 'good' : val <= bad ? 'mid' : 'bad') : (val <= good ? 'good' : val <= bad ? 'mid' : 'bad'));
+    return el('div', { class: `dt-metric ${cls}` }, [el('div', { class: 'dt-metric-v', text: val == null ? '—' : (unit === 'ms' ? formatMs(val) : String(val)) }), el('div', { class: 'dt-metric-k', text: label }), el('div', { class: 'dt-metric-h', text: hint })]);
+  };
+  host.appendChild(el('div', { class: 'dt-subhead', text: `Core Web Vitals（${THROTTLES[ses.state.throttle].label}）` }));
+  host.appendChild(el('div', { class: 'dt-metrics' }, [
+    metric('FCP 最初の描画', p.fcp, 'ms', 1800, 3000, '何か表示されるまで'),
+    metric('LCP 最大要素の描画', p.lcp, 'ms', 2500, 4000, '一番大きい要素が出るまで'),
+    metric('CLS レイアウトのズレ', p.cls, 'n', 0.1, 0.25, 'ガタつきの少なさ'),
+    metric('TBT 操作できない時間', p.tbt, 'ms', 200, 600, 'JSの重さの目安'),
+  ]));
+  if (p.lcpElement) host.appendChild(el('div', { class: 'dt-pane' }, [el('div', { class: 'dt-subhead', text: 'LCP 要素' }), el('div', { class: 'dt-code', text: p.lcpElement })]));
+  const sum = ses.networkSummary();
+  const bytesByType = {};
+  for (const r of ses.requests) bytesByType[r.type] = (bytesByType[r.type] || 0) + r.size;
+  const rows = Object.entries(bytesByType).sort((a, b) => b[1] - a[1]);
+  const total = rows.reduce((s, [, n]) => s + n, 0) || 1;
+  const box = el('div', { class: 'dt-pane' }, [el('div', { class: 'dt-subhead', text: `種類別の転送サイズ（合計 ${formatBytes(total)}）` })]);
+  for (const [t, n] of rows) box.appendChild(el('div', { class: 'dt-bar-row' }, [el('span', { class: 'dt-bar-k', text: t }), el('div', { class: 'dt-bar-track' }, [el('div', { class: 'dt-bar-fill', style: `width:${Math.max(2, (n / total) * 100)}%` })]), el('span', { class: 'dt-bar-v', text: formatBytes(n) })]));
+  box.appendChild(el('div', { class: 'dt-hint', text: `全 ${sum.count} 件のリクエスト。回線を遅くするとき(Network タブの Throttling)は、表示までの時間が伸びます。` }));
+  host.appendChild(box);
+}
+
+Object.assign(exports, { renderPerformance });
+
+};
+__mods["js/devtools.js"] = function (module, exports, __require) {
+// ============================================================
+// 疑似 DevTools（スマホ向け）。ゲーム内の架空ページに対して
+// Elements / Console / Network / Sources / Application / Security / Performance を操作する。
+// 実ブラウザの DevTools や実ページには一切アクセスしない。
+// ============================================================
+const { el, clear } = __require("js/util.js");
+const { TAB_LABEL } = __require("js/vb/session.js");
+const H = __require("js/vb/html.js");
+const { renderElements } = __require("js/dt/elements.js");
+const { renderConsole } = __require("js/dt/console.js");
+const { renderNetwork } = __require("js/dt/network.js");
+const { renderApplication } = __require("js/dt/application.js");
+const { renderSources } = __require("js/dt/sources.js");
+const { renderSecurity } = __require("js/dt/security.js");
+const { renderPerformance } = __require("js/dt/performance.js");
+
+const RENDER = { elements: renderElements, console: renderConsole, network: renderNetwork, application: renderApplication, sources: renderSources, security: renderSecurity, performance: renderPerformance };
+const ERR_BADGE = (ses) => ses.consoleLog.filter(m => m.level === 'error').length;
+
+/** DevTools を container に構築する。ui オブジェクトは再描画しても状態を保持する。 */
+function mountDevtools(container, ses, ui, { onChange } = {}) {
+  ui.tab = ui.tab && ses.tabs.includes(ui.tab) ? ui.tab : ses.tabs[0];
+  ui.quick = ui.quick || [];
+  const shell = el('div', { class: 'dt' });
+  const tabbar = el('div', { class: 'dt-tabs', role: 'tablist' });
+  const toast = el('div', { class: 'dt-toast', role: 'status' });
+  const body = el('div', { class: 'dt-body' });
+  shell.appendChild(tabbar); shell.appendChild(body); shell.appendChild(toast);
+  container.appendChild(shell);
+
+  let toastTimer = null;
+  ui.flash = (msg) => { toast.textContent = msg; toast.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('show'), 2600); };
+  ui.openSource = (file, line) => { ui.srcFile = file; ui.srcLine = line || null; ses.state.sourcesOpened.add(file); setTab('sources'); };
+  ui.openRequest = (id) => { ui.netDetail = id; ui.netTab = 'headers'; ses.state.viewedRequests.add(id); setTab('network'); };
+
+  function drawTabs() {
+    clear(tabbar);
+    for (const t of ses.tabs) {
+      const badge = t === 'console' ? ERR_BADGE(ses) : 0;
+      tabbar.appendChild(el('button', { class: 'dt-tab' + (ui.tab === t ? ' active' : ''), type: 'button', role: 'tab', 'aria-selected': ui.tab === t ? 'true' : 'false', onclick: () => setTab(t) }, [TAB_LABEL[t], badge ? el('span', { class: 'dt-tab-badge', text: String(badge) }) : null]));
+    }
+  }
+  function draw(keepScroll, toBottom) {
+    const top = body.scrollTop;
+    ui.stickBottom = !!toBottom;
+    RENDER[ui.tab](body, ses, ui);
+    if (keepScroll) body.scrollTop = top;
+    if (toBottom) requestAnimationFrame(() => { const c = body.querySelector('.dt-console'); if (c) c.scrollTop = c.scrollHeight; });
+  }
+  function setTab(t) { ui.tab = t; ses.visit(t); drawTabs(); draw(false); if (onChange) onChange(); }
+  ui.rerender = (tab, keepScroll, toBottom) => { drawTabs(); if (!tab || tab === ui.tab) draw(keepScroll, toBottom); if (onChange) onChange(); };
+
+  ses.visit(ui.tab);
+  const unsub = ses.subscribe((what) => { if (!shell.isConnected) { unsub(); return; } drawTabs(); if (what === 'dom' || what === 'storage' || what === 'bp' || what === 'console') { if (ui.tab !== 'console' || what === 'console') draw(true, what === 'console'); } if (onChange) onChange(); });
+  drawTabs(); draw(false);
+  return shell;
+}
+
+/** ページの「見た目」プレビュー（表示されている要素だけを簡易描画）。DOMはtextContentで作り、innerHTMLは使わない。 */
+function renderPagePreview(container, ses) {
+  clear(container);
+  const bar = el('div', { class: 'pv-url' }, [el('span', { class: 'pv-lock', text: ses.page.protocol === 'https:' ? '🔒' : '⚠️' }), el('span', { class: 'pv-url-text', text: ses.page.href })]);
+  const page = el('div', { class: 'pv-page' });
+  const body = H.querySelector(ses.root, 'body');
+  const title = H.querySelector(ses.root, 'title');
+  const draw = (n, into) => {
+    if (n.t === 'text') { const t = n.text.replace(/\s+/g, ' ').trim(); if (t && !(n.parent && ['script', 'style', 'title'].includes(n.parent.tag))) into.appendChild(document.createTextNode(t + ' ')); return; }
+    if (n.t !== 'el' || H.selfHidden(n)) return;
+    const t = n.tag;
+    if (['script', 'style', 'head', 'meta', 'link', 'title', 'noscript'].includes(t)) return;
+    let node;
+    if (/^h[1-6]$/.test(t)) node = el('div', { class: 'pv-' + t });
+    else if (t === 'a') node = el('span', { class: 'pv-a' });
+    else if (t === 'button') node = el('span', { class: 'pv-btn' });
+    else if (t === 'input') { if (['hidden', 'submit', 'button'].includes((n.attrs.type || '').toLowerCase())) { if ((n.attrs.type || '') === 'hidden') return; node = el('span', { class: 'pv-btn', text: n.attrs.value || '送信' }); into.appendChild(node); return; } node = el('span', { class: 'pv-input', text: n.attrs.placeholder || n.attrs.value || n.attrs.name || '' }); into.appendChild(node); return; }
+    else if (t === 'img') { into.appendChild(el('span', { class: 'pv-img', text: `🖼 ${n.attrs.alt || (n.attrs.src || 'image').split('/').pop()}` })); return; }
+    else if (t === 'iframe') { into.appendChild(el('span', { class: 'pv-img', text: '▭ 埋め込みフレーム' })); return; }
+    else if (['p', 'div', 'li', 'section', 'form', 'ul', 'ol', 'nav', 'header', 'footer', 'main', 'article', 'table', 'tr', 'label', 'pre'].includes(t)) node = el('div', { class: 'pv-block pv-' + t });
+    else node = el('span', {});
+    for (const c of n.children) draw(c, node);
+    if (node.childNodes.length) into.appendChild(node);
+  };
+  if (body) for (const c of body.children) draw(c, page);
+  if (!page.childNodes.length) page.appendChild(el('div', { class: 'dt-muted', text: '（表示される内容がありません）' }));
+  container.appendChild(el('div', { class: 'pv' }, [bar, el('div', { class: 'pv-title', text: title ? H.textContent(title).trim() : '(無題)' }), page,
+    el('div', { class: 'dt-hint', text: 'これは「画面に実際に表示される内容」の簡易表示です。非表示にされた要素・コメント・通信の中身は、DevTools でないと見えません。' })]));
+}
+
+Object.assign(exports, { mountDevtools, renderPagePreview });
 
 };
 __mods["js/story.js"] = function (module, exports, __require) {
@@ -11333,6 +14281,16 @@ const CHAPTERS = {
     title: '深掘り偵察',
     intro: [{ who: 'asagiri', text: 'ポートが開いている、の先だ。何が、どのバージョンで動くか。そこまで分かって初めて的確な判断ができる。' }],
     outro: [{ who: 'hayama', text: '古いバージョンのサービスがいくつか……ケース・ゼロも、ここが入口でした。' }],
+  },
+  'dt-basics': {
+    title: '画面の裏側を見る',
+    intro: [{ who: 'hayama', text: 'ブラウザの開発者ツール、使ったことはありますか？ Webの調査は、画面の裏で何が起きているかを見るところから始まります。' }, { who: 'asagiri', text: 'スマホでは本物を開けないから、うちの訓練用の疑似ツールを用意した。架空のページで練習しろ。' }],
+    outro: [{ who: 'asagiri', text: '見えるものと、実際にあるものは違う。次は、ブラウザの中に保存されるものを調べる。' }],
+  },
+  'dt-advanced': {
+    title: 'ブラウザの内側を読む',
+    intro: [{ who: 'hayama', text: '保存データ、ソース、保護の仕組み、表示速度。ここまで読めれば、Webの問題の大半は切り分けられます。' }],
+    outro: [{ who: 'asagiri', text: '症状から根本原因まで、自分でたどれるようになったな。現場ではこの順番が武器になる。' }],
   },
   packet: {
     title: 'パケットを読む',
@@ -11438,7 +14396,9 @@ const { buildEnvironment } = __require("js/env.js");
 const { Terminal } = __require("js/terminal.js");
 const { evaluate, needsAnswer } = __require("js/checker.js");
 const store = __require("js/storage.js");
-const { STAGES, getMission, getStageOf, isMissionUnlocked, allMissions } = __require("js/missions/index.js");
+const { STAGES, TRACKS, getMission, getStageOf, getStage, trackOfStage, isMissionUnlocked, allMissions, missionsOfTrack } = __require("js/missions/index.js");
+const { createSession } = __require("js/vb/session.js");
+const { mountDevtools, renderPagePreview } = __require("js/devtools.js");
 const { CAST, PROLOGUE, EPILOGUE, chapterOf } = __require("js/story.js");
 
 const app = document.getElementById('app');
@@ -11545,11 +14505,26 @@ function renderHome() {
 
   const map = el('div', { class: 'stage-list' }, STAGES.map(st => stageRow(st)));
 
+  // 並行コース（DevTools）: メインの進行とは独立して、いつでも始められる
+  const devTrack = TRACKS.find(t => t.id === 'devtools');
+  const devMissions = missionsOfTrack('devtools');
+  const devSection = devMissions.length ? [
+    el('div', { class: 'section-label', text: 'DevTools コース（メインと並行して進められます）' }),
+    el('p', { class: 'track-desc', text: 'ブラウザの開発者ツールの読み方を、架空のWebページで練習するコースです。スマホでは本物の開発者ツールを開けないため、同じ画面構成の疑似DevToolsを使います。' }),
+    (() => {
+      const dn = devMissions.find(m => isMissionUnlocked(m.id, isDone) && !isDone(m.id));
+      const dd = devMissions.filter(m => isDone(m.id)).length;
+      return el('button', { class: 'btn-primary', text: dn ? (dd ? 'DevTools コースの続きへ ▸' : 'DevTools コースを始める ▸') : 'DevTools コース修了 ✓', onclick: () => dn ? go('#/mission/' + dn.id) : go('#/stage/' + devTrack.stages[0].id) });
+    })(),
+    el('div', { class: 'stage-list', style: 'margin-top:12px' }, devTrack.stages.map(st => stageRow(st))),
+  ] : [];
+
   screen([
     topbar(''),
     header, stat, cont,
-    el('div', { class: 'section-label', text: '学習ステージ' }),
+    el('div', { class: 'section-label', text: 'メインコース — 学習ステージ' }),
     map,
+    ...devSection,
     el('p', { class: 'foot-note', text: 'これは学習用シミュレーターです。実在のLinuxとは一部挙動が異なります（docs/LIMITATIONS.md）。実際のコマンド実行や外部通信は一切行いません。' }),
   ]);
 }
@@ -11573,7 +14548,7 @@ function stageRow(st) {
 
 // ---------- ステージ画面 ----------
 function renderStage(stageId) {
-  const st = STAGES.find(s => s.id === stageId);
+  const st = getStage(stageId);
   if (!st) return renderHome();
   const list = el('div', { class: 'mission-list' }, st.missions.map((m, i) => {
     const unlocked = isMissionUnlocked(m.id, isDone);
@@ -11588,13 +14563,15 @@ function renderStage(stageId) {
     ]);
   }));
   const ch = chapterOf(st.id);
-  const idx = STAGES.indexOf(st);
+  const trk = trackOfStage(st.id);
+  const idx = trk.stages.indexOf(st);
+  const chPrefix = trk.id === 'main' ? '' : trk.title.replace(' コース', '') + ' ';
   const cleared = st.missions.every(m => isDone(m.id));
   screen([
     topbar(st.title, '#/'),
     el('div', { class: 'stage-hero' }, [
       el('div', { class: 'section-label', text: st.title }),
-      ch.title ? el('div', { class: 'chapter-head', text: `第${idx + 1}章 ${ch.title}` }) : null,
+      ch.title ? el('div', { class: 'chapter-head', text: `${chPrefix}第${idx + 1}章 ${ch.title}` }) : null,
       dialogue(ch.intro),
       el('p', { class: 'stage-intro', text: st.intro }),
     ]),
@@ -11655,9 +14632,17 @@ function startPlay(id) {
   const m = getMission(id);
   if (!m) return renderHome();
   store.markStarted(id);
+  if (m.browser) {
+    // ブラウザ型: ターミナルの代わりに、架空ページ + 疑似DevTools を使う
+    const dev = createSession(m.browser);
+    play = { mission: m, shell: null, term: null, dev, devUi: { quick: m.browser.quick || [] }, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
+    dev.subscribe(() => { if (play && play.dev === dev) checkCurrentTask(true); });
+    renderPlay();
+    return;
+  }
   const { shell } = buildEnvironment(m);
   const term = new Terminal(shell, { onCommand: () => { if (play) checkCurrentTask(true); } });
-  play = { mission: m, shell, term, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
+  play = { mission: m, shell, term, dev: null, taskIdx: 0, view: 'mission', hintLevel: 0, solved: new Array(m.tasks.length).fill(false) };
   renderPlay();
   // 既にクリア済みなら最初から復習として解き直せる（進捗は保持）
 }
@@ -11665,13 +14650,14 @@ function startPlay(id) {
 function renderPlay() {
   const m = play.mission;
 
-  // タブ切り替え（ミッション説明 / ターミナル）
-  const tabs = el('div', { class: 'play-tabs' }, [
-    el('button', { class: 'ptab' + (play.view === 'mission' ? ' active' : ''), text: '課題', onclick: () => { play.view = 'mission'; renderPlay(); } }),
-    el('button', { class: 'ptab' + (play.view === 'terminal' ? ' active' : ''), text: 'ターミナル', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }),
-  ]);
+  // タブ切り替え（課題 / ターミナル）。ブラウザ型は（課題 / ページ / DevTools）
+  const tabDefs = play.dev
+    ? [['mission', '課題'], ['page', 'ページ'], ['dev', 'DevTools']]
+    : [['mission', '課題'], ['terminal', 'ターミナル']];
+  const tabs = el('div', { class: 'play-tabs' }, tabDefs.map(([v, label]) =>
+    el('button', { class: 'ptab' + (play.view === v ? ' active' : ''), text: label, onclick: () => { play.view = v; renderPlay(); if (v === 'terminal') setTimeout(() => play.term.focus(), 50); } })));
 
-  const body = play.view === 'terminal' ? renderTerminalView() : renderTaskView();
+  const body = play.view === 'terminal' ? renderTerminalView() : play.view === 'dev' ? renderDevView() : play.view === 'page' ? renderPageView() : renderTaskView();
 
   screen([
     el('div', { class: 'play-top' }, [
@@ -11682,6 +14668,26 @@ function renderPlay() {
     tabs,
     body,
   ]);
+}
+
+function currentTaskMini() {
+  const task = play.mission.tasks[play.taskIdx];
+  return el('div', { class: 'cur-task-mini' }, [
+    el('span', { class: 'ctm-label', text: '現在の課題 ' + (play.taskIdx + 1) + '/' + play.mission.tasks.length }),
+    el('span', { class: 'ctm-text', text: task.q }),
+  ]);
+}
+
+function renderDevView() {
+  const box = el('div', { class: 'dt-host' });
+  mountDevtools(box, play.dev, play.devUi);
+  return el('div', {}, [currentTaskMini(), box]);
+}
+
+function renderPageView() {
+  const box = el('div', {});
+  renderPagePreview(box, play.dev);
+  return el('div', {}, [currentTaskMini(), box]);
 }
 
 function renderTerminalView() {
@@ -11732,10 +14738,10 @@ function renderTaskView() {
       input,
       el('button', { class: 'btn-answer', text: '提出', onclick: () => submitAnswer(input.value) }),
     ]));
-    blocks.push(el('div', { class: 'hint-note', text: 'ヒント: ターミナルで調べて、分かった値をここに入力します。' }));
+    blocks.push(el('div', { class: 'hint-note', text: play.dev ? 'ヒント: DevTools で調べて、分かった値をここに入力します。' : 'ヒント: ターミナルで調べて、分かった値をここに入力します。' }));
   } else {
     // 状態判定タスク：ターミナルで操作 → 判定ボタン
-    blocks.push(el('div', { class: 'hint-note', text: 'この課題はターミナルで操作して達成します。操作後、下のボタンで判定するか、コマンド実行ごとに自動で判定されます。' }));
+    blocks.push(el('div', { class: 'hint-note', text: play.dev ? 'この課題は DevTools の操作で達成します。操作後、下のボタンで判定するか、操作のたびに自動で判定されます。' : 'この課題はターミナルで操作して達成します。操作後、下のボタンで判定するか、コマンド実行ごとに自動で判定されます。' }));
     blocks.push(el('div', { class: 'answer-row' }, [
       el('button', { class: 'btn-answer wide', text: '達成を判定する', onclick: () => checkCurrentTask(false) }),
     ]));
@@ -11743,7 +14749,8 @@ function renderTaskView() {
   blocks.push(feedback);
 
   // ターミナルへ
-  blocks.push(el('button', { class: 'to-term', text: '⌨ ターミナルを開いて操作する', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }));
+  if (play.dev) blocks.push(el('div', { class: 'to-term-row' }, [el('button', { class: 'to-term', text: '🛠 DevTools を開く', onclick: () => { play.view = 'dev'; renderPlay(); } }), el('button', { class: 'to-term', text: '🌐 ページを見る', onclick: () => { play.view = 'page'; renderPlay(); } })]));
+  else blocks.push(el('button', { class: 'to-term', text: '⌨ ターミナルを開いて操作する', onclick: () => { play.view = 'terminal'; renderPlay(); setTimeout(() => play.term.focus(), 50); } }));
 
   // ヒント（段階的）
   const hintBox = el('div', { class: 'hint-box' });
@@ -11781,9 +14788,11 @@ function renderTaskView() {
   ]);
 }
 
+function runtimeOf() { return { vfs: play.shell ? play.shell.vfs : null, shell: play.shell, dev: play.dev }; }
+
 function submitAnswer(value) {
   const task = play.mission.tasks[play.taskIdx];
-  const r = evaluate(task.check, value, { vfs: play.shell.vfs, shell: play.shell });
+  const r = evaluate(task.check, value, runtimeOf());
   showFeedback(r.ok, r.ok ? '正解！' : (r.detail || 'もう一度試してみましょう'));
   if (r.ok) markSolved();
 }
@@ -11792,7 +14801,7 @@ function checkCurrentTask(silent) {
   const task = play.mission.tasks[play.taskIdx];
   if (play.solved[play.taskIdx]) return;
   if (needsAnswer(task) && !task.noInput) return; // 入力系は自動判定しない
-  const r = evaluate(task.check, null, { vfs: play.shell.vfs, shell: play.shell });
+  const r = evaluate(task.check, null, runtimeOf());
   if (r.ok) { markSolved(); if (silent) flashToast('課題達成 ✓'); }
   else if (!silent) showFeedback(false, r.detail || 'まだ条件を満たしていません');
 }
@@ -11842,16 +14851,17 @@ function renderReview(m) {
   ));
 
   const stageId = getStageOf(m.id);
-  const st = STAGES.find(s => s.id === stageId);
+  const st = getStage(stageId);
+  const trk = trackOfStage(st.id);
   const nextInStage = st.missions.find(x => !isDone(x.id));
   const ch = chapterOf(st.id);
   const stageCleared = !nextInStage;
-  const gameCleared = stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
+  const gameCleared = trk.id === 'main' && stageCleared && STAGES.every(x => x.missions.every(mm => isDone(mm.id)));
   let nextBtn;
   if (nextInStage) nextBtn = el('button', { class: 'btn-primary', text: '次のミッションへ ▸', onclick: () => { play = null; go('#/mission/' + nextInStage.id); } });
   else {
-    const stIdx = STAGES.indexOf(st);
-    const nextStage = STAGES[stIdx + 1];
+    const stIdx = trk.stages.indexOf(st);
+    const nextStage = trk.stages[stIdx + 1];
     if (nextStage) nextBtn = el('button', { class: 'btn-primary', text: '次のステージへ ▸', onclick: () => { play = null; go('#/stage/' + nextStage.id); } });
     else nextBtn = el('button', { class: 'btn-primary', text: '学習進捗を見る ▸', onclick: () => { play = null; go('#/progress'); } });
   }
@@ -11869,7 +14879,7 @@ function renderReview(m) {
     rv.why ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: 'なぜこの操作が必要だったか' }), el('div', { class: 'db-text', text: rv.why })]) : null,
     rv.practice ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '実務での使いどころ' }), el('div', { class: 'db-text', text: rv.practice })]) : null,
     rv.related && rv.related.length ? el('div', { class: 'detail-block' }, [el('div', { class: 'db-label', text: '次につながる知識' }), el('div', { class: 'chips' }, rv.related.map(r => el('span', { class: 'chip', text: r })))]) : null,
-    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `第${STAGES.indexOf(st) + 1}章 クリア` }) : null,
+    stageCleared && ch.outro.length ? el('div', { class: 'section-label', text: `${trk.id === 'main' ? '' : trk.title.replace(' コース', '') + ' '}第${trk.stages.indexOf(st) + 1}章 クリア` }) : null,
     stageCleared ? dialogue(ch.outro) : null,
     gameCleared ? el('div', { class: 'section-label', text: EPILOGUE.title }) : null,
     gameCleared ? dialogue(EPILOGUE.lines) : null,

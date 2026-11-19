@@ -5,7 +5,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { buildEnvironment } from '../js/env.js';
 import { evaluate, needsAnswer } from '../js/checker.js';
-import { STAGES, allMissions } from '../js/missions/index.js';
+import { STAGES, ALL_STAGES, allMissions } from '../js/missions/index.js';
+import { createSession } from '../js/vb/session.js';
 import { bundle } from '../build.mjs';
 
 let pass = 0, fail = 0;
@@ -138,19 +139,28 @@ function cmdTests() {
 // ---------- ミッション solution テスト ----------
 function missionTests() {
   for (const m of allMissions()) {
-    const { shell } = buildEnvironment(m);
-    // solution を順に実行
-    for (const line of (m.solution || [])) shell.run(line);
+    let shell = null, dev = null;
+    if (m.browser) {
+      dev = createSession(m.browser);
+      for (const step of (m.solution || [])) {
+        if (typeof step === 'string') dev.runConsole(step);
+        else dev[step.do](...(step.args || []));
+      }
+    } else {
+      ({ shell } = buildEnvironment(m));
+      for (const line of (m.solution || [])) shell.run(line);
+    }
+    const rt = { vfs: shell ? shell.vfs : null, shell, dev };
     // 各タスクを判定。answer系は solution 実行後の環境では直接評価できないので、
     // answerの正解をチェッカーで照合（any/equals の先頭を使って自己整合性を確認）
     m.tasks.forEach((task, ti) => {
       if (needsAnswer(task) && !task.noInput) {
         // 代表解を取り出して評価
         const probe = pickAnswer(task.check);
-        const r = evaluate(task.check, probe, { vfs: shell.vfs, shell });
+        const r = evaluate(task.check, probe, rt);
         ok(r.ok, `[${m.id}] task${ti + 1} answer "${probe}" should validate (${r.detail || ''})`);
       } else {
-        const r = evaluate(task.check, null, { vfs: shell.vfs, shell });
+        const r = evaluate(task.check, null, rt);
         ok(r.ok, `[${m.id}] task${ti + 1} state check after solution failed: ${r.detail || ''}`);
       }
     });
@@ -167,7 +177,7 @@ function pickAnswer(check) {
 // ---------- 構造検証 ----------
 function structureTests() {
   const ids = new Set();
-  for (const st of STAGES) {
+  for (const st of ALL_STAGES) {
     ok(st.id && st.title && Array.isArray(st.missions), `stage ${st.id} shape`);
     for (const m of st.missions) {
       ok(!ids.has(m.id), `duplicate mission id ${m.id}`); ids.add(m.id);
@@ -316,6 +326,43 @@ function securityStaticTests() {
 }
 
 
+// ---------- 疑似ブラウザ(DevTools)の安全性とミッション整合 ----------
+function vbrowserTests() {
+  const base = { url: 'https://t.example.com/', html: '<html><body><p id="a" class="c">x</p><input id="i" value="v"></body></html>', globals: { cfg: { v: 1 } }, storage: { local: { k: 'v' }, cookies: [{ name: 'sid', value: 'S', httpOnly: true }, { name: 'pub', value: 'P' }] } };
+  const run = (t) => createSession(base).runConsole(t);
+  // 基本動作
+  ok(run('1 + 2').text === '3', 'console: 算術');
+  ok(run("document.querySelectorAll('p').length").text === '1', 'console: querySelectorAll');
+  ok(run('cfg.v').text === '1', 'console: globals');
+  ok(!/sid/.test(run('document.cookie').text) && /pub=P/.test(run('document.cookie').text), 'console: HttpOnly Cookie は document.cookie に出ない');
+  // 逃げ道の遮断: eval・Function・prototype・constructor・グローバル参照は使えない
+  const bad = ['eval("1")', 'Function("return 1")()', '(function(){}).constructor("return 1")()', '[].constructor', '({}).__proto__', 'cfg.__proto__', 'cfg.constructor.constructor("return process")()', 'this', 'globalThis', 'window.eval', 'process', 'require("fs")', 'import("fs")', 'document.defaultView', 'new Function("1")', 'setTimeout("1")', 'localStorage.constructor', 'document.body.ownerDocument.defaultView', '`${1}`.constructor', '"".constructor.constructor("return 1")()'];
+  for (const b of bad) { const r = run(b); ok(r && (r.ok === false || r.text === 'undefined' || /^Window/.test(r.text)) && !/native code/.test(r.text) && !/^[0-9]/.test(r.text), `console: 危険な式は拒否/無効化される(実体に触れない): ${b} → ${r && r.text}`); }
+  ok(run('globalThis.eval').text === 'undefined' && run('window.Function').text === 'undefined', 'console: window 経由で eval/Function に到達できない');
+  // 無限ループ・巨大処理で固まらない
+  const t0 = Date.now(); const r1 = run('[1,2,3].map(x => x).length'); ok(r1.ok, 'console: map');
+  ok(Date.now() - t0 < 500, 'console: 応答が速い');
+  // DOM 変更はセッション内の仮想DOMにのみ作用
+  const s2 = createSession(base); s2.runConsole("document.querySelector('#a').setAttribute('data-x','1')");
+  ok(s2.querySelector('#a').attrs['data-x'] === '1', 'console: 仮想DOMへの属性変更');
+  ok(createSession(base).querySelector('#a').attrs['data-x'] === undefined, 'console: 別セッションには影響しない');
+  // ミッション整合: 状態課題は初期状態では未達成、answer の正解は調査可能な情報に含まれる
+  for (const m of allMissions().filter(x => x.browser)) {
+    const fresh = createSession(m.browser);
+    m.tasks.forEach((t, i) => {
+      if (t.check.type === 'dev') ok(!evaluate(t.check, null, { dev: fresh }).ok, `[${m.id}] task${i + 1} は初期状態で達成済みになっていない`);
+      else if (t.check.type === 'answer') {
+        const a = pickAnswer(t.check);
+        if (/^-?[\d.]+$/.test(a) || /^\d+\)/.test(a)) return; // 数値・選択肢は計算/判断で得る
+        const hay = JSON.stringify([m.browser.html, m.browser.console, m.browser.sources, m.browser.network, m.browser.storage, m.browser.globals, m.browser.breakpoints, m.browser.perf, m.browser.security]).toLowerCase().replace(/\\\\"/g, '"');
+        ok(hay.includes(String(a).toLowerCase()), `[${m.id}] task${i + 1} の正解 "${a}" がページ内の調査可能な情報に存在する`);
+      }
+    });
+    ok(m.browser.tabs && m.browser.tabs.length, `[${m.id}] DevTools のタブ指定`);
+    ok(/^https:\/\/[a-z0-9.-]+\.example\.(com|org|net)\//.test(m.browser.url), `[${m.id}] 架空ドメイン(example.*)を使っている`);
+  }
+}
+
 // ---------- バンドルしたコードがソース直実行と同じ結果を返すか ----------
 // (循環参照・巻き上げなど、バンドル特有の不具合の検出。本番(index.html)はバンドルを読むため重要)
 function bundledEngineTests() {
@@ -355,6 +402,7 @@ engineTests();
 scriptTests();
 userAdminTests();
 securityStaticTests();
+vbrowserTests();
 bundledEngineTests();
 structureTests();
 missionTests();

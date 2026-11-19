@@ -105,6 +105,41 @@ export function evaluate(check, answer, runtime) {
       if (check.notMember != null && g.members.includes(check.notMember)) return { ok: false, detail: `${check.notMember} がまだ ${check.name} のメンバーです` };
       return { ok: true };
     }
+    case 'dev': {
+      // 仮想ブラウザ(DevTools)上の操作・状態で判定する。runtime.dev は vb/session.js のセッション。
+      const d = runtime.dev;
+      if (!d) return { ok: false, detail: 'DevTools が起動していません' };
+      const st = d.state;
+      if (check.consoleRan != null) {
+        let re; try { re = new RegExp(check.consoleRan, 'i'); } catch { return { ok: false, detail: '判定定義が不正です' }; }
+        if (!d.replHistory.some(x => re.test(x))) return { ok: false, detail: 'Console で該当の式をまだ実行していません' };
+      }
+      if (check.breakpoint) { if (!st.breakpoints.some(b => b.file === check.breakpoint.file && b.line === check.breakpoint.line)) return { ok: false, detail: `${check.breakpoint.file} の ${check.breakpoint.line} 行目にブレークポイントがありません` }; }
+      if (check.pausedAt) { if (!st.pausedOnce.some(b => b.file === check.pausedAt.file && b.line === check.pausedAt.line)) return { ok: false, detail: 'その行でまだ実行を止めていません' }; }
+      if (check.tab != null && !st.visited.has(check.tab)) return { ok: false, detail: `${check.tab} タブをまだ開いていません` };
+      if (check.viewedRequest != null && !st.viewedRequests.has(check.viewedRequest)) return { ok: false, detail: '該当のリクエストの詳細をまだ開いていません' };
+      if (check.filterUsed != null && !st.filtersUsed.has(check.filterUsed)) return { ok: false, detail: `Network の「${check.filterUsed}」フィルタをまだ使っていません` };
+      if (check.throttle != null && st.throttle !== check.throttle) return { ok: false, detail: `スロットリングが ${check.throttle} になっていません` };
+      if (check.searched != null) { let re; try { re = new RegExp(check.searched, 'i'); } catch { return { ok: false, detail: '判定定義が不正です' }; } if (!st.searches.some(q => re.test(q))) return { ok: false, detail: 'Sources でその語をまだ検索していません' }; }
+      if (check.prettyPrinted != null && !st.prettyPrinted.has(check.prettyPrinted)) return { ok: false, detail: `${check.prettyPrinted} をまだ整形表示していません` };
+      if (check.dom) {
+        const n = d.querySelector(check.dom.sel);
+        if (check.dom.exists === false) { if (n) return { ok: false, detail: `${check.dom.sel} がまだ存在します` }; }
+        else {
+          if (!n) return { ok: false, detail: `${check.dom.sel} が見つかりません` };
+          if (check.dom.visible != null && (!d.isHidden(n)) !== check.dom.visible) return { ok: false, detail: `${check.dom.sel} の表示状態が目標と違います` };
+          if (check.dom.attr) for (const [k, v] of Object.entries(check.dom.attr)) { const cur = n.attrs[k]; if (v === null ? cur !== undefined : cur !== v) return { ok: false, detail: `${check.dom.sel} の ${k} 属性が目標と違います` }; }
+        }
+      }
+      if (check.storage) {
+        for (const kind of ['local', 'session']) for (const [k, v] of Object.entries(check.storage[kind] || {})) {
+          const cur = Object.prototype.hasOwnProperty.call(d[kind], k) ? d[kind][k] : null;
+          if (cur !== v) return { ok: false, detail: `${kind === 'local' ? 'localStorage' : 'sessionStorage'} の ${k} が目標と違います` };
+        }
+        for (const [k, want] of Object.entries(check.storage.cookie || {})) if (d.cookies.some(c => c.name === k) !== want) return { ok: false, detail: `Cookie ${k} の有無が目標と違います` };
+      }
+      return { ok: true };
+    }
     case 'env': {
       const v = shell.env[check.name];
       if (check.equals != null) return norm(v) === norm(check.equals) ? { ok: true } : { ok: false, detail: `環境変数 ${check.name} が目標と違います` };

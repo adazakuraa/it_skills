@@ -24,6 +24,8 @@ import { stageApiSec } from './stage-apisec.js';
 import { stageCloud } from './stage-cloud.js';
 import { stageDetect } from './stage-detect.js';
 import { stageAISec } from './stage-aisec.js';
+import { stageDevtools1 } from './stage-devtools1.js';
+import { stageDevtools2 } from './stage-devtools2.js';
 import { stagePacket } from './stage-packet.js';
 
 export const STAGES = [
@@ -58,28 +60,51 @@ export const STAGES = [
 // 今後のステージはここに追加する:
 //   フォレンジック / 暗号 / Active Directory / クラウド・コンテナ など
 
-// 索引を構築
+// ---------- コース(トラック) ----------
+// main    : 既存のメインコース（一本道）
+// devtools: ブラウザ開発者ツールの読み方を学ぶ並行コース。メインの進行状況とは独立して進められる。
+export const DEV_STAGES = [stageDevtools1, stageDevtools2];
+
+export const TRACKS = [
+  { id: 'main', title: 'メインコース', stages: STAGES },
+  { id: 'devtools', title: 'DevTools コース', stages: DEV_STAGES },
+];
+export const ALL_STAGES = [...STAGES, ...DEV_STAGES];
+
+// 索引を構築（コースごとに一本道の順序を持つ）
 const missionById = {};
 const stageOfMission = {};
-let order = [];
-for (const st of STAGES) {
-  for (const m of st.missions) {
-    missionById[m.id] = m;
-    stageOfMission[m.id] = st.id;
-    order.push(m.id);
+const trackOfMission = {};
+const orderByTrack = {};
+const order = [];
+for (const tr of TRACKS) {
+  orderByTrack[tr.id] = [];
+  for (const st of tr.stages) {
+    for (const m of st.missions) {
+      missionById[m.id] = m;
+      stageOfMission[m.id] = st.id;
+      trackOfMission[m.id] = tr.id;
+      orderByTrack[tr.id].push(m.id);
+      order.push(m.id);
+    }
   }
 }
 
 export function getMission(id) { return missionById[id]; }
 export function getStageOf(id) { return stageOfMission[id]; }
+export function trackOf(id) { return trackOfMission[id]; }
+export function trackOfStage(stageId) { return TRACKS.find(t => t.stages.some(s => s.id === stageId)); }
+export function getStage(stageId) { return ALL_STAGES.find(s => s.id === stageId); }
 export function missionOrder() { return order.slice(); }
 export function allMissions() { return order.map(id => missionById[id]); }
+export function missionsOfTrack(trackId) { return (orderByTrack[trackId] || []).map(id => missionById[id]); }
 
-/** 直前のミッションが完了していれば解放（一本道） */
+/** 同じコース内で、直前のミッションが完了していれば解放（コースごとに一本道） */
 export function isMissionUnlocked(id, isDone) {
-  const idx = order.indexOf(id);
+  const list = orderByTrack[trackOfMission[id]] || [];
+  const idx = list.indexOf(id);
   if (idx <= 0) return true;
-  return isDone(order[idx - 1]);
+  return isDone(list[idx - 1]);
 }
 
 /** ステージ内の最初の未クリアミッション、なければ null */
