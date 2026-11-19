@@ -91,6 +91,7 @@ node = { type: 'd'|'f'|'l', mode: 0o755, uid, gid, mtime, content?: string, chil
 | XSS | ターミナル出力・ユーザー入力・保存データはすべて `textContent` で描画。HTML を組み立てる箇所は固定テンプレート＋`escapeHtml()`。CSP で外部スクリプトとインライン script を禁止。 |
 | 正規表現 DoS | `grep`/`sed` などでユーザーが入力した正規表現は自分の端末内でのみ評価され、入力長と行数に上限を設定。 |
 | 保存データ改ざん | localStorage の読み込み時にスキーマ検証し、不正なら初期化。インポートも同じ検証を通す。 |
+| 疑似ブラウザの式評価 | `js/vb/jsparse.js` が制限付き式を構文木にし、`js/vb/jsrepl.js` がホスト関数の許可リストだけで評価（ステップ・深さ上限、`__proto__`/`constructor` 遮断）。テスト（`vbrowserTests`）で抜け道を検査。 |
 | 外部サービスへの影響 | 静的サイトのみ。ゲーム操作は GitHub や他サービスへ一切送信しない。 |
 | 攻撃技術の悪用 | 演習対象はゲーム内の仮想ホストに限定。攻撃系の内容は「仕組みの理解」と「検知・防御」に重点を置く。 |
 
@@ -116,6 +117,11 @@ network = {
 HTTPは宣言的ルーティング `http.routes[{ path, method?, when?, body, default? }]` で応答を出し分ける。
 `when:{param,equals|contains|regex}` によって、SQLi（`' OR '1'='1`）やパストラバーサル（`../`）の
 成功条件を**関数を使わずデータだけで**表現し、安全に攻撃演習を再現する。
+
+## 6b. DevTools コース（並行トラック）
+- `js/missions/index.js` の `TRACKS`（main / devtools）。ミッションの解放はトラックごとに一本道で、メインとは独立。
+- ブラウザ型ミッションは `browser` 定義（url/html/console/network/storage/sources/breakpoints/perf/security/tabs）を持ち、`createSession()` が状態を保持。判定は `check.type: 'dev'`（Console 実行履歴・DOM属性・ストレージ・ブレークポイント・フィルタ・スロットリング等）か `answer`。
+- テストは `solution`（Console 式、または `{do:'メソッド', args:[…]}`）をセッションに適用して全課題を検証する。
 
 ## 7. ミッション追加手順
 1. `js/missions/` にステージファイルを追加（または既存ファイルに追記）。

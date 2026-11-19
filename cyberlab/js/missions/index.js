@@ -25,6 +25,7 @@ import { stageCloud } from './stage-cloud.js';
 import { stageDetect } from './stage-detect.js';
 import { stageAISec } from './stage-aisec.js';
 import { stageDevtools1 } from './stage-devtools1.js';
+import { stageDevtools2 } from './stage-devtools2.js';
 import { stagePacket } from './stage-packet.js';
 
 export const STAGES = [
@@ -62,7 +63,7 @@ export const STAGES = [
 // ---------- コース(トラック) ----------
 // main    : 既存のメインコース（一本道）
 // devtools: ブラウザ開発者ツールの読み方を学ぶ並行コース。メインの進行状況とは独立して進められる。
-export const DEV_STAGES = [stageDevtools1];
+export const DEV_STAGES = [stageDevtools1, stageDevtools2];
 
 export const TRACKS = [
   { id: 'main', title: 'メインコース', stages: STAGES },

@@ -10951,9 +10951,329 @@ const d01 = {
 Object.assign(exports, { d01 });
 
 };
+__mods["js/missions/dt/d02-elements.js"] = function (module, exports, __require) {
+// DevTools 2: Elements — 「画面に見えるもの」と「HTMLにあるもの」の違い
+const HTML = `<!DOCTYPE html>
+<html><head><title>社内ポータル</title></head>
+<body>
+<header><h1>社内ポータル</h1><nav><a href="/news">お知らせ</a> <a href="/docs">資料</a> <a id="admin-link" href="/admin/console" style="display:none">管理コンソール</a></nav></header>
+<main>
+  <p class="notice">来週の定期メンテナンスは火曜 22:00 からです。</p>
+  <!-- TODO: 公開前に削除 / 検証用の旧環境は stg-portal.example.com にある -->
+  <form id="feedback" action="/feedback" method="post">
+    <input type="text" name="comment" placeholder="ご意見をどうぞ">
+    <input type="hidden" name="form_token" value="a91f-77c2-board-20">
+    <button id="send" type="submit" disabled>送信</button>
+  </form>
+  <p id="status" hidden>送信を受け付けました。ありがとうございます。</p>
+</main>
+</body></html>`;
+
+const d02 = {
+  id: 'dv-02-elements',
+  title: 'Elements: 画面に見えないものを探す',
+  minutes: 14,
+  objectives: ['Elements でDOMツリーを開いて要素を探せる', '非表示の要素・HTMLコメント・hidden な入力欄が「誰にでも見える」ことを理解する', '属性を編集してページの挙動を確かめられる'],
+  prereq: ['dv-01-console'],
+  briefing: '社内ポータルのフィードバック欄で、送信ボタンが押せない。画面からは理由が分からない。Elements タブはページの「HTMLそのもの」を見せてくれる。画面に見えている部分だけでなく、隠れている部分もそこには全部ある。',
+  concepts: [{
+    title: 'Elements と DOM',
+    why: '画面に見えているものは、HTML のごく一部。見えない要素・コメント・属性にこそ、不具合の原因や、公開すべきでない情報が残っていることがある。',
+    problem: '「見えない = 存在しない」と思い込むと、ボタンが押せない理由も、うっかり公開されている情報も見落とす。',
+    how: 'Elements タブは、ブラウザが組み立てた DOM（要素の木構造）を表示する。▸ をタップして展開、行をタップすると属性を確認・編集できる。検索欄にはセレクタ（#id、.class）やテキストが使える。「非表示」バッジは CSS や hidden 属性で隠されている要素。ここでの編集はその場のページにだけ反映され、サーバーには何も影響しない。',
+    example: '<a id="admin-link" style="display:none">…</a>   ← 画面には出ないが HTML には存在\n<input type="hidden" name="form_token" value="…">   ← 画面には出ないが誰でも読める',
+    relation: '画面→HTML の順で調べ、原因（disabled 属性など）と、公開すべきでない情報の両方に気づけるようになる。',
+  }],
+  browser: {
+    url: 'https://portal.example.com/',
+    html: HTML,
+    tabs: ['elements', 'console'],
+    console: [{ level: 'log', text: 'ポータルを読み込みました', source: 'portal.js:1' }],
+    sources: { 'portal.js': "console.log('ポータルを読み込みました');" },
+    quick: ["document.querySelector('#send').disabled", "document.querySelector('#send').getAttribute('disabled')"],
+  },
+  tasks: [
+    {
+      q: 'Elements タブで、画面には表示されていない（「非表示」バッジが付く）リンクの id を答えてください。',
+      narration: 'nav の中のリンクは「お知らせ」「資料」の2つしか見えない。だが HTML には、もう1つ隠れたリンクがある。Elements なら、非表示の要素にも「非表示」バッジが付いて表示される。',
+      check: { type: 'answer', any: ['admin-link'], ci: true },
+      answerHint: 'id の値',
+      hints: ['Elements タブで html → body → header → nav と ▸ を開く', '「非表示」バッジが付いた <a> を探す', 'id="admin-link"'],
+      explain: '画面に出ないリンク（/admin/console 宛て）が HTML には残っていた。display:none は「見せない」だけで「アクセスできない」にはならない。管理画面を守るのはリンクを隠すことではなく、サーバー側の認証・認可。「隠す」と「守る」は別物、というのが最初の大事な理解。',
+    },
+    {
+      q: 'HTML には開発者が残したコメント（<!-- … -->）があります。そこに書かれている「旧環境」のホスト名を答えてください。',
+      narration: 'コメントは画面には一切出ないが、ブラウザには送られてくる。Elements では、灰色の <!-- … --> として表示される。',
+      check: { type: 'answer', any: ['stg-portal.example.com'], ci: true },
+      answerHint: 'ホスト名',
+      hints: ['<main> の中を展開する。灰色で表示されている行がコメント', '検索欄に「TODO」と入れても探せる', 'stg-portal.example.com'],
+      explain: '開発メモに検証用環境のホスト名が残っていた。コメントは「公開されるHTMLの一部」で、閲覧者全員に届く。社内の構成・TODO・パスワードなどをコメントに残したまま公開するのは、情報漏えいの典型的な原因。公開前にコメントを除去する（ビルドで自動削除する）運用が必要。',
+    },
+    {
+      q: 'フォームには画面に出ない hidden の入力欄があります。その name が form_token の値を答えてください。',
+      narration: 'type="hidden" の入力欄は、フォーム送信時にサーバーへ一緒に送られる「隠しデータ」。画面には出ないが、Elements で選べば value が読める。',
+      check: { type: 'answer', any: ['a91f-77c2-board-20'], ci: true },
+      answerHint: '値そのまま',
+      hints: ['<form id="feedback"> を展開する', 'type="hidden" の <input> をタップして属性を見る', 'value="a91f-77c2-board-20"'],
+      explain: 'hidden でも値は誰でも読めるし、書き換えもできる。hidden 欄を「ユーザーに見せない安全な入れ物」として使い、価格・権限・ユーザーIDなどをそこに置くと、書き換えられて悪用される（パラメータ改ざん）。サーバー側で必ず検証しよう。',
+    },
+    {
+      q: '送信ボタン（#send）が押せない原因は、ボタンに付いたある属性です。その属性名を答えてください。',
+      narration: 'ボタンが反応しない原因は、見た目ではなく属性にあることが多い。#send の行をタップして属性の一覧を確認する。',
+      check: { type: 'answer', any: ['disabled'], ci: true },
+      answerHint: '属性名',
+      hints: ['検索欄に #send と入力して、該当の行をタップする', '属性一覧（タップして編集）を見る', 'disabled 属性'],
+      explain: 'disabled 属性が付いていると、ボタンは押せない。属性の有無を確認できるのが Elements の強み。本物の不具合なら、なぜ disabled のままなのか（入力チェックのJSが動いていない等）を Console や Sources で追う。',
+    },
+    {
+      q: 'Elements の属性編集を使って、#send ボタンから disabled 属性を削除してください（ページ内だけの変更で、サーバーには影響しません）。',
+      narration: '属性の編集は「その場の実験」。原因の仮説が正しいかを、コードを直す前に確かめられる。',
+      check: { type: 'dev', dom: { sel: '#send', attr: { disabled: null } } },
+      noInput: true,
+      hints: ['#send を選択して、属性一覧の disabled の横の「削除」をタップ', 'DevTools の Elements タブで、選択した要素の属性欄を操作する', 'Console でも document.querySelector(\'#send\').removeAttribute(\'disabled\') で同じことができる'],
+      explain: 'disabled を外すとボタンが押せる状態になった。これは「原因の仮説を即座に検証する」ための操作で、元のソースは変わらない（再読み込みで元に戻る）。恒久的に直すには、HTML／JSを修正する必要がある。逆に言えば、画面側の制限（disabled・hidden・maxlength）はユーザー側で簡単に外せるので、サーバー側の検証が必須。',
+    },
+  ],
+  review: {
+    steps: ['Elements で html → body を展開して構造を見る', '「非表示」バッジ・コメント・hidden な入力欄を探す', '検索欄で #id / .class / テキストを検索する', '属性を編集して仮説を確かめる（サーバーには影響しない）'],
+    commands: [{ cmd: "document.querySelector('#send')", meaning: 'セレクタで要素を取り出す' }, { cmd: "el.getAttribute('disabled')", meaning: '属性の値を読む' }, { cmd: "el.removeAttribute('disabled')", meaning: '属性を削除する' }],
+    why: 'HTML は閲覧者全員に全文が届く。画面に出さないことは、守ることではない。',
+    practice: 'リリース前に自分のページを Elements で見て、コメント・hidden欄・display:none の要素に「公開すべきでない情報」が無いか点検する。',
+    related: ['Console', 'Sources', 'パラメータ改ざん', 'アクセス制御'],
+  },
+  learned: ['devtools-elements', 'dom-hidden-elements', 'html-comments-leak', 'hidden-input', 'attr-edit'],
+  solution: ["document.querySelector('#send').removeAttribute('disabled')"],
+};
+
+Object.assign(exports, { d02 });
+
+};
+__mods["js/missions/dt/d03-network.js"] = function (module, exports, __require) {
+// DevTools 3: Network — リクエスト一覧とステータスコード
+const HTML = `<!DOCTYPE html>
+<html><head><title>カフェ Leaf — メニュー</title><link rel="stylesheet" href="/css/main.css"></head>
+<body>
+<h1>カフェ Leaf</h1>
+<img src="/img/hero.jpg" alt="店内の写真">
+<ul id="menu"></ul>
+<script src="/js/menu.js"></script>
+<script src="https://cdn.tracker-example.net/t.js"></script>
+</body></html>`;
+
+const net = [
+  { url: '/', status: 200, mime: 'text/html', size: 4200, time: 120, start: 0, initiator: 'ナビゲーション', resHeaders: { 'content-type': 'text/html; charset=utf-8' } },
+  { url: '/css/main.css', status: 200, mime: 'text/css', size: 9800, time: 60, start: 130, initiator: '/ (HTML)' },
+  { url: '/img/hero.jpg', status: 200, mime: 'image/jpeg', size: 1840000, resourceSize: 1840000, time: 900, start: 130, initiator: '/ (HTML)', note: '約1.8MB の画像です。表示サイズに対して大きすぎます。' },
+  { url: '/js/menu.js', status: 200, mime: 'application/javascript', size: 14200, time: 80, start: 130, initiator: '/ (HTML)' },
+  { url: '/api/menu', status: 200, mime: 'application/json', size: 1900, time: 200, start: 230, initiator: 'menu.js:3', resBody: '{"items":[{"name":"ブレンド","price":450},{"name":"カフェラテ","price":520}]}' },
+  { url: '/img/logo.png', status: 404, mime: 'text/html', size: 310, time: 40, start: 140, initiator: '/ (HTML)' },
+  { url: '/api/recommend', status: 500, mime: 'application/json', size: 120, time: 300, start: 240, initiator: 'menu.js:9', method: 'POST', reqBody: '{"area":"tokyo"}', resBody: '{"error":"internal server error"}' },
+  { url: 'https://cdn.tracker-example.net/t.js', status: 200, mime: 'application/javascript', size: 31000, time: 350, start: 140, initiator: '/ (HTML)' },
+  { url: '/js/old-widget.js', status: 304, mime: 'application/javascript', size: 180, time: 25, start: 135, initiator: '/ (HTML)', fromCache: false },
+];
+
+const d03 = {
+  id: 'dv-03-network',
+  title: 'Network: 通信の一覧を読む',
+  minutes: 14,
+  objectives: ['Network タブでリクエスト一覧を読める', 'ステータスコード（2xx/3xx/4xx/5xx）の意味と失敗の見分け方を理解する', 'フィルタで知りたい種類の通信を絞り込める'],
+  prereq: ['dv-02-elements'],
+  briefing: 'カフェのメニューページで、ロゴが出ない・おすすめ欄が空になる、と報告があった。画面を作るために、ブラウザは裏で何十もの通信（リクエスト）をしている。Network タブはそのすべてを時系列で一覧にしてくれる。',
+  concepts: [{
+    title: 'Network タブとステータスコード',
+    why: '画面が壊れる原因の多くは通信の失敗。「どのリクエストが」「どんなステータスで」失敗したかが分かれば、サーバー側か、ブラウザ側か、場所を絞れる。',
+    problem: '画像が出ない・データが空、という症状だけでは、URLの間違い・サーバーの障害・権限・ネットワークのどれなのか分からない。',
+    how: '一覧の1行が1リクエスト。左からメソッド・名前・ステータス。ステータスは 2xx=成功、3xx=転送/キャッシュ、4xx=リクエスト側の問題（404 見つからない、401 未認証、403 権限なし）、5xx=サーバー側の障害（500 内部エラー）。赤い行は失敗。上のフィルタ（Fetch/XHR、JS、CSS、Img…）で種類を絞れる。行をタップすると詳細が開く。',
+    example: 'GET  logo.png       404   ← URLが違う／ファイルが無い\nPOST recommend      500   ← サーバー側の障害',
+    relation: '失敗した行を見つけ、ステータスの桁で原因の側（クライアント／サーバー）を切り分ける。',
+  }],
+  browser: {
+    url: 'https://leaf-cafe.example.com/menu',
+    html: HTML,
+    tabs: ['network', 'console'],
+    console: [
+      { level: 'error', text: 'Failed to load resource: the server responded with a status of 404 ()', source: 'leaf-cafe.example.com/img/logo.png' },
+      { level: 'error', text: 'Failed to load resource: the server responded with a status of 500 ()', source: 'leaf-cafe.example.com/api/recommend' },
+    ],
+    network: net,
+  },
+  tasks: [
+    {
+      q: 'Network タブで、ステータスが 404 になっているリクエストの「名前」（ファイル名）を答えてください。',
+      narration: '一覧の中で、赤い行を探す。404 は「そのURLには何も無い」というステータス。',
+      check: { type: 'answer', any: ['logo.png'], ci: true },
+      answerHint: 'ファイル名',
+      hints: ['Network タブを開き、一覧の赤い行（ステータスが赤）を探す', '404 と書かれた行の名前欄を読む', 'logo.png'],
+      explain: '404 Not Found は「URLが間違っているか、ファイルが存在しない」。画像が出ない原因はこれ。参照パスのタイプミス、デプロイ漏れ、ファイル名の大文字小文字の違いなどが定番の原因。',
+    },
+    {
+      q: 'おすすめ欄が空になる原因のリクエスト（/api/recommend）のステータスコードを答えてください。',
+      narration: 'データを取りに行く通信（Fetch/XHR）の失敗は、画面の「空」として現れる。種類のフィルタを使うと見つけやすい。',
+      check: { type: 'answer', any: ['500'] },
+      answerHint: '3桁の数字',
+      hints: ['フィルタの「Fetch/XHR」を押して、データ取得の通信だけにする', 'recommend の行の右端のステータスを読む', '500'],
+      explain: '500 Internal Server Error は「サーバー側で何か失敗した」。4xx とは違い、リクエストを送った側（ブラウザ）の問題ではないので、直すのはサーバー側。フロントエンドとしては、失敗時の表示（エラー表示・再試行）を用意しておくのも大事。',
+    },
+    {
+      q: 'Network のフィルタ「Fetch/XHR」を使い、API の通信だけを表示してください。',
+      narration: '通信が何十件もあると、目的のものが埋もれる。フィルタは Network を使いこなす最初の一歩。',
+      check: { type: 'dev', filterUsed: 'fetch' },
+      noInput: true,
+      hints: ['Network タブ上部のチップ（すべて／Fetch/XHR／JS…）を見る', '「Fetch/XHR」をタップする', 'タップするとフィルタが有効になる'],
+      explain: 'Fetch/XHR は、JavaScriptが裏でAPIを呼ぶ通信。SPA（画面遷移なしで動くアプリ）の不具合調査では、まずここを見る。JS・CSS・Img などで絞れば、読み込み漏れや巨大ファイルも探しやすい。',
+    },
+    {
+      q: 'このページが読み込んでいる、別ドメイン（第三者）のスクリプトのホスト名を答えてください。第三者のホストはオレンジ色で表示されます。',
+      narration: 'ページは自分のサーバーだけでなく、広告・解析・CDN など外部のサービスからも読み込む。Host 欄で自分以外のドメインを探す。',
+      check: { type: 'answer', any: ['cdn.tracker-example.net'], ci: true },
+      answerHint: 'ホスト名',
+      hints: ['一覧の各行の右端にホスト名がある', 'leaf-cafe.example.com 以外のものを探す（オレンジ色）', 'cdn.tracker-example.net'],
+      explain: '外部ドメインのスクリプトは、読み込んだ時点でそのページ上で動く強い権限を持つ（Cookie以外のページ内容は全部読める）。便利だが、相手が改ざんされると自分のサイトも巻き込まれる（サプライチェーンリスク）。どこの外部サービスを使っているか、Network で棚卸しできる。',
+    },
+    {
+      q: 'もっとも転送サイズの大きいリクエストの名前を答えてください（Img フィルタで画像を絞って確認できます）。',
+      narration: '表示が遅いときは「何が重いか」を探す。サイズの大きいものから見ていくのが定石。',
+      check: { type: 'answer', any: ['hero.jpg'], ci: true },
+      answerHint: 'ファイル名',
+      hints: ['各行の2段目にサイズ（kB/MB）が出ている', '1つだけ MB 単位のものがある', 'hero.jpg（約1.8MB）'],
+      explain: 'hero.jpg が約1.8MB で、ページ全体の大半を占めている。画像の圧縮・サイズ縮小・新形式（WebP/AVIF）への変更は、表示速度改善で最も効果が大きい施策のひとつ。次のミッション以降で、通信量を回線速度別にも見ていく。',
+    },
+  ],
+  review: {
+    steps: ['Network で読み込み直し、赤い行（失敗）を探す', 'ステータスの桁（4xx / 5xx）で切り分ける', 'フィルタ（Fetch/XHR・JS・Img）で種類を絞る', 'ホスト欄で第三者ドメインを確認、サイズで重いものを探す'],
+    commands: [{ cmd: '404', meaning: '見つからない（URL・ファイルの問題）' }, { cmd: '500', meaning: 'サーバー内部の障害' }, { cmd: 'Fetch/XHR', meaning: 'JavaScript が行うデータ取得だけを表示するフィルタ' }],
+    why: '画面の不具合の多くは「通信のどこかが失敗している」。一覧を見れば、原因の場所（クライアント／サーバー／外部）が一目で分かる。',
+    practice: '不具合報告に「Network のスクリーンショット」を添えてもらうと、再現できない問題でも原因の目星が付く。',
+    related: ['ステータスコード', 'Headers', 'サプライチェーンリスク', 'パフォーマンス'],
+  },
+  learned: ['devtools-network', 'http-status-codes', 'network-filter', 'third-party-requests', 'resource-size'],
+  solution: [{ do: 'setFilter', args: ['fetch'] }],
+};
+
+Object.assign(exports, { d03 });
+
+};
+__mods["js/missions/dt/d04-headers.js"] = function (module, exports, __require) {
+// DevTools 4: Network 詳細 — ヘッダ・ペイロード・レスポンス
+const HTML = `<!DOCTYPE html>
+<html><head><title>書店 Pageturn — ログイン</title></head>
+<body>
+<h1>Pageturn</h1>
+<form id="login"><input name="email" type="email" placeholder="メールアドレス"><input name="password" type="password" placeholder="パスワード"><button type="submit">ログイン</button></form>
+<div id="msg"></div>
+<script src="/static/login.js"></script>
+</body></html>`;
+
+const net = [
+  { id: 'doc', url: '/login', status: 200, mime: 'text/html', size: 2800, time: 140, start: 0, initiator: 'ナビゲーション', remote: '203.0.113.20:443',
+    resHeaders: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'strict-transport-security': 'max-age=31536000', 'server': 'nginx' },
+    reqHeaders: { 'accept': 'text/html', 'user-agent': 'Mozilla/5.0 (Linux; Android 13)' } },
+  { id: 'js', url: '/static/login.js', status: 200, mime: 'application/javascript', size: 3100, time: 60, start: 150, initiator: '/login (HTML)',
+    resHeaders: { 'content-type': 'application/javascript', 'cache-control': 'public, max-age=31536000, immutable' } },
+  { id: 'login', url: '/api/v1/login', method: 'POST', status: 401, mime: 'application/json', size: 190, time: 220, start: 260, initiator: 'login.js:12', remote: '203.0.113.20:443',
+    reqHeaders: { 'content-type': 'application/json', 'accept': 'application/json', 'origin': 'https://pageturn.example.com', 'x-request-id': 'req-5f3a91' },
+    resHeaders: { 'content-type': 'application/json', 'www-authenticate': 'Bearer realm="pageturn"', 'x-ratelimit-remaining': '4' },
+    reqBody: '{"email":"reader@example.com","password":"●●●●●●●●"}',
+    resBody: '{"error":"invalid_credentials","message":"メールアドレスまたはパスワードが違います","attempts_left":4}',
+    note: '401 Unauthorized: 認証に失敗しました。' },
+  { id: 'search', url: '/api/v1/books?q=nature&page=2&sort=new', status: 200, mime: 'application/json', size: 2400, time: 180, start: 300, initiator: 'login.js:30',
+    reqHeaders: { 'accept': 'application/json' }, resHeaders: { 'content-type': 'application/json', 'cache-control': 'private, max-age=60' },
+    resBody: '{"page":2,"total":57,"books":[{"id":101,"title":"森の記録"},{"id":102,"title":"川の音"}]}' },
+];
+
+const d04 = {
+  id: 'dv-04-headers',
+  title: 'Network 詳細: ヘッダ・送信内容・レスポンス',
+  minutes: 15,
+  objectives: ['リクエストを開き、Headers / Payload / Response / Timing の見方を理解する', 'リクエストヘッダとレスポンスヘッダの違いを説明できる', 'ログイン失敗などの原因を、通信の中身から読み取る'],
+  prereq: ['dv-03-network'],
+  briefing: '書店 Pageturn のログインで「パスワードを正しく入れたのに失敗する」という問い合わせが来た。画面には「違います」としか出ない。Network の詳細を開けば、実際に何を送り、サーバーが何と返したかが読める。',
+  concepts: [{
+    title: 'リクエストとレスポンスの中身',
+    why: '通信は「送った内容（リクエスト）」と「返ってきた内容（レスポンス）」の往復。不具合は、どちらかの中身が想定と違うことで起きる。',
+    problem: '画面のエラー文は要約でしかない。実際に何が送られたか・返ったかを見ないと、原因を断定できない。',
+    how: '行をタップすると詳細が開き、4つのタブがある。Headers=URL・メソッド・ステータスと、リクエスト/レスポンス両方のヘッダ。Payload=クエリ文字列（?q=… の分解）と送信した本文。Response=サーバーが返した本文。Timing=所要時間。ヘッダは「通信の取扱説明書」で、種類・認証・キャッシュ方針などが書かれる。',
+    example: 'POST /api/v1/login   Status: 401\nRequest Headers: content-type: application/json\nPayload: {"email": …}\nResponse: {"error":"invalid_credentials"}',
+    relation: 'まず Headers で成否と条件を確認し、Payload で送った内容、Response でサーバーの言い分を読む。',
+  }],
+  browser: {
+    url: 'https://pageturn.example.com/login',
+    html: HTML,
+    tabs: ['network', 'console'],
+    console: [{ level: 'error', text: 'Failed to load resource: the server responded with a status of 401 ()', source: 'pageturn.example.com/api/v1/login' }],
+    sources: { 'login.js': '// ログイン処理\n' },
+    network: net,
+  },
+  tasks: [
+    {
+      q: 'Network タブで、ログイン API（/api/v1/login）の行をタップして詳細を開いてください。',
+      narration: '詳細は、一覧の行をタップすると開く。「‹ 一覧へ」で戻れる。',
+      check: { type: 'dev', viewedRequest: 'login' },
+      noInput: true,
+      hints: ['Network タブを開く', '名前が login の行を探す（メソッドは POST）', '行をタップする'],
+      explain: '詳細を開くと、ヘッダ・送信内容・レスポンス・タイミングが見られる。まずは Headers の「General」で、URL・メソッド・ステータスを確認するのが定番の入口。',
+    },
+    {
+      q: 'このログイン通信のステータスコードを答えてください（Headers タブの Status Code）。',
+      narration: 'ステータスは成否の第一声。数字だけでなく、その後ろの文言（Unauthorized など）も大事な情報。',
+      check: { type: 'answer', any: ['401'] },
+      answerHint: '3桁の数字',
+      hints: ['詳細の Headers タブ、全般 (General) を見る', 'Status Code の行', '401（Unauthorized）'],
+      explain: '401 Unauthorized は「認証が通っていない（誰か分からない／資格情報が違う）」。似た 403 Forbidden は「誰かは分かったが、権限がない」。この区別は、認証（あなたは誰か）と認可（何をしてよいか）の違いそのもの。',
+    },
+    {
+      q: 'Payload タブでサーバーに送られた内容を見て、送信された JSON の email の値を答えてください。',
+      narration: 'Payload には、ブラウザがサーバーへ送った本文が出る。ログインフォームの入力が、どう送られたかが分かる。',
+      check: { type: 'answer', any: ['reader@example.com'], ci: true },
+      answerHint: 'メールアドレス',
+      hints: ['詳細の Payload タブを開く', '「送信内容 (Request Payload)」を読む', 'reader@example.com'],
+      explain: '入力した値がそのまま送られている（このデモではパスワードは伏せ字）。通信が HTTPS でなければ、この内容は経路上で盗み見られる。パスワードを URL のクエリに載せるのも厳禁（履歴・ログに残る）。ここで「POST の本文に入れる」理由が分かる。',
+    },
+    {
+      q: 'Response タブで、サーバーが返した JSON の attempts_left（残り試行回数）の値を答えてください。',
+      narration: 'サーバーは画面に出ない詳しい情報も返していることがある。ログインのやり直しが何回できるか、ここに書かれている。',
+      check: { type: 'answer', any: ['4'] },
+      answerHint: '数字',
+      hints: ['詳細の Response タブ', '返ってきた JSON の中の attempts_left', '4'],
+      explain: 'パスワード試行の残り回数（ロックアウト）が返っている。総当たりを防ぐ仕組みの一部。ただし「ユーザーが存在するか」を示すメッセージの出し分けは、アカウント列挙に使われかねないので、エラー文は同じ内容に揃えるのが定石。',
+    },
+    {
+      q: 'この通信のレスポンスヘッダ x-ratelimit-remaining の値を答えてください（Headers タブのレスポンスヘッダ）。',
+      narration: 'ヘッダは「本文以外のメタ情報」。レート制限（一定時間内の回数制限）の残りなども、ヘッダで通知される。',
+      check: { type: 'answer', any: ['4'] },
+      answerHint: '数字',
+      hints: ['Headers タブの「レスポンスヘッダ (Response Headers)」を見る', 'x-ratelimit-remaining の行', '4'],
+      explain: 'レスポンスヘッダでは、キャッシュ方針（cache-control）、認証方式（www-authenticate）、制限の残り（x-ratelimit-*）などが分かる。リクエストヘッダ（ブラウザ→サーバー）とは向きが違う、という点を押さえておこう。',
+    },
+    {
+      q: '別の通信 /api/v1/books?q=nature&page=2&sort=new の Payload で、クエリパラメータ page の値を答えてください。',
+      narration: 'URL の ? 以降（クエリ文字列）は、Payload タブで1項目ずつ分解して表示される。検索や並び替えの条件が一目で分かる。',
+      check: { type: 'answer', any: ['2'] },
+      answerHint: '数字',
+      hints: ['一覧の books の行をタップする（「‹ 一覧へ」で戻れる）', 'Payload タブのクエリパラメータ', 'page = 2'],
+      explain: 'クエリパラメータは、URL を見るより分解表示のほうが読みやすい。GET でデータを取る通信では、パラメータが条件のすべて。変な値が送られている／想定した値が送られていない、という原因を見つけるのに役立つ。',
+    },
+  ],
+  review: {
+    steps: ['一覧から対象のリクエストを開く', 'Headers: URL・メソッド・ステータス・各ヘッダを見る', 'Payload: クエリと送信本文を確認する', 'Response: サーバーの返答と、期待との差を探す'],
+    commands: [{ cmd: 'Headers', meaning: 'URL・ステータス・リクエスト/レスポンスのヘッダ' }, { cmd: 'Payload', meaning: 'クエリパラメータと送信した本文' }, { cmd: 'Response', meaning: 'サーバーが返した本文' }],
+    why: '「送ったもの」と「返ってきたもの」を直接見れば、画面のメッセージに頼らず原因を断定できる。',
+    practice: 'API の不具合報告では、該当リクエストの Headers/Payload/Response（機密は伏せて）を共有してもらうと、フロントとサーバーのどちらの問題かがすぐ分かる。',
+    related: ['HTTP ヘッダ', '401 と 403', 'レート制限', '認証と認可'],
+  },
+  learned: ['network-detail', 'request-response-headers', 'payload-vs-response', 'status-401-403', 'query-params'],
+  solution: [{ do: 'openRequest', args: ['login'] }],
+};
+
+Object.assign(exports, { d04 });
+
+};
 __mods["js/missions/stage-devtools1.js"] = function (module, exports, __require) {
 // DevTools コース I — 画面の裏側を見る
 const { d01 } = __require("js/missions/dt/d01-console.js");
+const { d02 } = __require("js/missions/dt/d02-elements.js");
+const { d03 } = __require("js/missions/dt/d03-network.js");
+const { d04 } = __require("js/missions/dt/d04-headers.js");
 
 const stageDevtools1 = {
   id: 'dt-basics',
@@ -10961,10 +11281,659 @@ const stageDevtools1 = {
   title: 'DevTools I — 画面の裏側を見る',
   subtitle: 'Console・Elements・Network で、ブラウザが裏でやっていることを読む',
   intro: 'ブラウザの開発者ツール(DevTools)は、画面の「裏側」を見るための道具。スマホでは直接開けないので、ここでは架空のWebページを使った疑似DevToolsで練習する。画面の見え方は同じなので、PCで本物を開いたときにそのまま使える。',
-  missions: [d01],
+  missions: [d01, d02, d03, d04],
 };
 
 Object.assign(exports, { stageDevtools1 });
+
+};
+__mods["js/missions/dt/d05-storage.js"] = function (module, exports, __require) {
+// DevTools 5: Application — Storage と Cookie
+const HTML = `<!DOCTYPE html>
+<html><head><title>Mochi Market</title></head>
+<body>
+<header><h1>Mochi Market</h1><button id="theme-toggle">テーマ切替</button></header>
+<main><p>カートに入っている商品を確認できます。</p><div id="cart-count"></div></main>
+<script src="/js/shop.js"></script>
+</body></html>`;
+
+const d05 = {
+  id: 'dv-05-application',
+  title: 'Application: Storage と Cookie を読む',
+  minutes: 15,
+  objectives: ['Local Storage / Session Storage / Cookie の違いを説明できる', 'Cookie の HttpOnly / Secure / SameSite を読める', '「ブラウザに保存した秘密は読まれうる」という前提を理解する'],
+  prereq: ['dv-04-headers'],
+  briefing: 'ECサイト Mochi Market では、カートの中身やログイン状態がブラウザ内に保存されている。ページを閉じても残るのはなぜか？ どこに何が入っているのか？ Application タブで保存領域を直接のぞいてみよう。',
+  concepts: [{
+    title: 'ブラウザが覚えている場所',
+    why: 'ログイン状態・カート・設定は、ブラウザ側に保存されている。セキュリティ設計の多くは「何を、どこに、どの保護付きで置くか」の判断。',
+    problem: '保存場所ごとに性質が違う。選択を間違えると、他人に盗まれたり、勝手に送信されたりする。',
+    how: 'Local Storage=閉じても残る・JSから読み書き自由。Session Storage=タブを閉じると消える・JSから読める。Cookie=サーバーへ自動送信される小さな値。Cookie には保護の属性がある: HttpOnly(JSから読めない)、Secure(HTTPSでだけ送信)、SameSite(他サイトからの送信を制限)。Application タブでは、これらの中身と属性が一覧できる。',
+    example: 'localStorage: theme = "dark"\nCookie: sid  HttpOnly✓ Secure✓ SameSite=Lax\nCookie: auth_token  HttpOnly✗  ← JSから読める！',
+    relation: '保存の中身と属性を確認し、ユーザーのJSが読めるもの・盗まれたら困るものを見分ける。',
+  }],
+  browser: {
+    url: 'https://mochi-market.example.com/',
+    html: HTML,
+    tabs: ['application', 'console'],
+    storage: {
+      local: { theme: 'dark', cart: '[{"id":11,"qty":1},{"id":24,"qty":2},{"id":31,"qty":1}]', access_token: 'mm_at_5c1e90aa77' },
+      session: { checkout_step: '2' },
+      cookies: [
+        { name: 'sid', value: 'S-4b7d0e19c2', httpOnly: true, secure: true, sameSite: 'Lax', path: '/' },
+        { name: 'auth_token', value: 'mm_ck_77aa31d0', httpOnly: false, secure: true, sameSite: '', path: '/' },
+        { name: 'pref_lang', value: 'ja', httpOnly: false, secure: false, sameSite: 'Lax', path: '/', expires: '2027-01-01' },
+      ],
+    },
+    sources: { 'shop.js': "const theme = localStorage.getItem('theme');" },
+    quick: ["localStorage.getItem('theme')", "JSON.parse(localStorage.getItem('cart')).length", 'document.cookie', "Object.keys(localStorage)"],
+  },
+  tasks: [
+    {
+      q: 'Application タブの Local Storage を開き、キー theme の値を答えてください。',
+      narration: 'Local Storage は、サイトごとに用意された「ブラウザ内の小さな保存庫」。設定の記憶によく使われる。',
+      check: { type: 'answer', any: ['dark'], ci: true },
+      answerHint: '値',
+      hints: ['Application タブ → Local Storage', 'キー theme の行を読む', 'dark'],
+      explain: 'テーマ設定のような「見られても困らない」ものの保存は、Local Storage の正しい使い道。ブラウザを閉じても残る。逆に、見られたら困るものを置くべきではない。',
+    },
+    {
+      q: 'キー cart の値は JSON です。Console で JSON.parse(localStorage.getItem(\'cart\')).length を実行して、カートの商品種類数を答えてください。',
+      narration: 'Storage の値は文字列だけ。配列や辞書は JSON 文字列にして保存される。JSON.parse で戻せば、Console から中身を数えられる。',
+      check: { type: 'answer', any: ['3'] },
+      answerHint: '数字',
+      hints: ['Console タブで localStorage.getItem(\'cart\') を実行すると文字列が見える', 'JSON.parse(…) で配列に戻し、.length で個数', '3'],
+      explain: '3件。ブラウザ内に保存したデータは、ユーザー自身がいつでも書き換えられる。カートの単価や割引率をここに置いて信用すると、改ざんされる。金額計算はサーバー側で行うのが原則。',
+    },
+    {
+      q: 'Local Storage に、ログイン用のトークンらしき項目があります。そのキー名を答えてください。',
+      narration: 'トークンは「ログイン済みであること」を示す合言葉のようなもの。持っている人は、本人として扱われる。',
+      check: { type: 'answer', any: ['access_token'], ci: true },
+      answerHint: 'キー名',
+      hints: ['Local Storage の一覧を上から読む', 'token という語が入ったキー', 'access_token'],
+      explain: 'Local Storage のトークンは、同じサイトで動くJS（XSSで混入した悪意あるスクリプトも）から読める。盗まれると、パスワードなしで本人になりすまされる。認証情報は、HttpOnly Cookie など JS から読めない場所に置く設計が安全寄り。',
+    },
+    {
+      q: 'Cookies の中で、「認証用に見えるのに HttpOnly が付いていない」Cookie の名前を答えてください。',
+      narration: 'Cookie の下に、HttpOnly / Secure / SameSite の3つの属性が出ている。✓ が付いていれば保護あり、✗ は保護なし。',
+      check: { type: 'answer', any: ['auth_token'], ci: true },
+      answerHint: 'Cookie 名',
+      hints: ['Application → Cookies を開く', '各 Cookie の HttpOnly の ✓/✗ を見る', 'auth_token'],
+      explain: 'HttpOnly が無い認証 Cookie は、XSS でスクリプトを仕込まれたとき document.cookie で盗める。sid のように HttpOnly+Secure+SameSite が揃っているのが理想の姿。pref_lang のような言語設定なら、保護が弱くても被害は小さい。',
+    },
+    {
+      q: 'Console で document.cookie を実行すると、現在のページから読める Cookie が出ます。そこに表示される Cookie の「個数」を答えてください。',
+      narration: 'HttpOnly の Cookie は、JavaScript からは見えない（それが保護の仕組み）。Console の結果から、何個見えるか数えてみよう。',
+      check: { type: 'answer', any: ['2'] },
+      answerHint: '数字',
+      hints: ['Console で document.cookie を実行し、「;」で区切られた項目を数える', 'HttpOnly の Cookie は結果に含まれない', '2（sid は見えない）'],
+      explain: 'Cookie は3つあるのに、JS から見えるのは2つだけ。HttpOnly の sid は JS から隠されている。これが「XSS が起きても、セッションCookieは盗めない」という保護。属性ひとつの差が、被害の大きさを分ける。',
+    },
+    {
+      q: '「テーマ設定をリセットする」操作として、Local Storage の theme を削除してください（Application タブの削除、または Console の localStorage.removeItem で）。',
+      narration: 'ストレージの編集は、デバッグでよく使う。「初回アクセス時の状態」を再現したいときなどに便利。',
+      check: { type: 'dev', storage: { local: { theme: null } } },
+      noInput: true,
+      hints: ['Application → Local Storage の theme 行', '行の右の「削除」をタップ', "Console なら localStorage.removeItem('theme')"],
+      explain: '保存データを消して「初回の状態」でテストするのは、再現テストの基本。ただし本物のサイトで Cookie やストレージを消すとログアウトするので、操作の影響は考えてから行うこと。',
+    },
+  ],
+  review: {
+    steps: ['Application タブで Local / Session Storage と Cookie を開く', '保存されている値の種類・機密性を見る', 'Cookie の HttpOnly / Secure / SameSite を確認する', 'JS から読めるものに秘密が入っていないか点検する'],
+    commands: [{ cmd: "localStorage.getItem('key')", meaning: 'Local Storage の値を読む' }, { cmd: 'document.cookie', meaning: 'JS から見える Cookie（HttpOnly は除く）' }, { cmd: "localStorage.removeItem('key')", meaning: '項目を削除する' }],
+    why: '「ブラウザに置いたものは、持ち主（ユーザー）と、同じページで動くJSに読まれる」。何をどこに置くかは設計上の重大な判断。',
+    practice: '認証Cookieは HttpOnly + Secure + SameSite を付ける。トークンの置き場所と属性は、レビューで必ず確認する項目。',
+    related: ['XSS', 'セッション管理', 'CSRF と SameSite', 'JWT'],
+  },
+  learned: ['devtools-application', 'web-storage', 'cookie-flags', 'httponly', 'token-storage-risk'],
+  solution: ["JSON.parse(localStorage.getItem('cart')).length", 'document.cookie', "localStorage.removeItem('theme')"],
+};
+
+Object.assign(exports, { d05 });
+
+};
+__mods["js/missions/dt/d06-sources.js"] = function (module, exports, __require) {
+// DevTools 6: Sources — ソースの全文検索・整形表示（フロントに残る秘密）
+const HTML = `<!DOCTYPE html>
+<html><head><title>NoteBox</title></head>
+<body><h1>NoteBox</h1><div id="app"></div>
+<script src="/js/config.js"></script><script src="/js/app.min.js"></script>
+</body></html>`;
+
+const CONFIG = `// NoteBox 設定
+const CONFIG = {
+  apiBase: 'https://api.notebox.example.com',
+  apiKey: 'demo-key-7f3a9c',   // TODO: サーバー側へ移す
+  debug: false,
+};`;
+
+const MIN = `!function(){var c=window.CONFIG||{},u=c.apiBase;function g(p,o){return fetch(u+p,Object.assign({headers:{"X-Api-Key":c.apiKey}},o))}function l(){g("/v1/notes").then(function(r){return r.json()}).then(function(d){document.getElementById("app").textContent=d.length+" notes"})}function x(){g("/internal/v2/export",{method:"POST"})}window.NoteBox={load:l,exportAll:x};l()}();
+//# sourceMappingURL=app.min.js.map`;
+
+const d06 = {
+  id: 'dv-06-sources',
+  title: 'Sources: ソースを検索・整形して読む',
+  minutes: 15,
+  objectives: ['Sources で JS ファイルを開き、全文検索できる', '圧縮(minify)されたコードを整形表示して読める', 'フロントのコードに残る機密（APIキー・内部URL・ソースマップ）の危険を理解する'],
+  prereq: ['dv-05-application'],
+  briefing: 'メモアプリ NoteBox のセキュリティ点検を頼まれた。ブラウザに届く JavaScript は、そのまま全部読める。つまり、そこに何が書かれているかが「世界に公開されている情報」。Sources タブで、公開されている情報を棚卸ししよう。',
+  concepts: [{
+    title: 'Sources と minify',
+    why: 'ページを動かす JS はブラウザに全文が送られる。開発者が「見られないはず」と思っていても、実際は誰でも読める。',
+    problem: 'ソース内に APIキー・内部URL・コメントの TODO などが残ると、そこから攻撃の手がかりが得られてしまう。',
+    how: 'Sources タブでは、ページが読み込んだファイルを開ける。上部の検索欄は全ファイル横断の検索（key / token / password など）。サイズ削減のため1行に圧縮(minify)されたコードは、「{} 整形表示」で読みやすくできる。行番号をタップするとブレークポイントが置ける（次のミッション）。ファイル末尾の sourceMappingURL は、元のコードを復元できる「ソースマップ」の場所を示す。',
+    example: "apiKey: 'demo-key-7f3a9c',   // フロントに置いた時点で公開情報\n//# sourceMappingURL=app.min.js.map  ← 元コードが復元できる",
+    relation: '検索で気になる語を探し、整形して読み、機密が公開されていないかを点検する。',
+  }],
+  browser: {
+    url: 'https://notebox.example.com/',
+    html: HTML,
+    tabs: ['sources', 'console', 'network'],
+    sources: { 'config.js': CONFIG, 'app.min.js': MIN },
+    network: [
+      { url: '/', status: 200, mime: 'text/html', size: 900, time: 80 },
+      { url: '/js/config.js', status: 200, mime: 'application/javascript', size: 230, time: 40, start: 90 },
+      { url: '/js/app.min.js', status: 200, mime: 'application/javascript', size: 560, time: 40, start: 90 },
+    ],
+  },
+  tasks: [
+    {
+      q: 'Sources タブの全文検索で「apiKey」を検索してください。',
+      narration: '設定やキーのような文字列は、ファイルを1つずつ開くより、全ファイル検索のほうが速い。検索欄に語を入れて「検索」を押す。',
+      check: { type: 'dev', searched: 'apikey' },
+      noInput: true,
+      hints: ['Sources タブの一番上の検索欄に入力する', '「apiKey」と入力して「検索」をタップ', '結果の行をタップすると、該当行が開く'],
+      explain: '全文検索は、キー・トークン・パスワード・内部URL・TODO など、「置いてはいけない語」を探す最速の方法。セキュリティ点検（棚卸し）の基本動作。',
+    },
+    {
+      q: '検索で見つかった apiKey の値（引用符の中身）を答えてください。',
+      narration: 'config.js に、アプリが API を呼ぶときに使うキーが書かれている。コメントにも注目。',
+      check: { type: 'answer', any: ['demo-key-7f3a9c'], ci: true },
+      answerHint: 'キーの文字列',
+      hints: ['検索結果の config.js の行をタップして開く', 'apiKey: の右側の引用符の中', 'demo-key-7f3a9c'],
+      explain: 'ブラウザに届くコードに入れたキーは、全員に公開されているのと同じ。コメントの「TODO: サーバー側へ移す」が示す通り、秘密のキーはサーバー側に置き、フロントからはサーバー経由で呼ぶ設計にする。もし実運用でこうなっていたら、キーを失効させて再発行する。',
+    },
+    {
+      q: 'app.min.js は1行に圧縮されて読みにくい状態です。「{} 整形表示」を使って読みやすくしてください。',
+      narration: '本番のJSは、サイズを小さくするため改行や空白が削られている（minify）。整形表示は、読むための補助。',
+      check: { type: 'dev', prettyPrinted: 'app.min.js' },
+      noInput: true,
+      hints: ['ファイル名 app.min.js をタップして開く', 'ファイル名の下の「{} 整形表示」ボタンを押す', 'ボタンを押すと改行・インデントされる'],
+      explain: '整形（pretty print）は、元のコードの意味を変えずに見た目だけを整える。minify は「読みにくくする」だけで、「隠す」わけではない。難読化も、時間をかければ読み解ける。秘密を守る手段にはならない。',
+    },
+    {
+      q: '整形したコードを読んで、「エクスポート」機能が呼んでいる API のパス（/ から始まる）を答えてください。',
+      narration: 'ユーザー画面には出ていない機能の入口が、コードの中には残っていることがある。関数名 x が呼ぶ先を読んでみよう。',
+      check: { type: 'answer', any: ['/internal/v2/export'], ci: true },
+      answerHint: '/ から始まるパス',
+      hints: ['整形表示で、POST を使っている行を探す', 'g("/…", {method:"POST"}) の最初の引数', '/internal/v2/export'],
+      explain: '画面には出ない内部向け API（/internal/…）の存在が、フロントのコードから分かってしまう。URLを知られるだけでは問題ではないが、「内部用だから認証不要」にしていると悪用される。アクセス制御は常にサーバー側で行う。',
+    },
+    {
+      q: 'app.min.js の最終行のコメントに書かれている、ソースマップのファイル名を答えてください。',
+      narration: '最終行の `//# sourceMappingURL=…` は、「圧縮前の元コードを復元するための対応表」の場所。デバッグには便利だが、本番では扱いに注意が要る。',
+      check: { type: 'answer', any: ['app.min.js.map'], ci: true },
+      answerHint: 'ファイル名',
+      hints: ['app.min.js を開き、一番下の行を見る', 'sourceMappingURL= の右側', 'app.min.js.map'],
+      explain: 'ソースマップが公開されていると、圧縮前の元コード（変数名・コメント・ディレクトリ構造）が復元できてしまう。本番では非公開にするか、エラー監視サービスにだけ渡す運用が一般的。「見せたくないものは、そもそもフロントに置かない」が大原則。',
+    },
+  ],
+  review: {
+    steps: ['Sources で読み込まれているファイルを一覧する', '全文検索で key / token / password / TODO / internal を探す', '圧縮コードは整形表示して読む', 'ソースマップの公開状況を確認する'],
+    commands: [{ cmd: '全文検索', meaning: '全ファイルから語を探す' }, { cmd: '{} 整形表示', meaning: '圧縮コードを読みやすくする' }, { cmd: 'sourceMappingURL', meaning: '元コード復元用の対応表の場所' }],
+    why: 'フロントのコードは全公開。そこに秘密があれば、それは秘密ではない。',
+    practice: 'リリース前に、ビルド成果物（minify後のJS）を全文検索して、キー・内部URL・コメントの残骸がないか確認する。',
+    related: ['シークレット管理', 'アクセス制御', 'ソースマップ', 'ビルドパイプライン'],
+  },
+  learned: ['devtools-sources', 'source-search', 'pretty-print', 'frontend-secrets', 'source-maps'],
+  solution: [{ do: 'searchSources', args: ['apiKey'] }, { do: 'prettyPrint', args: ['app.min.js'] }],
+};
+
+Object.assign(exports, { d06 });
+
+};
+__mods["js/missions/dt/d07-debugger.js"] = function (module, exports, __require) {
+// DevTools 7: Sources のデバッガ — ブレークポイントで実行を止めて変数を読む
+const HTML = `<!DOCTYPE html>
+<html><head><title>Shop Cart</title></head>
+<body><h1>カート</h1><ul id="lines"></ul><p>合計: <span id="total">-</span></p><button id="checkout">購入手続きへ</button>
+<script src="/js/cart.js"></script></body></html>`;
+
+const CART = `// カートの合計金額を計算する
+const COUPON_RATE = 0.2;          // 20% 割引
+
+function calcTotal(items, coupon) {
+  let subtotal = 0;
+  for (const it of items) {
+    subtotal += it.price * it.qty;
+  }
+  const discount = coupon ? COUPON_RATE * 100 : 0;
+  const total = subtotal - discount * subtotal;
+  document.getElementById('total').textContent = total + '円';
+  return total;
+}
+
+function onCheckout() {
+  const items = loadCart();
+  return calcTotal(items, 'SPRING');
+}`;
+
+const d07 = {
+  id: 'dv-07-debugger',
+  title: 'デバッガ: ブレークポイントで実行を止める',
+  minutes: 16,
+  objectives: ['ブレークポイントを設定して実行を一時停止できる', 'Scope で変数の「その瞬間の値」を読める', 'Call Stack で「誰が呼んだか」をたどれる'],
+  prereq: ['dv-06-sources'],
+  briefing: 'ショップのカートで、クーポンを使うと合計がマイナスになるというバグ報告。コードを眺めても原因が分からない。そこで、計算の途中で実行を止めて、変数の値を直接見る。これがデバッガ(ブレークポイント)の使い方。',
+  concepts: [{
+    title: 'ブレークポイントとスコープ',
+    why: 'console.log を足して再実行する方法は遅く、必要な値を見落としやすい。止めて直接見れば、その瞬間のすべての変数が分かる。',
+    problem: '計算結果が想定と違うとき、どの時点で値がおかしくなったかを特定したい。',
+    how: 'Sources でコードを開き、行番号をタップするとブレークポイントが付く。その行が実行される直前にプログラムが一時停止し、下に「Scope」（その時点の変数の値）と「Call Stack」（どの関数がどの順で呼んだか）が出る。「▶ 再開」で実行を続ける。止めた行は、まだ実行される前という点に注意。',
+    example: '行 10 にブレークポイント → 一時停止\nScope (Local): subtotal = 6000, discount = 20\nCall Stack: calcTotal ← onCheckout',
+    relation: '怪しい行の手前に止め、変数の値を読み、期待値とのズレから原因の行を特定する。',
+  }],
+  browser: {
+    url: 'https://shop.example.com/cart',
+    html: HTML,
+    tabs: ['sources', 'console', 'elements'],
+    sources: { 'cart.js': CART },
+    breakpoints: {
+      'cart.js:10': {
+        scope: { 'Local': { items: '[3 items]', coupon: 'SPRING', subtotal: 6000, discount: 20 }, 'Global': { COUPON_RATE: 0.2 } },
+        stack: ['calcTotal (cart.js:10)', 'onCheckout (cart.js:17)', '(anonymous) (cart.js:21)'],
+        note: '10行目の直前で停止中。まだ total は計算されていません。',
+      },
+    },
+  },
+  tasks: [
+    {
+      q: 'Sources タブで cart.js を開き、合計金額を計算している行（const total = …、10行目）にブレークポイントを設定してください。',
+      narration: '行番号をタップすると、その行でプログラムが止まる印（ブレークポイント）が付く。止まった瞬間のすべての変数が見られる。',
+      check: { type: 'dev', pausedAt: { file: 'cart.js', line: 10 } },
+      noInput: true,
+      hints: ['Sources → ファイル名 cart.js をタップして開く', '10行目の行番号をタップする', '「一時停止しました」と表示され、下に Scope が出る'],
+      explain: 'ブレークポイントは「ここまで来たら止まれ」という指示。本番ほぼ同じ状態を再現できるのが、ログ出力より便利な点。止まる行は、実行される「直前」である点を覚えておこう。',
+    },
+    {
+      q: '停止中の Scope（Local）にある discount の値を答えてください。',
+      narration: 'Scope は、止まった瞬間の変数の値一覧。期待している値と実際の値を並べて見ると、バグの場所が見えてくる。',
+      check: { type: 'answer', any: ['20'] },
+      answerHint: '数字',
+      hints: ['下の「一時停止中」の枠を見る', 'スコープ (Scope) の Local の discount', '20'],
+      explain: '割引率 0.2（20%）のはずが discount=20 になっていた。9行目で COUPON_RATE * 100 としたのが原因で、「割引率」と「パーセント表記」が混ざっている。原因の行は、期待値と実際の値のズレを辿ると特定できる。',
+    },
+    {
+      q: 'この値で total を計算すると subtotal - discount * subtotal になります。subtotal が 6000 のときの total を答えてください。',
+      narration: '止まっているのは total が計算される直前。頭の中（または Console）で計算して、結果が想定と違うことを確かめよう。',
+      check: { type: 'answer', any: ['-114000', '−114000'] },
+      answerHint: '数字（マイナスもあり）',
+      hints: ['discount * subtotal を先に計算する（20 × 6000）', '6000 - 120000', '-114000'],
+      explain: '合計がマイナス 114,000 円になる。これがユーザーに見えていた不具合の正体。直し方は、割引率 0.2 をそのまま使う（discount = COUPON_RATE）か、パーセントで持つなら 100 で割る。値を止めて見ることで、推測ではなく根拠付きで直せる。',
+    },
+    {
+      q: 'Call Stack を見て、calcTotal を呼び出している関数の名前を答えてください。',
+      narration: 'Call Stack は「いまの関数を、誰が、どの順で呼んだか」の履歴。上が現在、下ほど呼び出し元。',
+      check: { type: 'answer', any: ['onCheckout'], ci: true },
+      answerHint: '関数名',
+      hints: ['停止中の枠の「コールスタック (Call Stack)」を見る', '一番上が calcTotal。その次の行が呼び出し元', 'onCheckout'],
+      explain: 'Call Stack を使うと「この値はどこから渡されたか」を遡れる。今回なら、coupon の \'SPRING\' は onCheckout が渡している。呼び出し元までたどれると、原因が引数なのか内部ロジックなのかを切り分けられる。',
+    },
+  ],
+  review: {
+    steps: ['怪しい処理の行番号をタップしてブレークポイントを置く', '停止した Scope で変数の値を期待値と比べる', 'Call Stack で呼び出し元をたどる', '直したら、ブレークポイントを外して「▶ 再開」'],
+    commands: [{ cmd: 'ブレークポイント', meaning: '実行を行の手前で止める印' }, { cmd: 'Scope', meaning: '止まった瞬間の変数の値' }, { cmd: 'Call Stack', meaning: '関数の呼び出しの履歴' }],
+    why: '値を直接見るデバッグは、推測を減らし、根拠のある修正につなげる。',
+    practice: 'バグ報告を受けたら、まず再現手順を確認し、怪しい行にブレークポイントを置いて期待値との差を探す。',
+    related: ['console.log デバッグ', 'ユニットテスト', '単位の取り違え（率とパーセント）'],
+  },
+  learned: ['devtools-debugger', 'breakpoints', 'scope-callstack', 'debug-method'],
+  solution: [{ do: 'toggleBreakpoint', args: ['cart.js', 10] }],
+};
+
+Object.assign(exports, { d07 });
+
+};
+__mods["js/missions/dt/d08-security.js"] = function (module, exports, __require) {
+// DevTools 8: Security / Issues — HTTPS・証明書・混在コンテンツ・CORS・CSP
+const HTML = `<!DOCTYPE html>
+<html><head><title>Maple Bank — マイページ</title></head>
+<body><h1>Maple Bank マイページ</h1>
+<img src="http://images.legacy-cdn.example.net/banner.png" alt="キャンペーン">
+<div id="profile">読み込み中…</div>
+<script src="/js/mypage.js"></script></body></html>`;
+
+const d08 = {
+  id: 'dv-08-security',
+  title: 'Security と Issues: 保護の状態を読む',
+  minutes: 15,
+  objectives: ['Security タブで HTTPS と証明書の情報を読める', '混在コンテンツ・Cookie 属性・CSP/CORS の警告を読み解ける', 'ブロックされた通信の原因と、守るべき意図を理解する'],
+  prereq: ['dv-07-debugger'],
+  briefing: 'ネットバンキング風のデモページ「Maple Bank マイページ」で、プロフィールが表示されない。Console には赤い警告が並ぶ。ブラウザは危険な通信を自動でブロックしてくれる。その警告は「守ろうとしている意図」を伝えている。Security タブと Issues で読み解こう。',
+  concepts: [{
+    title: 'ブラウザが守ってくれること',
+    why: 'ブラウザには、盗聴・改ざん・なりすましから利用者を守る仕組みがある。ブロックされたときの警告を理解すれば、直し方と、守るべき理由の両方が分かる。',
+    problem: '赤い警告を見ても、「なぜ駄目なのか」が分からないと、設定を緩めて無理に動かしてしまい、かえって危険になる。',
+    how: 'Security タブは、HTTPS か・証明書の発行先/期限・暗号方式を示す。Issues は、混在コンテンツ（HTTPSなのにHTTPの部品がある）、Cookie の属性不足、CSP/CORS によるブロックなどを一覧する。CORS=他ドメインの API をブラウザが読めるかを、サーバーが許可する仕組み（Access-Control-Allow-Origin ヘッダ）。CSP=読み込んでよい元を制限する、ページの防御ルール。',
+    example: 'Access to fetch at \'https://api…\' from origin \'https://…\' has been blocked by CORS policy: No \'Access-Control-Allow-Origin\' header is present.',
+    relation: '警告の文面から原因（ヘッダの欠落・HTTPの部品）を特定し、「緩める」のではなく正しく直す。',
+  }],
+  browser: {
+    url: 'https://mypage.maple-bank.example.com/',
+    html: HTML,
+    tabs: ['security', 'console', 'network', 'application'],
+    security: { cert: { subject: 'mypage.maple-bank.example.com', issuer: 'Example Trust CA G2', validFrom: '2026-03-15', validTo: '2027-03-14', cipher: 'TLS_AES_128_GCM_SHA256' }, protocol: 'TLS 1.3' },
+    storage: { cookies: [{ name: 'bank_session', value: 'B-91ac7f', httpOnly: true, secure: false, sameSite: 'Lax', path: '/' }] },
+    console: [
+      { level: 'warn', text: "Mixed Content: The page at 'https://mypage.maple-bank.example.com/' was loaded over HTTPS, but requested an insecure image 'http://images.legacy-cdn.example.net/banner.png'." },
+      { level: 'error', text: "Access to fetch at 'https://api.partner-data.example.org/profile' from origin 'https://mypage.maple-bank.example.com' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.", source: 'mypage.js:8' },
+    ],
+    sources: { 'mypage.js': "fetch('https://api.partner-data.example.org/profile');" },
+    network: [
+      { url: '/', status: 200, mime: 'text/html', size: 1900, time: 120, resHeaders: { 'content-type': 'text/html', 'strict-transport-security': 'max-age=31536000', 'content-security-policy': "default-src 'self'; img-src 'self' https:" } },
+      { url: 'http://images.legacy-cdn.example.net/banner.png', status: 200, mime: 'image/png', size: 22000, time: 140, start: 130, protocol: 'http/1.1' },
+      { url: 'https://api.partner-data.example.org/profile', status: 0, blocked: 'cors', mime: '', size: 0, time: 90, start: 140, initiator: 'mypage.js:8', note: 'サーバーのレスポンスに Access-Control-Allow-Origin ヘッダが無いため、ブラウザがこのページに結果を渡しませんでした。' },
+    ],
+  },
+  tasks: [
+    {
+      q: 'Security タブで、この証明書の有効期限（有効期間の終わり）の日付を答えてください（例: 2027-01-31 の形式）。',
+      narration: 'HTTPS は「証明書」で通信相手の正しさを保証する。期限切れの証明書は、ブラウザが警告を出す。',
+      check: { type: 'answer', any: ['2027-03-14'] },
+      answerHint: 'YYYY-MM-DD',
+      hints: ['Security タブを開く', '「証明書 (Certificate)」の「有効期間」', '2026-03-15 〜 2027-03-14 の終わり側'],
+      explain: '証明書の期限切れは、サイト停止の定番の原因（ブラウザが「安全ではありません」を出す）。期限を監視し、自動更新（ACME/Let\'s Encrypt など）を整えるのが運用の基本。',
+    },
+    {
+      q: '混在コンテンツ（HTTPS ページ内の HTTP のリソース）になっている画像のホスト名を答えてください。',
+      narration: 'HTTPS のページに HTTP の部品が混ざると、その部分だけ盗聴・改ざんされうる。Security タブの「Issues」にも出る。',
+      check: { type: 'answer', any: ['images.legacy-cdn.example.net'], ci: true },
+      answerHint: 'ホスト名',
+      hints: ['Security タブの Issues の「混在コンテンツ」を見る', 'detail に URL が出ている', 'images.legacy-cdn.example.net'],
+      explain: '画像だけでも、HTTPの部品があれば通信路上で差し替えられる。ブラウザは警告やブロックで保護する。直し方は、読み込み元を https:// にする（相手が対応していなければ、自分のサーバーに置き直す）。',
+    },
+    {
+      q: 'Cookie の警告で、「Secure 属性がない」と指摘されている Cookie の名前を答えてください。',
+      narration: 'Issues の Cookie の項目は、属性の不足を教えてくれる。Secure が無いと、HTTP でも送信されうる。',
+      check: { type: 'answer', any: ['bank_session'], ci: true },
+      answerHint: 'Cookie 名',
+      hints: ['Security タブの Issues の Cookie の項目を見る', 'Secure 属性がない旨の行', 'bank_session'],
+      explain: 'Secure が無い認証 Cookie は、誤って HTTP で接続した際にそのまま送信され、盗聴される恐れがある。HTTPS 専用のサイトでは、Cookie に Secure を付け、HSTS（strict-transport-security）で常に HTTPS を強制するのが定番の組み合わせ。',
+    },
+    {
+      q: 'Network タブで、CORS ポリシーによりブロックされたリクエストの URL の「パス」（/ から始まる部分）を答えてください。',
+      narration: 'ブロックされた通信は、ステータスが（blocked:cors）と表示される。画面に表示されない原因の1つ。',
+      check: { type: 'answer', any: ['/profile'], ci: true },
+      answerHint: '/ から始まるパス',
+      hints: ['Network タブを開き、ステータス欄が（blocked:cors）の行を探す', '詳細を開いて Request URL を読む', '/profile'],
+      explain: 'CORS は「他のドメインの API を、このページの JS から読んでいいか」をサーバーが許可する仕組み。ここでは相手サーバーが許可ヘッダを返していないので、ブラウザが結果を渡さない。直すのは API 側の設定で、フロントで回避する裏技ではない。',
+    },
+    {
+      q: 'Console の CORS エラー文に書かれている、「無い」と指摘されているレスポンスヘッダ名（Access-Control-… で始まる）を答えてください。',
+      narration: 'エラー文には、足りないものが具体的に書かれている。長い文だが、「No ... header is present」の部分を探す。',
+      check: { type: 'answer', any: ['access-control-allow-origin'], ci: true },
+      answerHint: 'ヘッダ名',
+      hints: ['Console の赤いエラーを読む', '「No」と「header is present」の間の引用符の中', 'Access-Control-Allow-Origin'],
+      explain: 'このヘッダで、サーバーが「どのオリジン(ドメイン)からの読み取りを許すか」を宣言する。無暗に * (全許可)にせず、必要なドメインだけを許可するのが安全。エラー文に直し方のヒントが書かれているので、まず全文を読む癖を付けよう。',
+    },
+  ],
+  review: {
+    steps: ['Security タブで HTTPS・証明書の発行先と期限を確認する', 'Issues で混在コンテンツ・Cookie の属性を確認する', 'Console/Network のブロック（CORS・CSP）の文面から原因を読む', '設定を緩めず、サーバー/配信側を正しく直す'],
+    commands: [{ cmd: 'Mixed Content', meaning: 'HTTPS ページ内の HTTP 部品' }, { cmd: 'CORS', meaning: '他ドメイン API を読む許可の仕組み' }, { cmd: 'Secure / HttpOnly / SameSite', meaning: 'Cookie を守る3つの属性' }],
+    why: 'ブラウザの警告は「利用者を守るために止めた」というサイン。意図を理解すれば、直し方も分かる。',
+    practice: 'リリース前に Security/Issues を確認する。証明書期限・混在コンテンツ・Cookie 属性は、機械的に点検できる項目。',
+    related: ['HTTPS/TLS', 'HSTS', 'CORS', 'CSP', 'Cookie 属性'],
+  },
+  learned: ['devtools-security', 'https-cert', 'mixed-content', 'cors', 'csp-basics'],
+  solution: [{ do: 'visit', args: ['security'] }],
+};
+
+Object.assign(exports, { d08 });
+
+};
+__mods["js/missions/dt/d09-performance.js"] = function (module, exports, __require) {
+// DevTools 9: Performance — 表示速度（Core Web Vitals）とスロットリング
+const HTML = `<!DOCTYPE html>
+<html><head><title>Aoba Travel</title></head>
+<body><header><h1>Aoba Travel</h1></header>
+<img id="hero" src="/img/hero-banner.png" alt="海辺の写真">
+<section id="cards"><div class="card">プランA</div><div class="card">プランB</div></section>
+<script src="/js/bundle.js"></script><script src="/js/vendor.js"></script></body></html>`;
+
+const d09 = {
+  id: 'dv-09-performance',
+  title: 'Performance: 遅い理由を数字で読む',
+  minutes: 16,
+  objectives: ['Core Web Vitals（FCP/LCP/CLS/TBT）の意味を説明できる', 'スロットリングで遅い回線を再現できる', '転送サイズの内訳から、重いリソースを特定できる'],
+  prereq: ['dv-08-security'],
+  briefing: '旅行サイト Aoba Travel は「スマホで開くのが遅い」と言われている。開発者のPC（高速回線）では速く見える。DevTools は、遅い回線を再現し、何に時間がかかっているかを数字で示してくれる。',
+  concepts: [{
+    title: '表示速度の指標とスロットリング',
+    why: '体感の遅さは離脱の大きな原因。「なんとなく遅い」ではなく、どの指標が悪く、何が原因かを数字で示せば、直す優先順位が決められる。',
+    problem: '開発環境は高速なので、遅さに気付けない。実際のユーザー（モバイル回線）の体験とは差がある。',
+    how: 'Network タブの Throttling で回線速度を切り替える（Fast 4G / Slow 4G / Offline）。Performance タブは Core Web Vitals を表示する: FCP=最初に何か表示されるまで、LCP=最大の要素（画像・見出し）が表示されるまで（2.5秒以内が目安）、CLS=表示のガタつき（0.1以下が目安）、TBT=JSの処理で操作できない時間。下に種類別の転送サイズが出るので、重いものから対処する。',
+    example: 'LCP 2.0s → Slow 4G で 10.00s\nCLS 0.31（画像に width/height が無く、後から押し下げられる）',
+    relation: '遅い回線で再現し、指標と内訳から重いものを特定して、効果の大きい順に直す。',
+  }],
+  browser: {
+    url: 'https://aoba-travel.example.com/',
+    html: HTML,
+    tabs: ['performance', 'network'],
+    perf: { fcp: 900, lcp: 2000, cls: 0.31, tbt: 450, lcpElement: '<img id="hero" src="/img/hero-banner.png" alt="海辺の写真">' },
+    network: [
+      { url: '/', status: 200, mime: 'text/html', size: 6100, time: 130, start: 0, initiator: 'ナビゲーション' },
+      { url: '/img/hero-banner.png', status: 200, mime: 'image/png', size: 2400000, time: 700, start: 140, initiator: '/ (HTML)', note: '表示幅は 400px 程度なのに、約2.4MBのPNGを読み込んでいます。' },
+      { url: '/js/bundle.js', status: 200, mime: 'application/javascript', size: 280000, time: 260, start: 140 },
+      { url: '/js/vendor.js', status: 200, mime: 'application/javascript', size: 890000, time: 420, start: 140, note: '使われていないライブラリも含んだ大きなファイルです。' },
+      { url: '/css/site.css', status: 200, mime: 'text/css', size: 24000, time: 60, start: 140 },
+    ],
+  },
+  tasks: [
+    {
+      q: 'Network タブの Throttling（回線速度）を「Slow 4G」に切り替えてください。',
+      narration: '開発者の回線は速すぎて、遅さに気づけない。スロットリングは「遅い回線の人の体験」を再現する機能。',
+      check: { type: 'dev', throttle: 'slow4g' },
+      noInput: true,
+      hints: ['Network タブを開く', '右上のプルダウン（No throttling）を選ぶ', '「Slow 4G」を選択'],
+      explain: 'Slow 4G にすると、通信にかかる時間が約5倍になる。同じページでも、電波の弱い場所のスマホでは、これくらい遅く感じられる。速度の検証は、必ず遅い回線で行う。',
+    },
+    {
+      q: 'Slow 4G にした状態で Performance タブを開き、LCP（最大要素の描画）の値を答えてください（例: 3.00 s の場合は 3）。',
+      narration: '通常 2.0秒だった LCP が、遅い回線ではどうなるか。目安は2.5秒以内。それを超えると「遅い」と判定される。',
+      check: { type: 'answer', any: ['10', '10.0', '10.00', '10秒', '10.00 s', '10s', '10000'], ci: true },
+      answerHint: '秒数',
+      hints: ['まず Slow 4G を選ぶ（前の課題）。次に Performance タブを開く', 'LCP のカード。赤くなる（遅い）', '10.00 s → 10'],
+      explain: 'LCP が 10 秒。目安の 2.5 秒を大きく超えていて、ユーザーは待ちきれず離脱する。この数字が「改善の根拠」になる。「速くしたい」ではなく「LCP を 2.5 秒以内に」と目標を数字で置ける。',
+    },
+    {
+      q: '種類別の転送サイズの内訳（Performance タブ）を見て、JavaScript ファイルの中で最も大きいファイル名を答えてください（Network タブで確認できます）。',
+      narration: '遅さの原因は、ほとんどの場合「大きなもの」。大きい順に見ていくのが、改善の定石。',
+      check: { type: 'answer', any: ['vendor.js'], ci: true },
+      answerHint: 'ファイル名',
+      hints: ['Network タブで、フィルタ「JS」を使う', '各行のサイズを比べる', 'vendor.js（約890kB）'],
+      explain: 'vendor.js は外部ライブラリをまとめたファイルで、未使用コードが多いことが多い。コード分割（必要な画面でだけ読み込む）、不要なライブラリの削除、tree shaking などで縮められる。',
+    },
+    {
+      q: 'LCP（最大要素）になっている HTML 要素の「タグ名」を答えてください（Performance タブの LCP 要素）。',
+      narration: 'LCP を決めているのは「画面で最も大きく表示される要素」。それが画像なら、画像の最適化が一番効く。',
+      check: { type: 'answer', any: ['img'], ci: true },
+      answerHint: 'タグ名',
+      hints: ['Performance タブの「LCP 要素」を見る', '< の次に書かれているタグ名', 'img'],
+      explain: 'LCP 要素が img（約2.4MBのPNG）。画像を適切なサイズに縮小して WebP/AVIF に変換するだけで、LCP が大きく改善する典型例。画像は最も効果が出やすい改善対象。',
+    },
+    {
+      q: 'CLS（レイアウトのズレ）の値を答えてください。目安は 0.1 以下です。',
+      narration: 'CLS は、読み込み中に画面の要素がずれて動く度合い。画像のサイズ指定がないと、画像が読み込まれた瞬間に下の文章が押し下げられる。',
+      check: { type: 'answer', any: ['0.31'] },
+      answerHint: '小数',
+      hints: ['Performance タブの CLS のカード', '数値だけを読む', '0.31'],
+      explain: '0.31 は目安（0.1以下）の3倍以上で、ボタンを押そうとした瞬間にずれて誤タップする、といった体験につながる。対策は、画像に width/height を指定して場所をあらかじめ確保すること。',
+    },
+  ],
+  review: {
+    steps: ['Throttling で遅い回線（Slow 4G）を再現する', 'Performance で FCP/LCP/CLS/TBT を読む', '種類別サイズと Network で、重いリソースを探す', '効果の大きい順（画像→JS→CSS）に対策する'],
+    commands: [{ cmd: 'LCP', meaning: '最大の要素が表示されるまで（目安 2.5秒以内）' }, { cmd: 'CLS', meaning: '表示のずれ（目安 0.1以下）' }, { cmd: 'Throttling', meaning: '遅い回線を再現する機能' }],
+    why: '速度は数字で測り、目標を決めて改善する。ユーザーの体験は開発者の環境とは違う。',
+    practice: '大きい画像の圧縮、画像サイズの指定、使っていないJSの削除は、費用対効果の高い定番の改善策。',
+    related: ['Core Web Vitals', '画像最適化', 'コード分割', 'キャッシュ'],
+  },
+  learned: ['devtools-performance', 'core-web-vitals', 'network-throttling', 'resource-weight', 'cls-causes'],
+  solution: [{ do: 'setThrottle', args: ['slow4g'] }],
+};
+
+Object.assign(exports, { d09 });
+
+};
+__mods["js/missions/dt/d10-capstone.js"] = function (module, exports, __require) {
+// DevTools 10: 総合演習 — 購入できない原因を突き止める
+const HTML = `<!DOCTYPE html>
+<html><head><title>Stagelink — チケット購入</title></head>
+<body>
+<h1>Stagelink</h1>
+<p class="lead">春の音楽祭 S席 ¥8,500</p>
+<form id="checkout" action="/api/checkout" method="post">
+  <input type="hidden" name="csrf_token" value="">
+  <input type="text" name="coupon" placeholder="クーポンコード">
+  <button id="pay" type="submit">購入する</button>
+</form>
+<p id="err" style="color:red"></p>
+<script src="/js/checkout.js"></script>
+</body></html>`;
+
+const JS = `// 購入処理
+const token = localStorage.getItem('csrfToken');
+document.querySelector('input[name=csrf_token]').value = token || '';
+
+document.getElementById('checkout').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = { coupon: e.target.coupon.value, csrf_token: token };
+  const res = await fetch('/api/checkout', { method: 'POST', body: JSON.stringify(body) });
+  if (!res.ok) {
+    document.getElementById('err').textContent = '購入できませんでした';
+    return;
+  }
+  location.href = '/thanks';
+});`;
+
+const d10 = {
+  id: 'dv-10-capstone',
+  title: '総合演習: 購入できない原因を突き止める',
+  minutes: 20,
+  objectives: ['Console・Network・Sources・Application を連携させて原因を絞り込める', '画面の症状から、通信→コード→保存データの順に根本原因へたどれる', '調査結果を「現象・原因・対策」で説明できる'],
+  prereq: ['dv-09-performance'],
+  briefing: 'チケット販売サイト Stagelink で「購入ボタンを押すと『購入できませんでした』と出る」という報告が相次いでいる。画面に出るのは1行だけ。ここまで学んだ道具を総動員して、根本原因まで突き止めよう。調査の順番も大事だ。',
+  concepts: [{
+    title: '調査の流れ',
+    why: '症状（画面のエラー文）は結果にすぎない。原因は、通信・コード・保存データのどこかにある。決まった順で調べれば、迷わず絞り込める。',
+    problem: '闇雲に触ると、原因と無関係なところを直して時間を失う。',
+    how: '1) Console で赤いエラー（種類と場所）を確認。2) Network で失敗した通信のステータスとレスポンスを確認。3) Sources でその通信を出しているコードを読む。4) Application で、コードが参照している保存データ（キー名・値）を確認。5) Elements で、画面に反映された値（hidden欄など）を確認。「現象→直接原因→根本原因」の順にたどる。',
+    example: '現象: 購入できません → 通信: 403（csrf_token が空）→ コード: localStorage の csrfToken を読んでいる → 保存データ: 実際のキーは csrf_token（名前の食い違い）',
+    relation: '5つの道具の読み方を一つの調査にまとめて使う。',
+  }],
+  browser: {
+    url: 'https://stagelink.example.com/checkout',
+    html: HTML,
+    tabs: ['console', 'network', 'sources', 'application', 'elements'],
+    storage: { local: { csrf_token: '7d2e-41ab-cc09', user_pref: 'compact' }, session: { cart_id: 'C-4471' }, cookies: [{ name: 'session', value: 'ST-00a1', httpOnly: true, secure: true, sameSite: 'Lax', path: '/' }] },
+    console: [
+      { level: 'log', text: 'checkout.js loaded', source: 'checkout.js:1' },
+      { level: 'error', text: 'Failed to load resource: the server responded with a status of 403 ()', source: 'stagelink.example.com/api/checkout' },
+    ],
+    sources: { 'checkout.js': JS },
+    network: [
+      { url: '/checkout', status: 200, mime: 'text/html', size: 2100, time: 110, start: 0, initiator: 'ナビゲーション' },
+      { url: '/js/checkout.js', status: 200, mime: 'application/javascript', size: 700, time: 50, start: 120, initiator: '/checkout (HTML)' },
+      { id: 'pay', url: '/api/checkout', method: 'POST', status: 403, mime: 'application/json', size: 130, time: 90, start: 400, initiator: 'checkout.js:8',
+        reqHeaders: { 'content-type': 'text/plain;charset=UTF-8' },
+        reqBody: '{"coupon":"","csrf_token":null}',
+        resBody: '{"error":"csrf_token_missing","message":"CSRFトークンが見つかりません"}',
+        note: '403 Forbidden: サーバーがリクエストを拒否しました。' },
+    ],
+    quick: ["localStorage.getItem('csrfToken')", "localStorage.getItem('csrf_token')", "Object.keys(localStorage)"],
+  },
+  tasks: [
+    {
+      q: 'まず Network で失敗した購入リクエスト（/api/checkout）を開き、レスポンスの error の値を答えてください。',
+      narration: '調査の起点は、失敗した通信。ステータス（403）と、サーバーの言い分（Response）を確認する。',
+      check: { type: 'answer', any: ['csrf_token_missing'], ci: true },
+      answerHint: 'エラーコード',
+      hints: ['Network → /api/checkout の行（赤い）をタップ', 'Response タブを開く', 'csrf_token_missing'],
+      explain: 'サーバーは「CSRFトークンが見つからない」と返している。つまり、ブラウザがトークンを送れていない。CSRFトークンは、他サイトからの勝手な購入リクエストを防ぐための合言葉で、無いリクエストは拒否されるのが正しい動作。',
+    },
+    {
+      q: '送信したリクエストの本文（Payload）で、csrf_token にどんな値が送られていたか答えてください（JSON に書かれたそのままの値）。',
+      narration: 'サーバーが「無い」と言うなら、ブラウザが何を送ったかを確かめる。Payload タブが答えを持っている。',
+      check: { type: 'answer', any: ['null'], ci: true },
+      answerHint: 'JSON の値',
+      hints: ['同じ詳細画面の Payload タブ', '送信内容 (Request Payload) の csrf_token', 'null'],
+      explain: 'null が送られていた。ブラウザ側で、トークンの値が取得できていないということ。次に、コード（Sources）で、トークンをどこから読んでいるかを確認する。',
+    },
+    {
+      q: 'Sources の checkout.js で、トークンを localStorage から読んでいる行の「キー名」（getItem の引数）を答えてください。',
+      narration: 'コードは localStorage の特定のキーを探しにいく。そのキー名が実際の保存と一致しているかが、次の確認ポイント。',
+      check: { type: 'answer', any: ['csrfToken'], ci: false },
+      answerHint: 'キー名（大文字小文字に注意）',
+      hints: ['Sources → checkout.js を開く', '2行目の localStorage.getItem(…)', 'csrfToken'],
+      explain: 'コードは csrfToken（キャメルケース）というキーを読んでいる。大文字小文字も含め、キー名は完全一致が必要。ここまでで「直接原因」の見当が付いた。実際に保存されているキー名と照らし合わせる。',
+    },
+    {
+      q: 'Application の Local Storage に実際に保存されている CSRF トークンのキー名を答えてください。',
+      narration: 'コードが探すキー(csrfToken)と、実際に保存されているキーを並べて比べる。',
+      check: { type: 'answer', any: ['csrf_token'], ci: false },
+      answerHint: 'キー名',
+      hints: ['Application → Local Storage を開く', 'token を含むキーを探す', 'csrf_token'],
+      explain: '保存側は csrf_token（スネークケース）、読む側は csrfToken。名前が食い違って null になっていた。これが根本原因で、「命名規則の不統一」という、ありがちな人為ミス。直すのはコード側（キー名を揃える）。',
+    },
+    {
+      q: '原因の裏付けとして、ページ内のフォームの hidden 入力欄（name=csrf_token）に、正しいトークンの値を設定してください（Elements で value を編集するか、Console で setAttribute）。これは、直し方が正しいかの実験です。',
+      narration: '仮説（キー名の食い違い）が正しければ、正しい値を入れたとき購入が通るはず。実験として、画面側に値を入れてみる。',
+      check: { type: 'dev', dom: { sel: 'input[name=csrf_token]', attr: { value: '7d2e-41ab-cc09' } } },
+      noInput: true,
+      hints: ['Elements で input name="csrf_token" を探して選ぶ', '属性 value に Application で見たトークンを入力する', "Console: document.querySelector('input[name=csrf_token]').setAttribute('value', localStorage.getItem('csrf_token'))"],
+      explain: '仮説の検証として、値を入れて挙動を確かめる。これは実験で、恒久対策は checkout.js の getItem(\'csrfToken\') を csrf_token に直すこと。本番では、直した後にテスト（自動テスト含む）で再発を防ぐ。',
+    },
+    {
+      q: '調査のまとめです。このインシデントの「根本原因」として最も適切なものを選んでください。\n1) サーバーが落ちていた（5xx）\n2) ブラウザが CORS でブロックした\n3) JS が読むキー名と、保存されているキー名が一致していなかった\n4) ユーザーが Cookie を削除した',
+      narration: '「現象（購入できない）」「直接原因（トークンが送られていない）」「根本原因（なぜ送られなかったか）」を区別するのが、調査の締め。',
+      check: { type: 'answer', any: ['3'] },
+      answerHint: '番号',
+      hints: ['ステータスは 403（5xx ではない）、CORS のエラーは出ていない', 'Cookie の session は正常。問題はトークン', '3'],
+      explain: '現象=購入できない、直接原因=トークンが null、根本原因=キー名の不一致。調査報告は、この3層で書くと伝わる。「403 だからサーバー側のバグ」と決めつけず、通信→コード→保存データと順に確かめた点が、実務的なデバッグの型になる。',
+    },
+  ],
+  review: {
+    steps: ['Console で赤いエラーの種類と場所を確認', 'Network で失敗した通信のステータスと Response/Payload を読む', 'Sources でその通信を出すコードを読む', 'Application で保存データの実際のキー・値と照合する', '現象→直接原因→根本原因で整理する'],
+    commands: [{ cmd: 'Console → Network → Sources → Application', meaning: '症状から根本原因へたどる順番' }, { cmd: "localStorage.getItem('key')", meaning: 'コードが読む値を直接確かめる' }, { cmd: 'setAttribute', meaning: '仮説を検証するための一時的な変更' }],
+    why: '道具の使い方より、「何を、どの順で、何のために見るか」が実務の力になる。',
+    practice: '障害調査の報告は、現象・原因・対策・再発防止の4点で書く。スクリーンショット（機密は伏せて）を添えると、他の人が追体験しやすい。',
+    related: ['CSRF', 'インシデント報告', '根本原因分析', 'デバッグの型'],
+  },
+  learned: ['devtools-investigation', 'root-cause-analysis', 'csrf-token', 'debug-flow'],
+  solution: ["document.querySelector('input[name=csrf_token]').setAttribute('value', localStorage.getItem('csrf_token'))"],
+};
+
+Object.assign(exports, { d10 });
+
+};
+__mods["js/missions/stage-devtools2.js"] = function (module, exports, __require) {
+// DevTools コース II — 保存・コード・保護・速度を読む
+const { d05 } = __require("js/missions/dt/d05-storage.js");
+const { d06 } = __require("js/missions/dt/d06-sources.js");
+const { d07 } = __require("js/missions/dt/d07-debugger.js");
+const { d08 } = __require("js/missions/dt/d08-security.js");
+const { d09 } = __require("js/missions/dt/d09-performance.js");
+const { d10 } = __require("js/missions/dt/d10-capstone.js");
+
+const stageDevtools2 = {
+  id: 'dt-advanced',
+  track: 'devtools',
+  title: 'DevTools II — 保存・コード・保護・速度',
+  subtitle: 'Application・Sources・デバッガ・Security・Performance、そして総合演習',
+  intro: '後半は、ブラウザに保存されるもの、ページを動かすコード、守りの仕組み、表示速度を読む。最後は、これまでの道具を総動員して「購入できない」原因を突き止める総合演習。',
+  missions: [d05, d06, d07, d08, d09, d10],
+};
+
+Object.assign(exports, { stageDevtools2 });
 
 };
 __mods["js/missions/stage-packet.js"] = function (module, exports, __require) {
@@ -11347,6 +12316,7 @@ const { stageCloud } = __require("js/missions/stage-cloud.js");
 const { stageDetect } = __require("js/missions/stage-detect.js");
 const { stageAISec } = __require("js/missions/stage-aisec.js");
 const { stageDevtools1 } = __require("js/missions/stage-devtools1.js");
+const { stageDevtools2 } = __require("js/missions/stage-devtools2.js");
 const { stagePacket } = __require("js/missions/stage-packet.js");
 
 const STAGES = [
@@ -11384,7 +12354,7 @@ const STAGES = [
 // ---------- コース(トラック) ----------
 // main    : 既存のメインコース（一本道）
 // devtools: ブラウザ開発者ツールの読み方を学ぶ並行コース。メインの進行状況とは独立して進められる。
-const DEV_STAGES = [stageDevtools1];
+const DEV_STAGES = [stageDevtools1, stageDevtools2];
 
 const TRACKS = [
   { id: 'main', title: 'メインコース', stages: STAGES },
@@ -12587,6 +13557,12 @@ function createSession(def) {
   ses.resume = () => { ses.state.paused = null; notify('bp'); };
 
   // ---- Network ----
+  // UI と同じ状態変更を行う操作（ミッションの solution 検証用にも使う）
+  ses.setFilter = (k) => { ses.state.networkFilter = k; ses.state.filtersUsed.add(k); notify('network'); };
+  ses.setThrottle = (k) => { if (THROTTLES[k]) { ses.state.throttle = k; notify('network'); } };
+  ses.openRequest = (id) => { ses.state.viewedRequests.add(id); notify('network'); };
+  ses.openSource = (f) => { ses.state.sourcesOpened.add(f); };
+  ses.prettyPrint = (f) => { ses.state.prettyPrinted.add(f); };
   ses.throttledTime = (r) => { const f = THROTTLES[ses.state.throttle].f; return f == null ? null : r.time * f; };
   ses.networkSummary = () => {
     const f = THROTTLES[ses.state.throttle].f;
@@ -13305,6 +14281,16 @@ const CHAPTERS = {
     title: '深掘り偵察',
     intro: [{ who: 'asagiri', text: 'ポートが開いている、の先だ。何が、どのバージョンで動くか。そこまで分かって初めて的確な判断ができる。' }],
     outro: [{ who: 'hayama', text: '古いバージョンのサービスがいくつか……ケース・ゼロも、ここが入口でした。' }],
+  },
+  'dt-basics': {
+    title: '画面の裏側を見る',
+    intro: [{ who: 'hayama', text: 'ブラウザの開発者ツール、使ったことはありますか？ Webの調査は、画面の裏で何が起きているかを見るところから始まります。' }, { who: 'asagiri', text: 'スマホでは本物を開けないから、うちの訓練用の疑似ツールを用意した。架空のページで練習しろ。' }],
+    outro: [{ who: 'asagiri', text: '見えるものと、実際にあるものは違う。次は、ブラウザの中に保存されるものを調べる。' }],
+  },
+  'dt-advanced': {
+    title: 'ブラウザの内側を読む',
+    intro: [{ who: 'hayama', text: '保存データ、ソース、保護の仕組み、表示速度。ここまで読めれば、Webの問題の大半は切り分けられます。' }],
+    outro: [{ who: 'asagiri', text: '症状から根本原因まで、自分でたどれるようになったな。現場ではこの順番が武器になる。' }],
   },
   packet: {
     title: 'パケットを読む',

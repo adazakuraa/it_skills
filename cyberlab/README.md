@@ -52,7 +52,9 @@ cd cyberlab && python3 -m http.server 8000
 | `js/commands.js` | コマンド実装（ls, grep, find, chmod, ps, systemctl …） |
 | `js/checker.js` | ミッション達成判定（結果の状態で判定） |
 | `js/terminal.js` | ターミナルUI（補完・履歴・クイックキー） |
-| `js/missions/` | ステージ／ミッション定義（純データ） |
+| `js/missions/` | ステージ／ミッション定義（純データ）。`dt/` は DevTools コース |
+| `js/vb/` | 疑似ブラウザ（HTML/DOM、制限付きJS式評価器、通信・保存・ソースのセッション） |
+| `js/devtools.js`, `js/dt/` | 疑似 DevTools の UI（Elements/Console/Network/Sources/Application/Security/Performance） |
 | `js/app.js` | 画面遷移・演習の進行 |
 | `tests/run.mjs` | 自動テスト |
 | `docs/DESIGN.md` | 設計書（アーキテクチャ・データ構造・セキュリティ） |
@@ -61,6 +63,9 @@ cd cyberlab && python3 -m http.server 8000
 ## 学習の流れ
 
 ステージは一本道で、前のミッションをクリアすると次が解放されます。**全25ステージ・117ミッション**。
+別枠で、**DevTools コース（2ステージ・10ミッション）** があります。メインの進行とは独立で、いつでも並行して進められます。
+スマホでは本物の開発者ツールを開けないため、架空のWebページに対する**疑似 DevTools**で、Console / Elements / Network / Application / Sources（デバッガ）/ Security / Performance の読み方を練習します（実在のサイトや本物のネットワークには一切アクセスしません）。
+
 基礎（Linux/ネットワーク/セキュリティ）から、**クラウド・コンテナ・API・検知・AIセキュリティ**まで、
 実務的・近代的な応用トピックまでをカバーしています。
 

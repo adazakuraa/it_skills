@@ -130,6 +130,12 @@ export function createSession(def) {
   ses.resume = () => { ses.state.paused = null; notify('bp'); };
 
   // ---- Network ----
+  // UI と同じ状態変更を行う操作（ミッションの solution 検証用にも使う）
+  ses.setFilter = (k) => { ses.state.networkFilter = k; ses.state.filtersUsed.add(k); notify('network'); };
+  ses.setThrottle = (k) => { if (THROTTLES[k]) { ses.state.throttle = k; notify('network'); } };
+  ses.openRequest = (id) => { ses.state.viewedRequests.add(id); notify('network'); };
+  ses.openSource = (f) => { ses.state.sourcesOpened.add(f); };
+  ses.prettyPrint = (f) => { ses.state.prettyPrinted.add(f); };
   ses.throttledTime = (r) => { const f = THROTTLES[ses.state.throttle].f; return f == null ? null : r.time * f; };
   ses.networkSummary = () => {
     const f = THROTTLES[ses.state.throttle].f;
